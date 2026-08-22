@@ -310,6 +310,33 @@ describe("header injection", () => {
     expect(headers.get("x-admin-key")).toBe("server-admin");
   });
 
+  it("strips client-set X-Forwarded-* headers (M2: rate-limit key integrity)", async () => {
+    // Load-bearing for the Cloud Run half of M2. The API image ships with no
+    // baked trusted-proxy set, and the Cloud Run manifest deliberately leaves
+    // FORWARDED_ALLOW_IPS unset, on the strength of THIS strip: the proxy is
+    // the API's only peer there, so if it forwarded a caller-supplied
+    // X-Forwarded-For the backend's per-IP rate-limit key would become
+    // client-controlled again. Removing any entry below silently re-opens
+    // that path, which is why it is pinned here rather than left implicit.
+    const fetchMock = mockBackend();
+    const id = createSession("api-k", "admin-k"); // pragma: allowlist secret
+    await callHandler("GET", ["filings"], {
+      cookies: { [ADMIN_SESSION_COOKIE]: id },
+      headers: {
+        "X-Forwarded-For": "198.51.100.9",
+        "X-Forwarded-Host": "evil.example",
+        "X-Forwarded-Proto": "http",
+      },
+    });
+    const firstCall = fetchMock.mock.calls[0];
+    expect(firstCall).toBeDefined();
+    const [, init] = firstCall as unknown as [string, RequestInit];
+    const headers = new Headers(init.headers as HeadersInit);
+    expect(headers.get("x-forwarded-for")).toBeNull();
+    expect(headers.get("x-forwarded-host")).toBeNull();
+    expect(headers.get("x-forwarded-proto")).toBeNull();
+  });
+
   it("forwards backend session_id cookie but never the admin_session cookie", async () => {
     const fetchMock = mockBackend();
     const id = createSession("api-k", "admin-k"); // pragma: allowlist secret

@@ -26,6 +26,7 @@ or a network, so the lockers run in the normal pytest job.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 from pathlib import Path
@@ -514,6 +515,87 @@ def test_compose_api_is_single_replica(compose: dict[str, Any]) -> None:
     )
     # `scale:` is the deprecated knob for the same thing — pin it too.
     assert "scale" not in api or api["scale"] == 1, "api must not scale beyond one instance"
+
+
+# ---------------------------------------------------------------------------
+# Trusted-proxy set: bounded, never "*", and in lockstep with the pinned
+# network subnet (M2).
+# ---------------------------------------------------------------------------
+
+
+def _parse_networks(value: str, label: str) -> set[Any]:
+    """Parse a comma-separated CIDR list, failing with a readable message.
+
+    A bare ``ipaddress.ip_network`` raises ``ValueError`` on a wildcard or a
+    typo, which surfaces as an unreadable traceback rather than a locker
+    message naming the offending artefact.
+    """
+    out = set()
+    for part in value.split(","):
+        part = part.strip()
+        try:
+            out.add(ipaddress.ip_network(part))
+        except ValueError as exc:
+            raise AssertionError(
+                f"{label} entry {part!r} is not a valid CIDR ({exc}). It must be a "
+                "bounded network — uvicorn silently files an unparseable value under "
+                "`trusted_literals`, where it matches no peer at all."
+            ) from None
+    return out
+
+
+def _api_forwarded_allow_ips(compose: dict[str, Any]) -> str:
+    env = _services(compose)["api"].get("environment", {})
+    # compose accepts both the mapping and the "KEY=value" list form.
+    if isinstance(env, list):
+        env = dict(item.split("=", 1) for item in env if isinstance(item, str) and "=" in item)
+    value = env.get("FORWARDED_ALLOW_IPS")
+    assert value, (
+        "api must set FORWARDED_ALLOW_IPS. Unset, uvicorn falls back to 127.0.0.1 "
+        "and every client collapses onto nginx's address — safe, but per-IP rate "
+        "limiting stops discriminating between tenants (DEPLOYMENT.md 4.20.1)"
+    )
+    return str(value).strip()
+
+
+@pytest.mark.security
+def test_compose_trusted_proxy_set_is_bounded(compose: dict[str, Any]) -> None:
+    # M2. With "*" uvicorn reads the LEFTMOST X-Forwarded-For entry, which
+    # nginx leaves client-controlled (it appends the real peer to the right),
+    # so any caller rotates the per-IP rate-limit key at will. Runtime proof of
+    # both halves: tests/api/test_search.py::TestForwardedForRateLimitKeying.
+    value = _api_forwarded_allow_ips(compose)
+    assert value != "*" and "*" not in value, (
+        f"FORWARDED_ALLOW_IPS must be a bounded CIDR, never a wildcard; got {value!r}"
+    )
+    # A bounded value must parse as real network(s) — a hostname or a typo
+    # would silently land in uvicorn's `trusted_literals` and match nothing.
+    _parse_networks(value, "FORWARDED_ALLOW_IPS")
+
+
+@pytest.mark.security
+def test_compose_trusted_proxy_set_matches_the_pinned_subnet(
+    compose: dict[str, Any],
+) -> None:
+    # The two values are a pair: FORWARDED_ALLOW_IPS names exactly the peers
+    # that can reach the api service, which is the pinned `sec_gs` subnet
+    # (nginx + the Next frontend proxy). Drift between them either over-trusts
+    # (a wider CIDR re-opens spoofing from any co-located peer) or breaks the
+    # real-client lookup entirely. Pinning the subnet is what makes the
+    # bounded set expressible at all — a Docker-assigned range is unpredictable.
+    network = compose.get("networks", {}).get("sec_gs") or {}
+    configs = (network.get("ipam") or {}).get("config") or []
+    subnets = [c.get("subnet") for c in configs if isinstance(c, dict) and c.get("subnet")]
+    assert subnets, (
+        "the sec_gs network must pin an ipam subnet so FORWARDED_ALLOW_IPS can "
+        "name exactly the trusted peers"
+    )
+    declared = _parse_networks(",".join(subnets), "sec_gs ipam subnet")
+    trusted = _parse_networks(_api_forwarded_allow_ips(compose), "FORWARDED_ALLOW_IPS")
+    assert trusted == declared, (
+        f"FORWARDED_ALLOW_IPS {sorted(map(str, trusted))} has drifted from the pinned "
+        f"sec_gs subnet {sorted(map(str, declared))} — change the two in lockstep"
+    )
 
 
 # ---------------------------------------------------------------------------

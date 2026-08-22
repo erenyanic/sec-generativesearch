@@ -33,6 +33,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from sec_generative_search.api.app import create_app
 from sec_generative_search.config.settings import reload_settings
@@ -673,3 +674,104 @@ class TestRealRetrievalServiceErrorMapping:
         assert body["error"] == "invalid_query"
         assert "whitespace-only" not in response.text
         assert body["message"] == "The search query could not be processed."
+
+
+# ---------------------------------------------------------------------------
+# Trusted-proxy / X-Forwarded-For rate-limit keying  (M2 regression lock)
+# ---------------------------------------------------------------------------
+
+
+# nginx's container address inside the pinned `sec_gs` compose subnet — the
+# only peer whose X-Forwarded-For the API is configured to believe.
+_TRUSTED_PROXY_CIDR = "10.201.7.0/24"
+_NGINX_PEER = ("10.201.7.5", 40000)
+_REAL_CLIENT_IP = "203.0.113.7"
+
+
+def _spoofed_chain(nonce: int) -> str:
+    """Reproduce what uvicorn sees for a client forging X-Forwarded-For.
+
+    nginx forwards ``$proxy_add_x_forwarded_for``, which APPENDS the real
+    peer to the RIGHT of whatever the caller already sent.  So a caller
+    who forges a per-request value controls the LEFTMOST entry and the
+    real address is always rightmost.
+    """
+    return f"198.51.100.{nonce}, {_REAL_CLIENT_IP}"
+
+
+@pytest.mark.security
+class TestForwardedForRateLimitKeying:
+    """M2: the per-IP rate-limit key must not be client-spoofable.
+
+    These cases drive uvicorn's **real** ``ProxyHeadersMiddleware`` over
+    the app.  That is load-bearing: a test that merely rotates
+    ``X-Forwarded-For`` against a bare ``TestClient`` is **vacuous** —
+    that stack contains no proxy-headers layer, so ``scope["client"]``
+    stays the fixed test peer, the header is inert, and the assertion
+    passes just as happily on a wildcard-configured deployment.
+
+    The pair below is a differential test: identical traffic, the only
+    variable being the trusted-proxy set. It also acts as an upgrade
+    tripwire — if a future uvicorn changes its XFF selection semantics,
+    the deployment posture in DEPLOYMENT.md §4.20.1 needs re-review and
+    these go red.
+    """
+
+    @staticmethod
+    def _client(search_app_factory, *, trusted_hosts: str) -> TestClient:
+        app, _service = search_app_factory(
+            results=[_result()],
+            env={"API_RATE_LIMIT_SEARCH": "3"},
+        )
+        # Wrap OUTSIDE the FastAPI stack, exactly where uvicorn puts it.
+        wrapped = ProxyHeadersMiddleware(app, trusted_hosts=trusted_hosts)
+        return TestClient(wrapped, base_url="https://testserver", client=_NGINX_PEER)
+
+    def _statuses(self, client: TestClient, *, rotate: bool) -> list[int]:
+        out: list[int] = []
+        for i in range(6):
+            chain = _spoofed_chain(i) if rotate else _spoofed_chain(0)
+            r = client.post(
+                "/api/search",
+                json={"query": "any"},
+                headers={"X-Forwarded-For": chain},
+            )
+            out.append(r.status_code)
+        return out
+
+    def test_bounded_trusted_set_defeats_xff_rotation(self, search_app_factory) -> None:
+        # The shipped posture: FORWARDED_ALLOW_IPS = the pinned subnet.
+        # uvicorn walks the chain from the right and returns the first
+        # UNTRUSTED host — the real client — so every request keys to the
+        # same bucket no matter what the caller forges on the left.
+        client = self._client(search_app_factory, trusted_hosts=_TRUSTED_PROXY_CIDR)
+        statuses = self._statuses(client, rotate=True)
+
+        assert statuses.count(200) == 3, (
+            f"rotating X-Forwarded-For bypassed the per-IP window: {statuses}"
+        )
+        assert 429 in statuses, f"expected a 429 once the window is spent; got {statuses}"
+
+    def test_wildcard_trusted_set_is_exploitable(self, search_app_factory) -> None:
+        # The negative control that gives the locker above its meaning, and
+        # the reason `--forwarded-allow-ips *` is banned from every deploy
+        # artefact: under always_trust uvicorn takes the LEFTMOST entry,
+        # which the caller owns outright, so each forged value mints a
+        # fresh bucket and the window never closes.
+        client = self._client(search_app_factory, trusted_hosts="*")
+        statuses = self._statuses(client, rotate=True)
+
+        assert statuses == [200] * 6, (
+            "expected the wildcard trusted set to be exploitable (this test "
+            f"documents WHY the wildcard is banned); got {statuses}"
+        )
+
+    def test_wildcard_still_limits_a_non_rotating_caller(self, search_app_factory) -> None:
+        # Proves the bypass above comes from ROTATION, not from the
+        # wildcard disabling rate limiting altogether — i.e. the exploit is
+        # key-spoofing, exactly as M2 describes.
+        client = self._client(search_app_factory, trusted_hosts="*")
+        statuses = self._statuses(client, rotate=False)
+
+        assert statuses.count(200) == 3, f"expected the window to bind; got {statuses}"
+        assert 429 in statuses, f"expected a 429 once the window is spent; got {statuses}"
