@@ -63,6 +63,13 @@ export function AppShell({ children }: AppShellProps): JSX.Element {
     }
     // Reload to re-trigger the WelcomeGate + LoginGate probes; the
     // server-side store entries are already revoked.
+    //
+    // The HARD navigation is load-bearing and must NOT become
+    // `router.push()`. `user-vault.ts` holds the KEK and the decrypted
+    // provider-key map in MODULE MEMORY; only a full document teardown
+    // discards them. A soft client-side navigation keeps the module graph
+    // alive, so the KEK would survive "sign out" in the tab's JS heap.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- see above: full teardown of in-memory vault state
     window.location.assign("/");
   }, [signingOut]);
 
