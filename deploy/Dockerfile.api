@@ -118,6 +118,19 @@ ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 # task IDs in-process, so a second worker produces orphan task-404s.
 # --proxy-headers because nginx / GFE terminates TLS and forwards the client
 # address upstream.
+#
+# The trusted-proxy set is DEPLOYMENT-SUPPLIED via $FORWARDED_ALLOW_IPS, never
+# baked here, and NEVER "*".  With "*" uvicorn takes the always_trust path and
+# reads the LEFTMOST X-Forwarded-For entry — which nginx's
+# `$proxy_add_x_forwarded_for` leaves fully client-controlled (it appends the
+# real peer to the RIGHT).  Any client could then rotate `scope["client"]` per
+# request and defeat every per-IP rate-limit window.  With a bounded set
+# uvicorn walks the chain from the right and returns the first *untrusted*
+# host — the real client — making the rate-limit key un-spoofable.
+# Unset, uvicorn falls back to "127.0.0.1": client addresses collapse onto the
+# proxy's own address (per-IP fairness is lost) but nothing is spoofable, so
+# the default fails SAFE rather than open.  Compose pins the API network's
+# subnet and sets FORWARDED_ALLOW_IPS to exactly that CIDR.
 CMD ["uvicorn", "sec_generative_search.api.app:create_app", "--factory", \
      "--host", "0.0.0.0", "--port", "8000", \
-     "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+     "--workers", "1", "--proxy-headers"]

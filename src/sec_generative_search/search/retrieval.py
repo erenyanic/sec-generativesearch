@@ -42,7 +42,11 @@ from datetime import date
 from typing import TYPE_CHECKING
 
 from sec_generative_search.config.settings import get_settings
-from sec_generative_search.core.exceptions import SearchError
+from sec_generative_search.core.exceptions import (
+    DatabaseError,
+    ProviderError,
+    SearchError,
+)
 from sec_generative_search.core.logging import get_logger, redact_for_log
 from sec_generative_search.core.metrics import get_metrics
 from sec_generative_search.core.types import RetrievalResult, SearchResult
@@ -257,11 +261,14 @@ class RetrievalService:
             ``token_count`` is at most ``context_token_budget``.
 
         Raises:
-            SearchError: Empty query, malformed date filter, or
-                downstream ChromaDB / embedding failure.  Bubbles up
-                already-typed errors (``SearchError``, ``DatabaseError``,
-                ``ProviderError``) verbatim so callers can react to the
-                category; only unexpected errors are wrapped.
+            SearchError: Empty query, malformed date filter, invalid
+                ``top_k``, or an otherwise-untyped downstream failure.
+            DatabaseError: Storage-layer fault raised by
+                ``ChromaDBClient.query`` — propagated verbatim, never
+                re-typed (see :meth:`_fetch_candidates`).
+            ProviderError: Embedding-side fault raised by
+                ``embed_query`` — likewise propagated verbatim so the
+                caller keeps the upstream-outage retry signal.
         """
         if not query or not query.strip():
             raise SearchError(
@@ -375,9 +382,16 @@ class RetrievalService:
     ) -> list[SearchResult]:
         """Embed the query and call ``ChromaDBClient.query``.
 
-        Wraps non-typed exceptions in :class:`SearchError` so callers see
-        a uniform failure category.  Already-typed errors
-        (``DatabaseError``, ``ProviderError``) propagate verbatim.
+        Two steps run under one ``try``: the embed call (raises
+        :class:`ProviderError` when a hosted embedder is unreachable or
+        rejects the key) and the vector query (raises
+        :class:`DatabaseError` on a storage fault).  Both are siblings of
+        :class:`SearchError` under ``SECGenerativeSearchError`` — *not*
+        subclasses — so each needs its own re-raise arm.  Re-typing them
+        to ``SearchError`` would collapse a storage outage and an
+        upstream outage onto the caller-fault category, sending the
+        wrong HTTP status and retry signal and pushing the driver text
+        into a route body.  Only genuinely untyped failures are wrapped.
         """
         try:
             vector = self._embedder.embed_query(query)
@@ -393,12 +407,13 @@ class RetrievalService:
                 start_date=start_date,
                 end_date=end_date,
             )
-        except SearchError:
+        except (SearchError, DatabaseError, ProviderError):
+            # Already typed and content-safe: let each reach the route
+            # arm that owns its status code (400 / 500 / 502).
             raise
         except Exception as exc:
-            # Database and provider errors carry their own subclass and
-            # were caught by the typed branch above.  Anything else
-            # ending up here is genuinely unexpected.
+            # Genuinely unexpected — no domain class fits, so the caller
+            # sees the uniform retrieval-failure category.
             raise SearchError(
                 "Retrieval failed",
                 details=str(exc),

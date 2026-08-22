@@ -45,6 +45,7 @@ from sec_generative_search.core.exceptions import (
 )
 from sec_generative_search.core.logging import LOGGER_NAME
 from sec_generative_search.core.types import ContentType, RetrievalResult
+from sec_generative_search.search.retrieval import RetrievalService
 
 # ---------------------------------------------------------------------------
 # In-process retrieval stub
@@ -543,3 +544,132 @@ class TestSearchRateLimitClassification:
             statuses.append(r.status_code)
         assert statuses.count(200) == 3
         assert 429 in statuses
+
+
+# ---------------------------------------------------------------------------
+# Error mapping through the REAL RetrievalService  (M1 regression lock)
+# ---------------------------------------------------------------------------
+
+
+class _Vector:
+    """Minimal stand-in for the 1-D ``np.ndarray`` an embedder returns."""
+
+    @staticmethod
+    def tolist() -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+
+@dataclass
+class _FakeEmbedder:
+    """Embedder double: returns a vector or raises the supplied error."""
+
+    raise_with: Exception | None = None
+
+    def embed_query(self, query: str) -> _Vector:
+        if self.raise_with is not None:
+            raise self.raise_with
+        return _Vector()
+
+
+@dataclass
+class _FakeChroma:
+    """ChromaDB client double: returns hits or raises the supplied error."""
+
+    raise_with: Exception | None = None
+
+    def query(self, **kwargs: Any) -> list[Any]:
+        if self.raise_with is not None:
+            raise self.raise_with
+        return []
+
+
+@pytest.mark.security
+class TestRealRetrievalServiceErrorMapping:
+    """Drive the production :class:`RetrievalService` end-to-end.
+
+    :class:`TestSearchErrorMapping` above raises the typed error from a
+    *stub* ``retrieve``, so it never exercises ``_fetch_candidates`` —
+    the very method that used to re-wrap ``DatabaseError`` /
+    ``ProviderError`` into ``SearchError``.  These cases wire the real
+    service over fake embedder / Chroma doubles so the wrapping
+    behaviour is what is under test.
+    """
+
+    @staticmethod
+    def _app_with_real_service(
+        search_app_factory,
+        *,
+        embedder_raises: Exception | None = None,
+        chroma_raises: Exception | None = None,
+    ):
+        app, _stub = search_app_factory()
+        app.state.retrieval_service = RetrievalService(
+            embedder=_FakeEmbedder(raise_with=embedder_raises),
+            chroma_client=_FakeChroma(raise_with=chroma_raises),
+            token_counter=len,
+        )
+        return app
+
+    def test_embedder_provider_error_reaches_the_502_arm(self, search_app_factory) -> None:
+        app = self._app_with_real_service(
+            search_app_factory,
+            embedder_raises=ProviderError(
+                "embedder upstream failed",
+                details="https://embed.internal.example/v1 returned 500",
+            ),
+        )
+        client = TestClient(app, base_url="https://testserver")
+        response = client.post("/api/search", json={"query": "revenue concentration"})
+
+        assert response.status_code == 502
+        body = response.json()
+        assert body["error"] == "provider_error"
+        # Upstream hostnames / driver strings never reach the caller.
+        assert "embed.internal.example" not in response.text
+
+    def test_storage_database_error_reaches_the_500_arm(self, search_app_factory) -> None:
+        app = self._app_with_real_service(
+            search_app_factory,
+            chroma_raises=DatabaseError(
+                "collection read failed",
+                details="sqlite3.OperationalError: database is locked at /app/data/metadata.sqlite",
+            ),
+        )
+        client = TestClient(app, base_url="https://testserver")
+        response = client.post("/api/search", json={"query": "revenue concentration"})
+
+        assert response.status_code == 500
+        body = response.json()
+        assert body["error"] == "database_error"
+        # The SQLite path and driver text are operator-log-only.
+        assert "/app/data/metadata.sqlite" not in response.text
+        assert "OperationalError" not in response.text
+
+    def test_unexpected_error_still_collapses_to_400(self, search_app_factory) -> None:
+        # A genuinely untyped failure keeps the historical SearchError
+        # category — the narrowing must not swallow the catch-all.
+        app = self._app_with_real_service(
+            search_app_factory,
+            chroma_raises=RuntimeError("unexpected driver state 0xdeadbeef"),
+        )
+        client = TestClient(app, base_url="https://testserver")
+        response = client.post("/api/search", json={"query": "revenue concentration"})
+
+        assert response.status_code == 400
+        assert response.json()["error"] == "invalid_query"
+        # ...but the driver string must not ride the envelope out.
+        assert "0xdeadbeef" not in response.text
+
+    def test_caller_fault_search_error_body_is_a_fixed_message(self, search_app_factory) -> None:
+        # Whitespace-only query clears the schema guard (min_length=1) and
+        # is rejected by the service.  The 400 body carries a fixed
+        # message — never ``SearchError.details``.
+        app = self._app_with_real_service(search_app_factory)
+        client = TestClient(app, base_url="https://testserver")
+        response = client.post("/api/search", json={"query": "   "})
+
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"] == "invalid_query"
+        assert "whitespace-only" not in response.text
+        assert body["message"] == "The search query could not be processed."

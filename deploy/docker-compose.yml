@@ -52,6 +52,15 @@ services:
       # Point the secret-bearing knobs at the Docker-secret mount points below.
       DB_ENCRYPTION_KEY_FILE: /run/secrets/db_encryption_key
       API_AUTH_PEPPER_FILE: /run/secrets/api_auth_pepper
+      # Trusted-proxy set for uvicorn's --proxy-headers. MUST be a bounded
+      # CIDR and MUST NEVER be "*": with "*" uvicorn trusts the LEFTMOST
+      # X-Forwarded-For entry, which nginx leaves client-controlled (it appends
+      # the real peer to the right), letting any caller rotate the per-IP
+      # rate-limit key at will. Bounded, uvicorn walks the chain from the right
+      # and returns the first untrusted host — the real client. This value is
+      # exactly the `sec_gs` subnet pinned under `networks:` below; change both
+      # together if the range collides with an existing network.
+      FORWARDED_ALLOW_IPS: 10.201.7.0/24
     # Docker secrets mount read-only at /run/secrets/<name> and fail loudly if
     # the source file is missing (a plain bind mount would silently create a
     # directory there and break SQLCipher).
@@ -113,6 +122,14 @@ services:
 networks:
   sec_gs:
     driver: bridge
+    # Subnet is PINNED so the API's FORWARDED_ALLOW_IPS can name exactly the
+    # peers allowed to set X-Forwarded-For (nginx + the Next frontend proxy).
+    # A Docker-assigned subnet would be unpredictable and force the wildcard
+    # this deployment must never use. Keep in lockstep with
+    # `services.api.environment.FORWARDED_ALLOW_IPS`.
+    ipam:
+      config:
+        - subnet: 10.201.7.0/24
 
 volumes:
   sec_gs_data:

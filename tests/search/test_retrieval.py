@@ -13,7 +13,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from sec_generative_search.core.exceptions import CitationError, SearchError
+from sec_generative_search.core.exceptions import (
+    CitationError,
+    DatabaseError,
+    ProviderError,
+    SearchError,
+)
 from sec_generative_search.core.types import (
     ContentType,
     RetrievalResult,
@@ -86,6 +91,29 @@ class _FailingChroma:
     def query(self, **kwargs):  # type: ignore[no-untyped-def]
         del kwargs
         raise RuntimeError("chroma exploded")
+
+
+class _RaisingChroma:
+    """Raises a caller-supplied exception from ``query``."""
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+    def query(self, **kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        raise self.exc
+
+
+class _RaisingEmbedder(_FakeEmbedder):
+    """Embedder whose ``embed_query`` raises a caller-supplied exception."""
+
+    def __init__(self, api_key: str, exc: Exception) -> None:
+        super().__init__(api_key)
+        self.exc = exc
+
+    def embed_query(self, text: str) -> np.ndarray:
+        del text
+        raise self.exc
 
 
 class _IdentityReranker(BaseRerankerProvider):
@@ -629,6 +657,56 @@ class TestSecurity:
 
         joined = "\n".join(rec.getMessage() for rec in caplog.records)
         assert "supply chain risk" in joined
+
+    @pytest.mark.security
+    def test_database_error_propagates_verbatim(self) -> None:
+        # A storage fault MUST keep its class so the route maps it to
+        # 500 ``database_error`` (generic body) rather than the
+        # caller-fault 400 whose message used to render
+        # ``"{message} — {details}"`` — leaking the driver text.
+        original = DatabaseError(
+            "collection read failed",
+            details="sqlite3.OperationalError: database is locked at /app/data/metadata.sqlite",
+        )
+        svc = RetrievalService(
+            _FakeEmbedder("k"),
+            _RaisingChroma(original),
+            token_counter=lambda _t: 1,
+        )
+        with pytest.raises(DatabaseError) as excinfo:
+            svc.retrieve("revenue concentration risk")
+        assert excinfo.value is original
+        assert not isinstance(excinfo.value, SearchError)
+
+    @pytest.mark.security
+    def test_provider_error_propagates_verbatim(self) -> None:
+        # A hosted-embedder outage MUST keep its class so the route maps
+        # it to a retryable 502, not a do-not-retry 400.
+        original = ProviderError(
+            "embedder upstream failed",
+            details="https://embed.internal.example/v1 returned 500",
+        )
+        svc = RetrievalService(
+            _RaisingEmbedder("k", original),
+            _FakeChroma([]),
+            token_counter=lambda _t: 1,
+        )
+        with pytest.raises(ProviderError) as excinfo:
+            svc.retrieve("revenue concentration risk")
+        assert excinfo.value is original
+        assert not isinstance(excinfo.value, SearchError)
+
+    @pytest.mark.security
+    def test_untyped_error_is_still_wrapped(self) -> None:
+        # The narrowing must not remove the catch-all: an unexpected
+        # failure still collapses onto the uniform SearchError category.
+        svc = RetrievalService(
+            _FakeEmbedder("k"),
+            _FailingChroma(),
+            token_counter=lambda _t: 1,
+        )
+        with pytest.raises(SearchError):
+            svc.retrieve("revenue concentration risk")
 
     @pytest.mark.security
     def test_no_credential_shaped_attributes(self) -> None:

@@ -117,10 +117,12 @@ def search_filings(
             context_token_budget=body.context_token_budget,
         )
     except SearchError as exc:
-        # Caller-input fault.  The driver detail is logged here but the
-        # body only carries the safe ``message`` so we do not echo the
-        # offending value back to the caller (``redact_for_log`` honours
-        # ``LOG_REDACT_QUERIES`` for the operator log).
+        # Caller-input fault (empty query, malformed date, bad top_k) or
+        # an untyped downstream failure the service could not classify.
+        # ``str(exc)`` renders ``"{message} — {details}"``, and
+        # ``details`` may carry driver text or a file path, so the body
+        # gets a FIXED message and the detail stays in the operator log
+        # only (``redact_for_log`` honours ``LOG_REDACT_QUERIES`` there).
         logger.warning(
             "search rejected: query=%r details=%s",
             redact_for_log(body.query[:80]),
@@ -129,7 +131,7 @@ def search_filings(
         raise http_error(
             status_code=400,
             error="invalid_query",
-            message=str(exc),
+            message="The search query could not be processed.",
             hint=(
                 "Check the query (must be non-empty), date filters "
                 "(YYYY-MM-DD), and top_k (positive integer)."

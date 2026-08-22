@@ -279,6 +279,27 @@ def test_server_runs_single_worker_behind_proxy(dockerfile: str) -> None:
     assert "--proxy-headers" in cmd, "uvicorn must run with --proxy-headers behind nginx/GFE"
 
 
+@pytest.mark.security
+def test_dockerfile_never_bakes_a_wildcard_trusted_proxy_set(dockerfile: str) -> None:
+    # M2 regression lock. `--forwarded-allow-ips *` puts uvicorn's
+    # _TrustedHosts into always_trust mode, where get_trusted_client_host()
+    # returns the LEFTMOST X-Forwarded-For entry. nginx forwards
+    # `$proxy_add_x_forwarded_for`, which APPENDS the real peer to the RIGHT of
+    # whatever the client sent — so the leftmost value is fully
+    # client-controlled and `scope["client"]` (the per-IP rate-limit key)
+    # becomes rotatable per request. The trusted set must be
+    # deployment-supplied via $FORWARDED_ALLOW_IPS and always bounded.
+    flat = re.sub(r"\\\s*\n", " ", dockerfile)
+    assert "--forwarded-allow-ips" not in flat, (
+        "Dockerfile bakes --forwarded-allow-ips; the trusted-proxy set must come "
+        "from the deployment ($FORWARDED_ALLOW_IPS), never the image"
+    )
+    assert not re.search(r'FORWARDED_ALLOW_IPS[=:]\s*["\']?\*', flat), (
+        "Dockerfile sets a wildcard FORWARDED_ALLOW_IPS — every per-IP rate-limit "
+        "window becomes spoofable via X-Forwarded-For"
+    )
+
+
 # ==========================================================================
 # Frontend image (deploy/Dockerfile.frontend) — the frontend-image-keyless
 # half of the deployment lockers.

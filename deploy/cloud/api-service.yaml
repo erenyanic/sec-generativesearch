@@ -82,6 +82,16 @@ spec:
               nvidia.com/gpu: "1"
           # --- Non-secret configuration (Scenario C / cloud profile) ---------
           env:
+            # uvicorn's --proxy-headers trusted-proxy set. Deliberately LEFT
+            # UNSET: ingress is `internal`, so the only peer is the Cloud Run
+            # frontend service, whose Next admin proxy strips every inbound
+            # X-Forwarded-* header before forwarding. uvicorn's unset default
+            # ("127.0.0.1") therefore trusts nothing and keeps the per-IP
+            # rate-limit key un-spoofable. If this service is ever given
+            # public ingress, set FORWARDED_ALLOW_IPS to the verified
+            # front-end range — NEVER "*" (with "*" uvicorn reads the
+            # leftmost, client-controlled X-Forwarded-For entry and every
+            # per-IP window becomes rotatable).
             - name: DB_DEPLOYMENT_PROFILE
               value: cloud
             # Public demo: FIFO eviction + "clear all" disabled via the API.
