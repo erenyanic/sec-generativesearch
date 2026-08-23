@@ -123,9 +123,7 @@ line-length = 100
 # adapted for the current generative-search code style. Each entry is
 # removed from this list once the module is brought up to the same lint
 # standard as the rest of the project.
-extend-exclude = [
-    "src/sec_generative_search/api/routes/filings.py",
-]
+extend-exclude = []
 
 [tool.ruff.lint]
 select = [

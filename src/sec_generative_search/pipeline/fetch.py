@@ -43,7 +43,7 @@ from edgar import Company, set_identity
 from sec_generative_search.config.constants import BASE_FORMS, SUPPORTED_FORMS
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.exceptions import FetchError
-from sec_generative_search.core.logging import get_logger
+from sec_generative_search.core.logging import get_logger, redact_for_log
 from sec_generative_search.core.types import FilingIdentifier
 
 logger = get_logger(__name__)
@@ -446,7 +446,7 @@ class FilingFetcher:
         if filing_info._filing_obj is not None:
             logger.info(
                 "Fetching %s %s content directly (accession: %s)",
-                filing_info.ticker,
+                redact_for_log(filing_info.ticker),
                 filing_info.form_type,
                 filing_info.accession_number,
             )
@@ -457,7 +457,7 @@ class FilingFetcher:
             )
             logger.info(
                 "Fetched %s %s (%s): %s characters",
-                filing_info.ticker,
+                redact_for_log(filing_info.ticker),
                 filing_info.form_type,
                 filing_id.date_str,
                 f"{len(html_content):,}",
@@ -553,7 +553,7 @@ class FilingFetcher:
             "Listed %d available %s filings for %s",
             len(result),
             form_type,
-            ticker,
+            redact_for_log(ticker),
         )
 
         return result
@@ -671,7 +671,7 @@ class FilingFetcher:
 
         logger.info(
             "Fetching %s %s at index %d",
-            ticker,
+            redact_for_log(ticker),
             form_type,
             index,
         )
@@ -695,7 +695,7 @@ class FilingFetcher:
 
         logger.info(
             "Fetched %s %s (%s): %s characters",
-            ticker,
+            redact_for_log(ticker),
             form_type,
             filing_id.date_str,
             f"{len(html_content):,}",
@@ -760,7 +760,7 @@ class FilingFetcher:
             "Fetching up to %d %s filings for %s",
             count,
             form_type,
-            ticker,
+            redact_for_log(ticker),
         )
 
         company = self._get_company(ticker)
@@ -805,7 +805,7 @@ class FilingFetcher:
             "Completed: fetched %d %s filings for %s",
             fetched_count,
             form_type,
-            ticker,
+            redact_for_log(ticker),
         )
 
     def fetch_by_accession(
@@ -842,7 +842,7 @@ class FilingFetcher:
 
         logger.info(
             "Fetching %s %s by accession: %s",
-            ticker,
+            redact_for_log(ticker),
             form_type,
             accession_number,
         )
@@ -858,7 +858,7 @@ class FilingFetcher:
                 filing_id, html_content = self._fetch_filing_content(filing, ticker, form_type)
                 logger.info(
                     "Fetched %s %s (%s): %s characters",
-                    ticker,
+                    redact_for_log(ticker),
                     form_type,
                     filing_id.date_str,
                     f"{len(html_content):,}",
@@ -931,7 +931,9 @@ class FilingFetcher:
                 )
                 results[ticker.upper()] = filings
             except FetchError as e:
-                logger.warning("Failed to list filings for %s: %s", ticker, e.message)
+                logger.warning(
+                    "Failed to list filings for %s: %s", redact_for_log(ticker), e.message
+                )
                 results[ticker.upper()] = []
 
         total_filings = sum(len(f) for f in results.values())
@@ -1012,13 +1014,13 @@ class FilingFetcher:
                 logger.debug(
                     "Fetched %d filings for %s",
                     ticker_count,
-                    ticker,
+                    redact_for_log(ticker),
                 )
 
             except FetchError as e:
                 logger.warning(
                     "Skipping %s due to error: %s",
-                    ticker,
+                    redact_for_log(ticker),
                     e.message,
                 )
                 continue

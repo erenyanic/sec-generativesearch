@@ -92,7 +92,11 @@ from sec_generative_search.core.exceptions import (
     FilingLimitExceededError,
     SECGenerativeSearchError,
 )
-from sec_generative_search.core.logging import get_logger
+from sec_generative_search.core.logging import (
+    get_logger,
+    redact_all_for_log,
+    redact_for_log,
+)
 from sec_generative_search.core.metrics import get_metrics
 from sec_generative_search.pipeline.fetch import FilingFetcher, FilingInfo
 from sec_generative_search.pipeline.orchestrator import PipelineOrchestrator
@@ -526,7 +530,7 @@ class TaskManager:
         logger.info(
             "Created task %s: tickers=%s, forms=%s, mode=%s",
             task_id[:8],
-            tickers,
+            redact_all_for_log(tickers),
             form_types,
             count_mode,
         )
@@ -1070,7 +1074,7 @@ class TaskManager:
             logger.info(
                 "Task %s: ingested %s %s (%s) — %d chunks in %.1fs",
                 info.task_id[:8],
-                filing_id.ticker,
+                redact_for_log(filing_id.ticker),
                 filing_id.form_type,
                 filing_id.date_str,
                 result.ingest_result.chunk_count,
@@ -1263,7 +1267,7 @@ class TaskManager:
                         logger.warning(
                             "Task %s: fetch failed for %s %s — %s",
                             info.task_id[:8],
-                            ticker,
+                            redact_for_log(ticker),
                             form_type,
                             exc.message,
                         )

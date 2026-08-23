@@ -316,7 +316,7 @@ class RetrievalService:
             effective_top_k,
             fetch_count,
             effective_min_sim,
-            ticker if ticker else "any",
+            redact_for_log(ticker) if ticker else "any",
             form_type if form_type else "any",
             self._reranker is not None,
         )

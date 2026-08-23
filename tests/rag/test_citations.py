@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
+from sec_generative_search.core.logging import LOGGER_NAME
+from sec_generative_search.core.types import ContentType, RetrievalResult
 from sec_generative_search.rag.citations import (
+    _build_citations,
     extract_citations,
     extract_from_inline_markers,
     extract_from_json_envelope,
@@ -274,3 +278,65 @@ class TestHybridDispatcher:
         payload = "Inline [1] [2]."
         result = extract_citations(payload, sample_chunks, prefer_json=False)
         assert len(result.citations) == 2
+
+
+@pytest.mark.security
+class TestCitationLoggingIsTotalAndContentFree:
+    """The drop-and-log path must survive redaction being switched on.
+
+    ``chunk_id`` is ``str | None`` and ``to_citation()`` raises precisely
+    when it is falsy — so a *missing* id is the primary way execution
+    reaches the warning below. Handing ``None`` to ``redact_for_log``
+    there would raise ``AttributeError`` out of an ``except`` block and
+    turn the documented "logged-and-dropped, never raised" contract into
+    a raise, on the RAG generation path, only when
+    ``LOG_REDACT_QUERIES`` is on.
+    """
+
+    @staticmethod
+    def _malformed_chunk(*, chunk_id: str | None) -> RetrievalResult:
+        return RetrievalResult(
+            content="Segment revenue rose.",
+            path="Part I > Item 1",
+            content_type=ContentType.TEXT,
+            ticker="ZQXW",
+            form_type="10-K",
+            similarity=0.5,
+            # ``filing_date`` missing → ``to_citation`` raises even when
+            # a chunk_id *is* present, so both branches are reachable.
+            filing_date=None,
+            accession_number="0000320193-23-000077",
+            chunk_id=chunk_id,
+            token_count=8,
+        )
+
+    @pytest.mark.parametrize("chunk_id", [None, "ZQXW_10-K_2023-09-30_001"])
+    def test_drops_without_raising_under_redaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        chunk_id: str | None,
+    ) -> None:
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        assert _build_citations([self._malformed_chunk(chunk_id=chunk_id)]) == []
+
+    def test_warning_carries_no_ticker(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        logger_name = "sec_generative_search.rag.citations"
+        package_logger = logging.getLogger(LOGGER_NAME)
+        prior_propagate = package_logger.propagate
+        package_logger.propagate = True
+        try:
+            with caplog.at_level(logging.WARNING, logger=logger_name):
+                _build_citations([self._malformed_chunk(chunk_id="ZQXW_10-K_2023-09-30_001")])
+        finally:
+            package_logger.propagate = prior_propagate
+
+        messages = [r.getMessage() for r in caplog.records if r.name == logger_name]
+        assert messages, "expected a drop warning"
+        # ``chunk_id`` is ``{TICKER}_{FORM}_{DATE}_{INDEX}`` — the whole
+        # value is a ticker carrier, so it must not appear raw.
+        assert all("ZQXW" not in message for message in messages)

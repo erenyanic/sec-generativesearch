@@ -45,6 +45,7 @@ embedder is touched.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Iterator
@@ -588,3 +589,217 @@ class TestSessionIdHeaderPathRejection:
         # And the planted credential is still present in the store —
         # the logout call did NOT find it.
         assert api_app.state.session_store.get(planted_sid, "openai") is not None
+
+
+# ---------------------------------------------------------------------------
+# 5. Research identifiers (ticker / accession) never reach the log stream
+#    under LOG_REDACT_QUERIES (finding M3)
+# ---------------------------------------------------------------------------
+
+# A ticker shaped like a real one but unmistakable in a log line, and the
+# canonical accession shape. Both are the Tier-3 "research pattern" the
+# no-persistence model keeps out of storage — the log stream must not
+# re-expose them.
+_TICKER_SENTINEL = "ZQXW"
+_ACCESSION_SENTINEL = "0000320193-23-000077"
+
+
+@dataclass
+class _LogProbeRetrievalService:
+    """Retrieval stub for the redaction probe — returns one hit."""
+
+    def retrieve(self, query: str, **kwargs: Any) -> list[Any]:
+        return []
+
+
+@dataclass
+class _LogProbeRegistry:
+    """Registry stub exposing exactly one filing under the sentinels."""
+
+    record: Any
+
+    def get_filing(self, accession_number: str) -> Any:
+        if accession_number == self.record.accession_number:
+            return self.record
+        return None
+
+
+@dataclass
+class _LogProbeStore:
+    """FilingStore stub that reports a successful single delete."""
+
+    deleted: list[str] = field(default_factory=list)
+
+    def delete_filing(self, accession_number: str) -> bool:
+        self.deleted.append(accession_number)
+        return True
+
+
+@dataclass
+class _LogProbeTaskManager:
+    """TaskManager stub for the ingest create path."""
+
+    created: list[dict[str, Any]] = field(default_factory=list)
+
+    def create_task(self, **kwargs: Any) -> str:
+        kwargs.pop("edgar_identity_resolver", None)
+        self.created.append(kwargs)
+        return f"{len(self.created):032x}"
+
+
+@pytest.fixture
+def json_log_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Iterator[Any]:
+    """Boot the **real** package logging stack into a JSON-lines file.
+
+    ``caplog`` attaches to the root logger, but the package logger sets
+    ``propagate = False`` and the redaction filter lives on the
+    *handlers* ``configure_logging`` builds (same placement as
+    :class:`CorrelationIdFilter`, and for the same reason). Capturing
+    through ``caplog`` would therefore observe **unfiltered** records
+    and make this lock vacuous. Driving the production
+    ``configure_logging`` path into a real file handler exercises
+    filter + handler wiring + formatter exactly as a Scenario-B/C
+    deployment does.
+    """
+    from sec_generative_search.core import logging as sgs_logging
+
+    log_file = tmp_path / "app.jsonl"
+    monkeypatch.setenv("LOG_FILE_PATH", str(log_file))
+    monkeypatch.setenv("LOG_FORMAT", "json")
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("LOG_REDACT_QUERIES", "true")
+
+    package_logger = logging.getLogger(LOGGER_NAME)
+    prior_handlers = list(package_logger.handlers)
+    prior_level = package_logger.level
+    prior_configured = sgs_logging._logging_configured
+
+    # ``configure_logging`` early-returns on the module global; without
+    # this reset the new handler is never built and the assertions below
+    # would pass vacuously.
+    package_logger.handlers.clear()
+    sgs_logging._logging_configured = False
+    sgs_logging.configure_logging(use_rich=False)
+
+    try:
+        yield log_file
+    finally:
+        for handler in list(package_logger.handlers):
+            handler.close()
+        package_logger.handlers[:] = prior_handlers
+        package_logger.setLevel(prior_level)
+        sgs_logging._logging_configured = prior_configured
+
+
+@pytest.mark.security
+class TestResearchIdentifierLogRedaction:
+    """``LOG_REDACT_QUERIES=true`` must cover tickers **and** accessions.
+
+    The flag is a documented Scenario-B/C default and ``LOG_FORMAT=json``
+    ships the stream to an aggregator (a third-party one in Scenario C).
+    An operator who enables it must not still be shipping every ingested,
+    searched, and deleted research target in plaintext.
+
+    Drives the three surfaces the finding names — an ingest create, a
+    ``POST /api/search`` carrying a ticker filter, and a
+    ``DELETE /api/filings/{accession}`` — through the real logging stack
+    and asserts no raw identifier survives in any emitted record.
+    """
+
+    def _drive_all_three_surfaces(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sec_generative_search.database import FilingRecord
+
+        for key in list(os.environ):
+            if key.startswith("API_") or key.startswith("EDGAR_"):
+                monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("EDGAR_IDENTITY_NAME", "Test User")
+        monkeypatch.setenv("EDGAR_IDENTITY_EMAIL", "test@example.com")
+        reload_settings()
+
+        record = FilingRecord(
+            id=1,
+            ticker=_TICKER_SENTINEL,
+            form_type="10-K",
+            filing_date="2023-09-30",
+            accession_number=_ACCESSION_SENTINEL,
+            chunk_count=12,
+            ingested_at="2024-01-01T00:00:00Z",
+        )
+
+        app = create_app()
+        app.state.retrieval_service = _LogProbeRetrievalService()
+        app.state.registry = _LogProbeRegistry(record=record)
+        app.state.filing_store = _LogProbeStore()
+        app.state.task_manager = _LogProbeTaskManager()
+        app.state.session_store = InMemorySessionCredentialStore(ttl_seconds=300)
+        app.state.edgar_identity_store = InMemorySessionEdgarIdentityStore(ttl_seconds=300)
+        app.state.encrypted_credential_store = None
+
+        client = TestClient(app, base_url="https://testserver")
+
+        created = client.post(
+            "/api/ingest/add",
+            json={"tickers": [_TICKER_SENTINEL], "form_types": ["10-K"]},
+        )
+        assert created.status_code == 202, created.text
+
+        searched = client.post(
+            "/api/search",
+            json={"query": "segment revenue", "ticker": _TICKER_SENTINEL},
+        )
+        assert searched.status_code == 200, searched.text
+
+        deleted = client.delete(f"/api/filings/{_ACCESSION_SENTINEL}")
+        assert deleted.status_code == 200, deleted.text
+
+    @staticmethod
+    def _emitted_lines(log_file) -> list[str]:
+        text = log_file.read_text(encoding="utf-8")
+        return [line for line in text.splitlines() if line.strip()]
+
+    def test_no_raw_ticker_or_accession_in_any_emitted_record(
+        self,
+        json_log_file,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._drive_all_three_surfaces(monkeypatch)
+
+        lines = self._emitted_lines(json_log_file)
+        assert lines, "expected the routes to emit at least one log record"
+
+        # Non-vacuity: the three audit lines must actually be present,
+        # otherwise the absence assertions below prove nothing.
+        joined = "\n".join(lines)
+        for action in ("ingest_task_created", "search_executed", "delete_filing"):
+            assert action in joined, f"expected a {action} audit line"
+
+        for line in lines:
+            payload = json.loads(line)
+            message = payload["message"]
+            assert _TICKER_SENTINEL not in message, f"raw ticker leaked: {message}"
+            assert _ACCESSION_SENTINEL not in message, f"raw accession leaked: {message}"
+            # The dash-free rendering must not survive either.
+            assert _ACCESSION_SENTINEL.replace("-", "") not in message
+
+        # And the redaction actually fired (rather than the identifiers
+        # simply being dropped from every line).
+        assert "<redacted:" in joined
+
+    def test_scenario_a_default_keeps_identifiers_readable(
+        self,
+        json_log_file,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With the flag off (Scenario A) the operator keeps full detail.
+
+        The control is deliberately opt-in: a single-user local install
+        gets grep-able logs. Pinning this stops a future change from
+        turning redaction on unconditionally, which would be a silent
+        operability regression.
+        """
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "false")
+        self._drive_all_three_surfaces(monkeypatch)
+
+        joined = "\n".join(self._emitted_lines(json_log_file))
+        assert _TICKER_SENTINEL in joined
+        assert _ACCESSION_SENTINEL in joined

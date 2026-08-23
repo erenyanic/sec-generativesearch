@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from sec_generative_search.core.logging import get_logger
+from sec_generative_search.core.logging import get_logger, redact_for_log
 from sec_generative_search.core.types import Chunk, FilingIdentifier, IngestResult
 from sec_generative_search.pipeline.chunk import TextChunker
 from sec_generative_search.pipeline.fetch import FilingFetcher
@@ -188,7 +188,7 @@ class PipelineOrchestrator:
 
         logger.info(
             "Processing %s %s (%s)",
-            filing_id.ticker,
+            redact_for_log(filing_id.ticker),
             filing_id.form_type,
             filing_id.date_str,
         )
@@ -223,7 +223,7 @@ class PipelineOrchestrator:
 
         logger.info(
             "Processed %s %s: %d segments → %d chunks in %.1fs",
-            filing_id.ticker,
+            redact_for_log(filing_id.ticker),
             filing_id.form_type,
             len(segments),
             len(chunks),
@@ -255,7 +255,7 @@ class PipelineOrchestrator:
         Returns:
             ProcessedFiling containing all processed data.
         """
-        logger.info("Ingesting latest %s for %s", form_type, ticker)
+        logger.info("Ingesting latest %s for %s", form_type, redact_for_log(ticker))
 
         if progress_callback:
             progress_callback("Fetching", 0, 4)
@@ -287,7 +287,7 @@ class PipelineOrchestrator:
         """
         logger.info(
             "Ingesting %s %s at index %d",
-            ticker,
+            redact_for_log(ticker),
             form_type,
             index,
         )
@@ -329,7 +329,7 @@ class PipelineOrchestrator:
         logger.info(
             "Ingesting multiple %s filings for %s",
             form_type,
-            ticker,
+            redact_for_log(ticker),
         )
 
         for filing_id, html_content in self.fetcher.fetch(
@@ -397,7 +397,7 @@ class PipelineOrchestrator:
             except Exception as e:
                 logger.warning(
                     "Failed to process %s %s: %s",
-                    filing_id.ticker,
+                    redact_for_log(filing_id.ticker),
                     filing_id.accession_number,
                     str(e),
                 )

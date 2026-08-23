@@ -14,6 +14,8 @@ errors) we care about.
 
 from __future__ import annotations
 
+import io
+import logging
 import sqlite3
 import threading
 from datetime import date
@@ -26,6 +28,7 @@ from sec_generative_search.core.exceptions import (
     DatabaseError,
     FilingLimitExceededError,
 )
+from sec_generative_search.core.logging import LOGGER_NAME, AccessionRedactionFilter
 from sec_generative_search.core.types import FilingIdentifier
 from sec_generative_search.database import (
     DatabaseStatistics,
@@ -1186,3 +1189,52 @@ class TestSettingsDefaults:
             for extra in cleanup:
                 if extra.exists():
                     extra.unlink()
+
+
+@pytest.mark.security
+class TestRegistryLogStreamIsIdentifierFree:
+    """The **real** registry's log lines carry no ticker or accession.
+
+    The static call-site lock in ``tests/core/test_logging.py`` proves
+    every ticker expression is *wrapped*; it cannot prove the wrapper
+    survives the value at runtime. This drives the production
+    ``MetadataRegistry`` through register → remove with redaction on and
+    captures through a handler that carries
+    :class:`AccessionRedactionFilter`, which is what a Scenario-B/C
+    deployment actually runs (``caplog`` attaches to root and would see
+    unfiltered records).
+    """
+
+    def test_register_and_remove_emit_no_raw_identifier(
+        self,
+        registry: MetadataRegistry,
+        sample_filing_id: FilingIdentifier,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.DEBUG)
+        handler.addFilter(AccessionRedactionFilter())
+        package_logger = logging.getLogger(LOGGER_NAME)
+        prior_level = package_logger.level
+        package_logger.addHandler(handler)
+        package_logger.setLevel(logging.DEBUG)
+        try:
+            registry.register_filing(sample_filing_id, chunk_count=12)
+            # Atomic re-registration hits the "already registered" branch,
+            # which logs the accession.
+            registry.register_filing_if_new(sample_filing_id, chunk_count=12)
+            registry.remove_filing(sample_filing_id.accession_number)
+            # Second removal hits the "not found in registry" warning.
+            registry.remove_filing(sample_filing_id.accession_number)
+        finally:
+            package_logger.removeHandler(handler)
+            package_logger.setLevel(prior_level)
+
+        emitted = stream.getvalue()
+        assert emitted.strip(), "expected the registry to log something"
+        assert sample_filing_id.ticker not in emitted
+        assert sample_filing_id.accession_number not in emitted
+        assert "<redacted:" in emitted

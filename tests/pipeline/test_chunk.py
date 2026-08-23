@@ -28,12 +28,15 @@ Covers the chunker's core guarantees:
 
 from __future__ import annotations
 
+import io
+import logging
 from datetime import date
 from itertools import pairwise
 
 import pytest
 
 from sec_generative_search.core.exceptions import ChunkingError
+from sec_generative_search.core.logging import LOGGER_NAME, AccessionRedactionFilter
 from sec_generative_search.core.types import (
     ContentType,
     FilingIdentifier,
@@ -362,3 +365,47 @@ class TestActiveCentringCut:
         # the upper bound.
         assert chunks[0].content.startswith("short one")
         assert "word word" in chunks[1].content
+
+
+@pytest.mark.security
+class TestChunkerLogStreamIsIdentifierFree:
+    """The **real** chunker's progress line carries no ticker.
+
+    Runtime companion to the static call-site lock in
+    ``tests/core/test_logging.py``: that lock proves the expression is
+    *wrapped*, this one proves the wrapper survives a real call. The
+    handler carries :class:`AccessionRedactionFilter` because that is
+    what ``configure_logging`` installs in production — ``caplog``
+    attaches to root and would observe unfiltered records.
+    """
+
+    def test_chunking_emits_no_raw_ticker_or_accession(
+        self,
+        filing_id: FilingIdentifier,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.DEBUG)
+        handler.addFilter(AccessionRedactionFilter())
+        package_logger = logging.getLogger(LOGGER_NAME)
+        prior_level = package_logger.level
+        package_logger.addHandler(handler)
+        package_logger.setLevel(logging.DEBUG)
+        try:
+            chunker = TextChunker(token_limit=50, tolerance=10, overlap_tokens=0)
+            segment = _make_segment(
+                f"Revenue rose in {filing_id.ticker}. " * 20,
+                filing_id,
+            )
+            assert chunker.chunk_segments([segment])
+        finally:
+            package_logger.removeHandler(handler)
+            package_logger.setLevel(prior_level)
+
+        emitted = stream.getvalue()
+        assert emitted.strip(), "expected the chunker to log something"
+        assert filing_id.ticker not in emitted
+        assert filing_id.accession_number not in emitted

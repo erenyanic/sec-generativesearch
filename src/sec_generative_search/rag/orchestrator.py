@@ -50,7 +50,11 @@ from typing import TYPE_CHECKING
 
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.exceptions import GenerationError, ProviderError
-from sec_generative_search.core.logging import get_logger, redact_for_log
+from sec_generative_search.core.logging import (
+    get_logger,
+    redact_all_for_log,
+    redact_for_log,
+)
 from sec_generative_search.core.metrics import get_metrics
 from sec_generative_search.core.provider_health import get_provider_health
 from sec_generative_search.core.types import (
@@ -783,7 +787,7 @@ class RAGOrchestrator:
         logger.info(
             "RAG refusal — no chunks retrieved for query=%r tickers=%s",
             redact_for_log(plan.raw_query[:80]),
-            plan.tickers or "any",
+            redact_all_for_log(plan.tickers) if plan.tickers else "any",
         )
         return GenerationResult(
             answer=_REFUSAL_TEXT,

@@ -20,7 +20,7 @@ import re
 
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.exceptions import ChunkingError
-from sec_generative_search.core.logging import get_logger
+from sec_generative_search.core.logging import get_logger, redact_for_log
 from sec_generative_search.core.types import Chunk, ContentType, Segment
 
 logger = get_logger(__name__)
@@ -329,7 +329,7 @@ class TextChunker:
         logger.info(
             "Chunking %d segments from %s %s",
             len(segments),
-            filing_id.ticker,
+            redact_for_log(filing_id.ticker),
             filing_id.form_type,
         )
 

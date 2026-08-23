@@ -170,7 +170,8 @@ def search_filings(
         endpoint="POST /api/search",
         detail=(
             f"hits={len(results)} top_k={body.top_k or 'default'} "
-            f"ticker={body.ticker or 'any'} form_type={body.form_type or 'any'}"
+            f"ticker={redact_for_log(body.ticker) if body.ticker else 'any'} "
+            f"form_type={body.form_type or 'any'}"
         ),
     )
     return SearchResponse(

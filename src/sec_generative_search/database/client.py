@@ -39,7 +39,7 @@ from sec_generative_search.core.exceptions import (
     DatabaseError,
     EmbeddingCollectionMismatchError,
 )
-from sec_generative_search.core.logging import get_logger
+from sec_generative_search.core.logging import get_logger, redact_for_log
 from sec_generative_search.core.types import EmbedderStamp, SearchResult
 
 if TYPE_CHECKING:
@@ -314,7 +314,7 @@ class ChromaDBClient:
             logger.info(
                 "Stored %d chunks for %s %s (%s)",
                 len(chunks),
-                filing_id.ticker,
+                redact_for_log(filing_id.ticker),
                 filing_id.form_type,
                 filing_id.date_str,
             )

@@ -42,7 +42,7 @@ import re
 from typing import TYPE_CHECKING
 
 from sec_generative_search.core.exceptions import CitationError
-from sec_generative_search.core.logging import get_logger
+from sec_generative_search.core.logging import get_logger, redact_for_log
 
 if TYPE_CHECKING:
     from sec_generative_search.core.types import Citation, RetrievalResult
@@ -193,7 +193,10 @@ def extract_from_json_envelope(
             continue
         chunk = by_id.get(raw_id)
         if chunk is None:
-            logger.info("Model emitted unknown citation chunk_id=%r; dropping", raw_id)
+            logger.info(
+                "Model emitted unknown citation chunk_id=%r; dropping",
+                redact_for_log(raw_id),
+            )
             continue
         matched.append(chunk)
         seen.add(raw_id)
@@ -266,9 +269,14 @@ def _build_citations(chunks: list[RetrievalResult]) -> list[Citation]:
         except CitationError as exc:
             # Malformed retrieval result reaching this point indicates
             # an upstream bug, not adversarial input — log and drop.
+            # A *missing* ``chunk_id`` is the single most common way to
+            # land here (``to_citation`` raises on a falsy id), and it is
+            # itself the diagnostic — so report it as missing rather than
+            # handing ``None`` to ``redact_for_log``, which would raise
+            # out of this handler and break the never-raise contract.
             logger.warning(
-                "Skipping citation for chunk_id=%r due to validation error: %s",
-                chunk.chunk_id,
+                "Skipping citation for chunk_id=%s due to validation error: %s",
+                redact_for_log(chunk.chunk_id) if chunk.chunk_id else "<missing>",
                 exc,
             )
     return out

@@ -10,12 +10,15 @@ EDGAR access or a real model.
 
 from __future__ import annotations
 
+import io
+import logging
 from collections.abc import Iterator
 from datetime import date
 
 import numpy as np
 import pytest
 
+from sec_generative_search.core.logging import LOGGER_NAME, AccessionRedactionFilter
 from sec_generative_search.core.types import (
     Chunk,
     ContentType,
@@ -326,3 +329,49 @@ class TestOrchestratorSecurity:
 
         assert result.embeddings is None
         _ = ForbiddenEmbedder  # keep the type alive for readers
+
+
+@pytest.mark.security
+class TestOrchestratorLogStreamIsIdentifierFree:
+    """The **real** orchestrator's progress lines carry no identifier.
+
+    Runtime companion to the static call-site lock in
+    ``tests/core/test_logging.py`` — ``pipeline/orchestrator.py`` is one
+    of the two files with the most wrapped ticker sites, and a shape
+    lock proves only that an expression is *wrapped*, never that the
+    wrapper survives the value.
+    """
+
+    def test_ingest_latest_emits_no_raw_ticker_or_accession(
+        self,
+        filing_id: FilingIdentifier,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+
+        orchestrator = PipelineOrchestrator(
+            fetcher=StubFetcher(results=[(filing_id, "<html/>")]),
+            parser=StubParser([_make_segment(filing_id)]),
+            chunker=StubChunker([_make_chunk(filing_id, 0)]),
+            embedder=StubEmbedder(dim=3),
+        )
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.DEBUG)
+        handler.addFilter(AccessionRedactionFilter())
+        package_logger = logging.getLogger(LOGGER_NAME)
+        prior_level = package_logger.level
+        package_logger.addHandler(handler)
+        package_logger.setLevel(logging.DEBUG)
+        try:
+            assert orchestrator.ingest_latest(filing_id.ticker, filing_id.form_type)
+        finally:
+            package_logger.removeHandler(handler)
+            package_logger.setLevel(prior_level)
+
+        emitted = stream.getvalue()
+        assert emitted.strip(), "expected the orchestrator to log something"
+        assert filing_id.ticker not in emitted
+        assert filing_id.accession_number not in emitted
+        assert "<redacted:" in emitted

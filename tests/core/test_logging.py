@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import logging
@@ -13,6 +14,7 @@ from sec_generative_search.core import logging as sgs_logging
 from sec_generative_search.core.correlation import bind_correlation_id
 from sec_generative_search.core.logging import (
     LOGGER_NAME,
+    AccessionRedactionFilter,
     CorrelationIdFilter,
     JsonFormatter,
     audit_log,
@@ -261,3 +263,284 @@ class TestSuppressThirdPartyLoggers:
 
         for name in ("chromadb", "httpx", "sentence_transformers"):
             assert logging.getLogger(name).level == logging.WARNING
+
+
+# ---------------------------------------------------------------------------
+# Research-identifier redaction (finding M3)
+# ---------------------------------------------------------------------------
+
+_ACCESSION = "0000320193-23-000077"
+
+
+@pytest.mark.security
+class TestAccessionRedactionFilter:
+    """Accessions are scrubbed centrally, at the handler layer.
+
+    Splitting the control is deliberate: the accession shape
+    (``NNNNNNNNNN-NN-NNNNNN``) is unambiguous enough for a global regex,
+    so one filter closes every call site — including ones nobody
+    enumerated. Tickers are *not* regex-detectable (a generic
+    uppercase-token pattern would mangle ``INFO`` / ``POST`` / ``API``),
+    so they are redacted at the call sites and held by
+    :class:`TestTickerCallSiteHygiene`.
+    """
+
+    def test_scrubs_an_accession_carried_in_record_args(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The trap: most sites log ``logger.info("... %s", accession)``,
+        # so the value lives in ``record.args`` and never in
+        # ``record.msg``. A filter that rewrites ``msg`` alone scrubs
+        # nothing.
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        record = _make_record("Removed filing from registry: %s", _ACCESSION)
+        assert AccessionRedactionFilter().filter(record) is True
+        assert _ACCESSION not in record.getMessage()
+        assert "<redacted:" in record.getMessage()
+
+    def test_scrubs_an_accession_carried_in_the_message(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        record = _make_record(f"SECURITY_AUDIT: accession={_ACCESSION} form=10-K")
+        AccessionRedactionFilter().filter(record)
+        message = record.getMessage()
+        assert _ACCESSION not in message
+        assert "form=10-K" in message
+
+    def test_scrubs_the_dash_free_accession_form(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        record = _make_record("accession=%s", _ACCESSION.replace("-", ""))
+        AccessionRedactionFilter().filter(record)
+        assert _ACCESSION.replace("-", "") not in record.getMessage()
+
+    def test_placeholder_matches_redact_for_log(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Filter output and call-site output must agree for the same
+        # string, so an operator can correlate a filtered line with a
+        # deliberately-redacted one.
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        record = _make_record("accession=%s", _ACCESSION)
+        AccessionRedactionFilter().filter(record)
+        assert redact_for_log(_ACCESSION) in record.getMessage()
+
+    def test_no_op_when_flag_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LOG_REDACT_QUERIES", raising=False)
+        record = _make_record("accession=%s", _ACCESSION)
+        AccessionRedactionFilter().filter(record)
+        assert record.getMessage() == f"accession={_ACCESSION}"
+
+    def test_flag_is_read_per_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Caching the flag at construction time would make the control
+        # untestable (and unreachable for a process that sets the env
+        # after import).
+        log_filter = AccessionRedactionFilter()
+
+        monkeypatch.delenv("LOG_REDACT_QUERIES", raising=False)
+        clear_record = _make_record("accession=%s", _ACCESSION)
+        log_filter.filter(clear_record)
+        assert _ACCESSION in clear_record.getMessage()
+
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "true")
+        redacted_record = _make_record("accession=%s", _ACCESSION)
+        log_filter.filter(redacted_record)
+        assert _ACCESSION not in redacted_record.getMessage()
+
+    def test_clears_args_so_a_literal_percent_survives(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # After substitution the record holds a fully-rendered message;
+        # leaving ``args`` populated would re-run ``%``-interpolation
+        # over text that may now contain a stray ``%``.
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        record = _make_record("accession=%s progress=100%% done", _ACCESSION)
+        AccessionRedactionFilter().filter(record)
+        assert record.args in ((), None)
+        assert "100% done" in record.getMessage()
+
+    def test_never_raises_on_a_malformed_record(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A raising filter drops the record. On a request path that
+        # would turn a logging bug into missing audit evidence.
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        record = _make_record("two placeholders %s %s", "only-one")
+        assert AccessionRedactionFilter().filter(record) is True
+
+    def test_is_idempotent_across_handlers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The filter is attached per-handler, so a record with two
+        # handlers is filtered twice.
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        record = _make_record("accession=%s", _ACCESSION)
+        log_filter = AccessionRedactionFilter()
+        log_filter.filter(record)
+        first = record.getMessage()
+        log_filter.filter(record)
+        assert record.getMessage() == first
+
+    def test_scrubs_the_exception_traceback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # ``logger.exception(...)`` renders the traceback separately from
+        # the message; a domain error's ``details`` can carry an
+        # accession into it.
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        import sys
+
+        try:
+            raise ValueError(f"storage failed for {_ACCESSION}")
+        except ValueError:
+            record = logging.LogRecord(
+                name="sec_generative_search.test",
+                level=logging.ERROR,
+                pathname=__file__,
+                lineno=1,
+                msg="storage failure",
+                args=(),
+                exc_info=sys.exc_info(),
+            )
+
+        AccessionRedactionFilter().filter(record)
+        payload = json.loads(JsonFormatter().format(record))
+        assert _ACCESSION not in payload["exc"]
+        assert "ValueError" in payload["exc"]
+
+    def test_every_handler_carries_the_redaction_filter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # Attaching to the logger instead of the handlers would miss
+        # child-logger records (the package logger has
+        # ``propagate = False``) — the same reason
+        # ``CorrelationIdFilter`` sits on handlers.
+        monkeypatch.setenv("LOG_FILE_PATH", str(tmp_path / "run.log"))
+        configure_logging(level=logging.INFO, use_rich=False)
+        handlers = logging.getLogger(LOGGER_NAME).handlers
+        assert handlers
+        for handler in handlers:
+            assert any(isinstance(f, AccessionRedactionFilter) for f in handler.filters)
+
+
+# --- Static call-site lock for the ticker half of the control --------------
+
+_LOG_LEVELS = frozenset({"debug", "info", "warning", "error", "exception", "critical"})
+
+# Wrapping any of these renders the identifier content-free, so the
+# enclosed expression needs no further treatment.
+_REDACTING_WRAPPERS = frozenset(
+    {"redact_for_log", "redact_all_for_log", "mask_secret", "len", "sorted", "id"}
+)
+
+# Attribute / variable names that carry a ticker symbol (``chunk_id`` is
+# ``{TICKER}_{FORM}_{DATE}_{INDEX}`` — see ``Chunk.chunk_id``).
+_TICKER_CARRIER_ATTRS = frozenset({"ticker", "tickers", "chunk_id"})
+_TICKER_CARRIER_NAMES = frozenset({"ticker", "tickers"})
+
+_SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "sec_generative_search"
+
+
+def _is_log_call(node: ast.Call) -> bool:
+    """True when *node* is a logging or audit-log emission."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "audit_log"
+    if isinstance(func, ast.Attribute):
+        if func.attr == "audit_log":
+            return True
+        return func.attr in _LOG_LEVELS and "log" in ast.unparse(func.value).lower()
+    return False
+
+
+def _wrapper_name(node: ast.Call) -> str | None:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _unredacted_ticker_carriers(node: ast.AST) -> list[str]:
+    """Return the ticker-carrying sub-expressions of *node* that are raw."""
+    found: list[str] = []
+
+    def walk(current: ast.AST) -> None:
+        if isinstance(current, ast.Call) and _wrapper_name(current) in _REDACTING_WRAPPERS:
+            return  # everything inside is rendered content-free
+        if isinstance(current, ast.Attribute) and current.attr in _TICKER_CARRIER_ATTRS:
+            found.append(ast.unparse(current))
+            return
+        if isinstance(current, ast.Name) and current.id in _TICKER_CARRIER_NAMES:
+            found.append(ast.unparse(current))
+            return
+        if isinstance(current, ast.IfExp):
+            # The condition is a truthiness test, not a rendered value.
+            walk(current.body)
+            walk(current.orelse)
+            return
+        for child in ast.iter_child_nodes(current):
+            walk(child)
+
+    walk(node)
+    return found
+
+
+@pytest.mark.security
+class TestTickerCallSiteHygiene:
+    """No production log call site may render a raw ticker.
+
+    The central filter cannot close this half: a regex able to spot an
+    arbitrary ticker would also match ``INFO``, ``POST``, ``API``,
+    ``GPU`` and ``JSON``. So tickers are redacted where they are logged
+    — and this lock is what keeps that true as new call sites land,
+    which is exactly how the leak spread in the first place (the
+    ``ingest.py`` docstring already claimed it emitted "the redacted
+    ticker list" while the code did not).
+    """
+
+    def test_no_log_call_renders_a_raw_ticker(self) -> None:
+        violations: list[str] = []
+
+        for path in sorted(_SRC_ROOT.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not _is_log_call(node):
+                    continue
+                for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                    for carrier in _unredacted_ticker_carriers(argument):
+                        violations.append(
+                            f"{path.relative_to(_SRC_ROOT.parents[1])}:"
+                            f"{node.lineno}: raw ticker expression {carrier!r}"
+                        )
+
+        assert not violations, (
+            "log call sites render a raw ticker; wrap the value in "
+            "redact_for_log()/redact_all_for_log() or log a count:\n  " + "\n  ".join(violations)
+        )
+
+    def test_the_scan_actually_finds_a_planted_violation(self) -> None:
+        # Guards against the scan silently matching nothing (a rename of
+        # the logger attribute or a change in the AST shape would make
+        # the lock above vacuously green).
+        planted = ast.parse('logger.info("fetched %s", filing_id.ticker)')
+        call = planted.body[0].value  # type: ignore[attr-defined]
+        assert _is_log_call(call)
+        assert _unredacted_ticker_carriers(call.args[1]) == ["filing_id.ticker"]
+
+        cleared = ast.parse('logger.info("fetched %s", redact_for_log(filing_id.ticker))')
+        cleared_call = cleared.body[0].value  # type: ignore[attr-defined]
+        assert _unredacted_ticker_carriers(cleared_call.args[1]) == []

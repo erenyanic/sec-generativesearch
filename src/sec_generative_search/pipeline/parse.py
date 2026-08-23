@@ -17,7 +17,7 @@ from typing import Any
 from doc2dict import html2dict
 
 from sec_generative_search.core.exceptions import ParseError
-from sec_generative_search.core.logging import get_logger
+from sec_generative_search.core.logging import get_logger, redact_for_log
 from sec_generative_search.core.types import (
     ContentType,
     FilingIdentifier,
@@ -80,7 +80,7 @@ class FilingParser:
 
         logger.info(
             "Parsing %s %s (%s characters)",
-            filing_id.ticker,
+            redact_for_log(filing_id.ticker),
             filing_id.form_type,
             f"{len(html_content):,}",
         )
@@ -123,7 +123,7 @@ class FilingParser:
         logger.info(
             "Extracted %d segments from %s %s",
             len(segments),
-            filing_id.ticker,
+            redact_for_log(filing_id.ticker),
             filing_id.form_type,
         )
 

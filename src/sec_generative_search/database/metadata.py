@@ -42,7 +42,11 @@ from sec_generative_search.core.exceptions import (
     DatabaseError,
     FilingLimitExceededError,
 )
-from sec_generative_search.core.logging import get_logger
+from sec_generative_search.core.logging import (
+    ACCESSION_RE,
+    get_logger,
+    redact_for_log,
+)
 from sec_generative_search.core.types import FilingIdentifier
 from sec_generative_search.database.migrations import (
     apply_pending_migrations,
@@ -107,8 +111,10 @@ def _resolve_runtime_encryption_key(default_key: str | None) -> str | None:
     return default_key
 
 
-# SEC accession number pattern: NNNNNNNNNN-NN-NNNNNN (with or without dashes).
-_ACCESSION_RE = re.compile(r"\b\d{10}-?\d{2}-?\d{6}\b")
+# SEC accession number pattern: NNNNNNNNNN-NN-NNNNNN (with or without
+# dashes).  Aliased from ``core.logging`` so the persisted-error scrub and
+# the log-stream scrub (``AccessionRedactionFilter``) cannot drift apart.
+_ACCESSION_RE = ACCESSION_RE
 
 
 def _scrub_error_message(
@@ -531,7 +537,7 @@ class MetadataRegistry:
                 )
             logger.info(
                 "Registered filing: %s %s (%s) — %d chunks",
-                filing_id.ticker,
+                redact_for_log(filing_id.ticker),
                 filing_id.form_type,
                 filing_id.date_str,
                 chunk_count,
@@ -616,7 +622,7 @@ class MetadataRegistry:
 
         logger.info(
             "Registered filing: %s %s (%s) — %d chunks",
-            filing_id.ticker,
+            redact_for_log(filing_id.ticker),
             filing_id.form_type,
             filing_id.date_str,
             chunk_count,

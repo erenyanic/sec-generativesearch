@@ -12,6 +12,7 @@ credentials and the project contract forbids logging them.
 
 from __future__ import annotations
 
+import io
 import logging
 from datetime import date
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from typing import Any
 import pytest
 
 from sec_generative_search.core.exceptions import FetchError
+from sec_generative_search.core.logging import LOGGER_NAME, AccessionRedactionFilter
 from sec_generative_search.pipeline import fetch as fetch_module
 from sec_generative_search.pipeline.fetch import FilingFetcher, FilingInfo
 
@@ -236,3 +238,66 @@ class TestEdgarIdentityNotLogged:
         combined = "\n".join(r.getMessage() for r in caplog.records)
         assert "Secret Name" not in combined
         assert "secret@example.com" not in combined
+
+
+@pytest.mark.security
+class TestFetchLogStreamIsIdentifierFree:
+    """The **real** fetcher's listing path logs no ticker or accession.
+
+    ``fetch.py`` carries the largest concentration of wrapped ticker
+    sites, so it gets a runtime companion to the static call-site lock
+    in ``tests/core/test_logging.py``: the static lock proves an
+    expression is *wrapped*, only a real call proves the wrapper
+    survives the value. EDGAR is never touched — ``_get_company`` and
+    ``_get_filings`` are stubbed.
+    """
+
+    def test_list_available_emits_no_raw_identifier(
+        self,
+        fetcher: FilingFetcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+
+        ticker = "ZQXW"
+        accession = "0000320193-23-000077"
+        amended = "0000320193-23-000078"
+        filings = [
+            # An amendment first so the skip-branch (which logs the
+            # accession) is exercised alongside the summary line.
+            SimpleNamespace(
+                accession_no=amended,
+                form="10-K/A",
+                filing_date=date(2023, 11, 4),
+                company=ticker,
+            ),
+            SimpleNamespace(
+                accession_no=accession,
+                form="10-K",
+                filing_date=date(2023, 11, 3),
+                company=ticker,
+            ),
+        ]
+        monkeypatch.setattr(fetcher, "_get_company", lambda t: SimpleNamespace())
+        monkeypatch.setattr(fetcher, "_get_filings", lambda *a, **k: filings)
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.DEBUG)
+        handler.addFilter(AccessionRedactionFilter())
+        package_logger = logging.getLogger(LOGGER_NAME)
+        prior_level = package_logger.level
+        package_logger.addHandler(handler)
+        package_logger.setLevel(logging.DEBUG)
+        try:
+            assert fetcher.list_available(ticker, "10-K")
+        finally:
+            package_logger.removeHandler(handler)
+            package_logger.setLevel(prior_level)
+
+        emitted = stream.getvalue()
+        assert emitted.strip(), "expected the fetcher to log something"
+        assert ticker not in emitted
+        assert accession not in emitted
+        assert amended not in emitted
+        assert "<redacted:" in emitted

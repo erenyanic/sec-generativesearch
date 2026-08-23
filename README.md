@@ -119,7 +119,7 @@ The SEC requires an identifying name and email in the User-Agent of every EDGAR 
 | `DB_MAX_FILINGS`              | `2500`  | Corpus ceiling                                                                                          |
 | `API_KEY` / `API_ADMIN_KEY`   | unset   | Read-tier and admin-tier API keys; unset = auth disabled (local only)                                   |
 | `API_EDGAR_SESSION_REQUIRED`  | `false` | Require per-session EDGAR identity (recommended for shared servers)                                     |
-| `LOG_REDACT_QUERIES`          | `false` | Hash query text and tickers before they reach the logs                                                  |
+| `LOG_REDACT_QUERIES`          | `false` | Hash query text, tickers and accession numbers before they reach the logs                               |
 
 A `.env` for local use is as short as:
 
@@ -311,7 +311,7 @@ pnpm build
 pnpm audit:ci
 ```
 
-**Backend:** 2649 tests, of which 942 are security-regression locks (`@pytest.mark.security`). **Frontend:** 294 tests across security and functional trees. A security-tree failure is a release blocker.
+**Backend:** 2671 tests, of which 964 are security-regression locks (`@pytest.mark.security`). **Frontend:** 294 tests across security and functional trees. A security-tree failure is a release blocker.
 
 ---
 

@@ -69,7 +69,7 @@ from sec_generative_search.api.schemas import (
 )
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.exceptions import DatabaseError
-from sec_generative_search.core.logging import audit_log, get_logger
+from sec_generative_search.core.logging import audit_log, get_logger, redact_for_log
 from sec_generative_search.database import FilingRecord, FilingStore, MetadataRegistry
 
 __all__ = ["router"]
@@ -314,7 +314,7 @@ def delete_filing(
         client_ip=_client_ip(request),
         endpoint="DELETE /api/filings/{accession}",
         detail=(
-            f"accession={accession} ticker={record.ticker} "
+            f"accession={accession} ticker={redact_for_log(record.ticker)} "
             f"form={record.form_type} chunks={record.chunk_count}"
         ),
     )
@@ -373,9 +373,7 @@ def delete_by_ids(
         "delete_filings_batch",
         client_ip=_client_ip(request),
         endpoint="POST /api/filings/delete-by-ids",
-        detail=(
-            f"deleted={len(found)} chunks={chunks_total} not_found={len(not_found)}"
-        ),
+        detail=(f"deleted={len(found)} chunks={chunks_total} not_found={len(not_found)}"),
     )
     return DeleteByIdsResponse(
         filings_deleted=len(found),
@@ -445,10 +443,7 @@ def bulk_delete(
         "bulk_delete",
         client_ip=_client_ip(request),
         endpoint="POST /api/filings/bulk-delete",
-        detail=(
-            f"filings={len(filings)} chunks={chunks_total} "
-            f"tickers={len(tickers_affected)}"
-        ),
+        detail=(f"filings={len(filings)} chunks={chunks_total} tickers={len(tickers_affected)}"),
     )
     return BulkDeleteResponse(
         filings_deleted=len(filings),

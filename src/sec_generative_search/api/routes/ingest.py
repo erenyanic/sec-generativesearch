@@ -36,9 +36,11 @@ Audit-log discipline:
 
         - Every create / cancel emits a ``SECURITY_AUDIT:`` line via
             :func:`audit_log` carrying the action, client IP, masked task id
-            tail, the redacted ticker list, and the form types. Names / emails /
-            provider keys never reach this surface, so there is nothing to redact
-            here that is not already covered by the access-log layer.
+            tail, the ticker **count**, and the form types. The symbols
+            themselves are research-pattern data and never reach the line
+            (finding M3); names / emails / provider keys never reach this
+            surface either, so there is nothing further to redact here that
+            is not already covered by the access-log layer.
         - Read paths (``GET /api/ingest/tasks/{id}``, list) do not audit-log
             — they would flood under WebSocket-less polling clients and they
             already appear in the access log.
@@ -183,7 +185,7 @@ def _create_task(
         detail=(
             f"client_ip={_client_ip(request)} "
             f"task_id_tail={mask_secret(task_id)} "
-            f"tickers={list(body.tickers)} "
+            f"tickers={len(body.tickers)} "
             f"form_types={list(body.form_types)} "
             f"count_mode={body.count_mode}"
         ),

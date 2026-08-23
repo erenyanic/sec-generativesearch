@@ -8,6 +8,12 @@ Configuration:
     LOG_LEVEL environment variable controls the logging level.
     Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
 
+    LOG_REDACT_QUERIES gates research-identifier redaction.  When
+    enabled it hashes query text at the call sites that wrap a value in
+    :func:`redact_for_log`, and :class:`AccessionRedactionFilter`
+    additionally scrubs every SEC accession number out of the rendered
+    message of *every* record.
+
     LOG_FILE_PATH environment variable enables optional file logging via
     RotatingFileHandler.  LOG_FILE_MAX_BYTES (default 10 MB) and
     LOG_FILE_BACKUP_COUNT (default 3) control rotation.
@@ -24,7 +30,9 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 from rich.console import Console
@@ -43,6 +51,13 @@ DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # Track whether logging has been configured
 _logging_configured = False
+
+# SEC accession number: ``NNNNNNNNNN-NN-NNNNNN``, with or without the
+# dashes.  This is the one research identifier that is unambiguous enough
+# to scrub with a global regex — hence the split control described in
+# :class:`AccessionRedactionFilter`.  ``database.metadata`` reuses this
+# pattern so the two surfaces cannot drift apart.
+ACCESSION_RE = re.compile(r"\b\d{10}-?\d{2}-?\d{6}\b")
 
 
 def _get_log_level() -> int:
@@ -84,6 +99,63 @@ class CorrelationIdFilter(logging.Filter):
         return True
 
 
+class AccessionRedactionFilter(logging.Filter):
+    """Scrub SEC accession numbers out of every rendered log record.
+
+    Gated on ``LOG_REDACT_QUERIES``, read **per record** so an operator
+    (or a test) toggling the flag takes effect without re-configuring
+    logging.
+
+    Why a filter and not call-site wrapping: accessions are logged from
+    roughly thirty sites across the ingest pipeline, the storage layer,
+    and three route audit lines, and new sites are easy to add.  One
+    handler-level control closes all of them, including sites nobody
+    enumerated.  Tickers deliberately do **not** get the same treatment —
+    a regex able to spot an arbitrary symbol would also match ``INFO``,
+    ``POST``, ``API``, ``GPU`` and ``JSON`` — so those are wrapped in
+    :func:`redact_for_log` where they are logged.
+
+    Two mechanics are load-bearing:
+
+    * Most sites log ``logger.info("... %s", accession)``, so the value
+      lives in ``record.args``, never in ``record.msg``.  The filter
+      therefore rewrites the **rendered** message and clears ``args``.
+    * It attaches to each *handler* (not the logger), matching
+      :class:`CorrelationIdFilter` — the package logger sets
+      ``propagate = False``, so a logger-level filter would miss
+      records emitted by child loggers.
+
+    The substitution reuses :func:`redact_for_log`'s
+    ``<redacted:XXXXXXXX>`` form, so a scrubbed accession correlates
+    with one redacted at a call site, and repeated filtering (one pass
+    per handler) is idempotent.
+
+    ``RichHandler(rich_tracebacks=True)`` renders tracebacks straight
+    from ``exc_info`` and so bypasses the ``exc_text`` scrub below.
+    That is console-only, interactive, Scenario-A output — outside the
+    B/C log-aggregator threat model this control exists for.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Never raise: a filter that throws drops the record, which on a
+        # request path would silently discard audit evidence.
+        try:
+            if not _redaction_enabled():
+                return True
+            message = record.getMessage()
+            if ACCESSION_RE.search(message):
+                record.msg = ACCESSION_RE.sub(_redact_accession_match, message)
+                record.args = ()
+            if record.exc_info or record.exc_text:
+                exc_text = record.exc_text or logging.Formatter().formatException(
+                    record.exc_info  # type: ignore[arg-type]
+                )
+                record.exc_text = ACCESSION_RE.sub(_redact_accession_match, exc_text)
+        except Exception:  # pragma: no cover - defensive, must never break logging
+            return True
+        return True
+
+
 class JsonFormatter(logging.Formatter):
     """Dependency-free JSON-lines formatter for log aggregators.
 
@@ -103,8 +175,11 @@ class JsonFormatter(logging.Formatter):
             "correlation_id": getattr(record, "correlation_id", "-"),
             "message": record.getMessage(),
         }
-        if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
+        if record.exc_info or record.exc_text:
+            # ``exc_text`` may already have been rendered *and scrubbed*
+            # by :class:`AccessionRedactionFilter`; re-formatting from
+            # ``exc_info`` here would undo that.
+            payload["exc"] = record.exc_text or self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
 
 
@@ -143,6 +218,7 @@ def _add_file_handler(
     file_handler.setLevel(log_level)
     file_handler.setFormatter(_make_formatter(log_format))
     file_handler.addFilter(CorrelationIdFilter())
+    file_handler.addFilter(AccessionRedactionFilter())
     logger.addHandler(file_handler)
 
 
@@ -204,6 +280,9 @@ def configure_logging(
     # child-logger records carry the attribute before the formatter
     # references it.
     handler.addFilter(CorrelationIdFilter())
+    # Accession scrubbing sits beside it, for the same reason: a
+    # handler-level filter also covers propagated child-logger records.
+    handler.addFilter(AccessionRedactionFilter())
     logger.addHandler(handler)
 
     # Optional file logging via RotatingFileHandler.
@@ -275,6 +354,27 @@ def audit_log(
     )
 
 
+def _redaction_enabled() -> bool:
+    """Whether ``LOG_REDACT_QUERIES`` is set to a truthy value.
+
+    Read from ``os.environ`` on every call (never cached) so the flag can
+    be toggled at runtime and so the check works from any module without
+    depending on the Pydantic settings hierarchy (avoids circular
+    imports).
+    """
+    return os.environ.get("LOG_REDACT_QUERIES", "").lower() in ("1", "true", "yes")
+
+
+def _digest(value: str) -> str:
+    """Return the ``<redacted:XXXXXXXX>`` placeholder for *value*."""
+    return f"<redacted:{hashlib.sha256(value.encode()).hexdigest()[:8]}>"
+
+
+def _redact_accession_match(match: re.Match[str]) -> str:
+    """``re.sub`` replacement returning the placeholder for a matched accession."""
+    return _digest(match.group(0))
+
+
 def redact_for_log(value: str) -> str:
     """Return *value* unchanged or a SHA-256 digest prefix when redaction is enabled.
 
@@ -284,15 +384,26 @@ def redact_for_log(value: str) -> str:
     is the first 8 hex characters of its SHA-256 hash.  This preserves log
     correlation (same input → same hash) while hiding the actual content.
 
-    The check reads ``os.environ`` directly so it can be used from any module
-    without depending on the Pydantic settings hierarchy (avoids circular
-    imports).
+    Wrap **query text and ticker symbols** here at the call site.  SEC
+    accession numbers are handled centrally by
+    :class:`AccessionRedactionFilter`, so they need no call-site wrapping
+    (wrapping one anyway is harmless — the placeholder no longer matches
+    the accession pattern).
     """
-    flag = os.environ.get("LOG_REDACT_QUERIES", "").lower()
-    if flag in ("1", "true", "yes"):
-        digest = hashlib.sha256(value.encode()).hexdigest()[:8]
-        return f"<redacted:{digest}>"
+    if _redaction_enabled():
+        return _digest(value)
     return value
+
+
+def redact_all_for_log(values: Iterable[str]) -> str:
+    """Render a collection of identifiers for a log line, each redacted.
+
+    Used for ticker lists so a log line keeps its cardinality (and its
+    per-symbol correlation hashes) without carrying the symbols
+    themselves.  Returns ``"none"`` for an empty collection.
+    """
+    rendered = ", ".join(redact_for_log(value) for value in values)
+    return rendered or "none"
 
 
 def suppress_third_party_loggers() -> None:
