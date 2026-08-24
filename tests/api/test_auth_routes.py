@@ -29,15 +29,21 @@ from __future__ import annotations
 
 import base64
 import os
+import secrets
 from collections.abc import Iterator
+from http.cookies import SimpleCookie
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from sec_generative_search.api.dependencies import SESSION_COOKIE_NAME
 from sec_generative_search.config.settings import reload_settings
 from sec_generative_search.core.credentials import InMemorySessionCredentialStore
-from sec_generative_search.core.edgar_identity import InMemorySessionEdgarIdentityStore
+from sec_generative_search.core.edgar_identity import (
+    EdgarIdentity,
+    InMemorySessionEdgarIdentityStore,
+)
 from sec_generative_search.core.user_auth import (
     SALT_BYTES,
     mint_enrolment_token,
@@ -489,3 +495,116 @@ class TestUserTierDisabled:
         )
         assert r.status_code == 503
         assert r.json()["error"] == "user_tier_disabled"
+
+
+# ---------------------------------------------------------------------------
+# EDGAR-identity lockstep on the user-tier session seams (L1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.security
+class TestEdgarIdentityLockstep:
+    """The user-tier router must clear EDGAR identity with the session.
+
+    Documented invariant (AGENT.md §API, DEPLOYMENT.md §4.4): *session
+    rotation and logout MUST clear EDGAR identity in lockstep with
+    credentials*.  ``api/routes/session.py`` honoured this on both its
+    seams; the parallel user-tier router in ``api/routes/auth.py`` did
+    not, leaving a ``(name, email)`` Tier-3 PII pair resident in the
+    in-memory store until its independent TTL sweep evicted it.
+
+    Every test below seeds the store under a **real**
+    ``secrets.token_urlsafe(32)`` value: ``extract_session_id`` shape-
+    checks the cookie and returns ``None`` for anything else, so a
+    made-up id would make the route a no-op and the assertion vacuous.
+    Each test therefore also asserts the identity *is* present before
+    the call.
+    """
+
+    @staticmethod
+    def _minted_session_id(response) -> str:
+        """Read the freshly minted id out of the response ``Set-Cookie``.
+
+        Reading the client jar instead would be ambiguous once a test
+        has seeded a prior cookie of its own — httpx raises
+        ``CookieConflict`` when two cookies share a name across domains.
+        """
+        jar = SimpleCookie()
+        jar.load(response.headers["set-cookie"])
+        return jar[SESSION_COOKIE_NAME].value
+
+    @staticmethod
+    def _seed_identity(auth_app, session_id: str) -> None:
+        store: InMemorySessionEdgarIdentityStore = auth_app.state.edgar_identity_store
+        store.set(session_id, EdgarIdentity(name="Ada Lovelace", email="ada@example.com"))
+
+    def test_login_clears_prior_session_edgar_identity(
+        self, auth_app, auth_client: TestClient
+    ) -> None:
+        _enrol_user(auth_app, auth_proof=b"p" * 32)
+        prior = secrets.token_urlsafe(32)
+        self._seed_identity(auth_app, prior)
+        auth_client.cookies.set(SESSION_COOKIE_NAME, prior)
+
+        store = auth_app.state.edgar_identity_store
+        # Non-vacuity guard: the identity must really be resident first.
+        assert store.get(prior) is not None
+
+        response = auth_client.post(
+            "/api/auth/login",
+            json={"username": "alice", "auth_proof": _b64(b"p" * 32)},
+        )
+        assert response.status_code == 200
+        assert store.get(prior) is None
+
+    def test_login_does_not_carry_identity_onto_the_new_session(
+        self, auth_app, auth_client: TestClient
+    ) -> None:
+        """The delete must key off ``prior``, never the freshly minted id."""
+        _enrol_user(auth_app, auth_proof=b"p" * 32)
+        prior = secrets.token_urlsafe(32)
+        self._seed_identity(auth_app, prior)
+        auth_client.cookies.set(SESSION_COOKIE_NAME, prior)
+
+        response = auth_client.post(
+            "/api/auth/login",
+            json={"username": "alice", "auth_proof": _b64(b"p" * 32)},
+        )
+        assert response.status_code == 200
+        minted = self._minted_session_id(response)
+        assert minted != prior
+        assert auth_app.state.edgar_identity_store.get(minted) is None
+
+    def test_signout_clears_session_edgar_identity(self, auth_app, auth_client: TestClient) -> None:
+        _enrol_user(auth_app, auth_proof=b"p" * 32)
+        login = auth_client.post(
+            "/api/auth/login",
+            json={"username": "alice", "auth_proof": _b64(b"p" * 32)},
+        )
+        session_id = self._minted_session_id(login)
+        self._seed_identity(auth_app, session_id)
+
+        store = auth_app.state.edgar_identity_store
+        assert store.get(session_id) is not None
+
+        response = auth_client.delete("/api/auth/session")
+        assert response.status_code == 200
+        assert store.get(session_id) is None
+
+    def test_signout_response_shape_is_unchanged(self, auth_app, auth_client: TestClient) -> None:
+        """Rule **L**: the sign-out body stays ``{cleared: bool}``.
+
+        ``session.py::logout_session`` deliberately carries a second
+        ``cleared_edgar_identity`` field; ``auth.py::sign_out`` does
+        not.  Mirroring it here would be a schema widening, so the
+        asymmetry is pinned rather than left to drift.
+        """
+        _enrol_user(auth_app, auth_proof=b"p" * 32)
+        login = auth_client.post(
+            "/api/auth/login",
+            json={"username": "alice", "auth_proof": _b64(b"p" * 32)},
+        )
+        self._seed_identity(auth_app, self._minted_session_id(login))
+
+        body = auth_client.delete("/api/auth/session").json()
+        assert set(body) == {"cleared"}

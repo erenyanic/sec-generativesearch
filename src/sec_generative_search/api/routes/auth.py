@@ -44,6 +44,7 @@ from fastapi import APIRouter, Depends, Request, Response
 from sec_generative_search.api.dependencies import (
     SESSION_COOKIE_NAME,
     extract_session_id,
+    get_edgar_identity_store,
     get_login_username_window,
     get_session_store,
     get_user_store,
@@ -62,6 +63,7 @@ from sec_generative_search.api.schemas import (
 )
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.credentials import CredentialStore
+from sec_generative_search.core.edgar_identity import InMemorySessionEdgarIdentityStore
 from sec_generative_search.core.exceptions import (
     AuthError,
     ConfigurationError,
@@ -317,6 +319,7 @@ async def login(
     body: LoginRequest,
     store: UserStore | None = Depends(get_user_store),
     session_store: CredentialStore = Depends(get_session_store),
+    edgar_store: InMemorySessionEdgarIdentityStore = Depends(get_edgar_identity_store),
     username_window: Any = Depends(get_login_username_window),
 ) -> LoginResponse:
     """Validate the supplied ``auth_proof`` against the stored ``auth_hash``.
@@ -355,12 +358,17 @@ async def login(
             message="Database error during login.",
         ) from exc
 
-    # Rotate any prior session: clear stored credentials under the old
-    # ``session_id``, then mint a fresh one.  Mirrors the established
-    # ``POST /api/session`` rotation contract.
+    # Rotate any prior session: clear stored credentials AND the EDGAR
+    # identity under the old ``session_id``, then mint a fresh one.
+    # Mirrors the established ``POST /api/session`` rotation contract —
+    # the two stores are keyed identically and MUST be cleared in
+    # lockstep, otherwise a rotated cookie leaves the prior session's
+    # ``(name, email)`` PII resident until its independent TTL sweep.
+    # The delete keys off ``prior``, never the freshly minted id.
     prior = extract_session_id(request)
     if prior is not None:
         session_store.clear(prior)
+        edgar_store.delete(prior)
 
     session_id = _mint_session_id()
     ttl_seconds = get_settings().api.session_ttl_seconds
@@ -599,6 +607,7 @@ async def sign_out(
     request: Request,
     response: Response,
     session_store: CredentialStore = Depends(get_session_store),
+    edgar_store: InMemorySessionEdgarIdentityStore = Depends(get_edgar_identity_store),
 ) -> dict[str, bool]:
     """Sign-out: revoke the session in lockstep with the cookie.
 
@@ -606,11 +615,19 @@ async def sign_out(
     user-tier ``auth/`` prefix so the SPA can call a single endpoint.
     Idempotent — a request with no cookie still emits an expired cookie
     and returns ``{cleared: false}``.
+
+    Credentials and EDGAR identity are dropped in lockstep, as on the
+    legacy seam.  The response body deliberately stays ``{cleared:
+    bool}``: ``session.py``'s logout carries a second
+    ``cleared_edgar_identity`` field, but widening this one would be a
+    schema change on a route the SPA already consumes, and the flag
+    would carry no information the caller can act on.
     """
     session_id = extract_session_id(request)
     cleared = False
     if session_id is not None:
         session_store.clear(session_id)
+        edgar_store.delete(session_id)
         index = getattr(request.app.state, "session_user_index", None)
         if index is not None:
             cleared = index.pop(session_id, None) is not None

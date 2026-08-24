@@ -868,6 +868,41 @@ class ApiSettings(BaseSettings):
         return v or None
 
     @model_validator(mode="after")
+    def _reject_wildcard_cors_origin(self) -> "ApiSettings":
+        """Refuse a wildcard entry in ``cors_origins``.
+
+        Starlette's ``CORSMiddleware`` special-cases ``allow_origins=["*"]``
+        when ``allow_credentials=True`` (which ``create_app`` always sets):
+        instead of emitting a literal ``*``, it reflects the requesting
+        ``Origin`` back and sets ``Access-Control-Allow-Credentials:
+        true``, so **any** site could read credentialed cross-origin
+        responses.  The shipped default is safe — this guard is here so
+        the "just make it work" wildcard fails at load rather than
+        silently widening the browser trust boundary.
+
+        Unconditional, not gated on whether auth is enabled: the same
+        list is the WebSocket ``Origin`` allow-list
+        (``api/websocket.py::_is_origin_allowed``), where auth-
+        conditionality would be meaningless — and a wildcard there never
+        matches a real origin anyway, so it can only ever misconfigure.
+
+        Matched per entry against the stripped value: a whitespace-padded
+        ``" * "`` is refused too, while an origin that merely *contains*
+        a star is left alone (this is not a substring ban).  A bare
+        ``API_CORS_ORIGINS=*`` never reaches this validator — the env
+        source decodes ``list[str]`` as JSON and raises before validation
+        — but that path is fail-closed as well.
+        """
+        if any(origin.strip() == "*" for origin in self.cors_origins):
+            raise ValueError(
+                "API_CORS_ORIGINS must not contain '*' — the API is served with "
+                "allow_credentials=True, under which a wildcard makes Starlette "
+                "reflect any requesting Origin. List your exact origins instead, "
+                "e.g. API_CORS_ORIGINS='[\"https://app.example.com\"]'."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _resolve_auth_pepper(self) -> "ApiSettings":
         """Resolve ``auth_pepper`` from ``auth_pepper_file`` if set.
 

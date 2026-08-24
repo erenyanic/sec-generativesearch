@@ -894,3 +894,66 @@ class TestAuthPepperResolution:
         clean_env.setenv("API_AUTH_PEPPER_FILE", str(pepper_file))
         with pytest.raises(ValidationError, match="mutually exclusive"):
             ApiSettings()
+
+
+@pytest.mark.security
+class TestCorsWildcardRejection:
+    """Security (L2): ``API_CORS_ORIGINS`` must never carry ``*``.
+
+    Starlette's ``CORSMiddleware`` treats ``allow_origins=["*"]`` with
+    ``allow_credentials=True`` specially: it reflects the requesting
+    ``Origin`` back and sets ``Access-Control-Allow-Credentials: true``,
+    so any site could read credentialed cross-origin responses.  The
+    shipped default is safe; the guard exists so an operator reaching
+    for the "just make it work" wildcard fails at boot instead.
+
+    The same list is the WebSocket ``Origin`` allow-list
+    (``api/websocket.py::_is_origin_allowed``), so the rejection is
+    unconditional rather than gated on whether auth is enabled.
+
+    Note on env shapes: pydantic-settings decodes a ``list[str]`` field
+    from JSON, so a bare ``API_CORS_ORIGINS=*`` never reaches the
+    validator — it raises ``SettingsError`` at source-decode time, which
+    is also fail-closed.  ``'["*"]'`` is the only shape that would
+    otherwise produce a live wildcard, and that is what this guard
+    catches.
+    """
+
+    def test_default_origins_are_not_wildcard(self, clean_env: pytest.MonkeyPatch) -> None:
+        assert ApiSettings().cors_origins == ["http://localhost:3000"]
+
+    def test_wildcard_only_list_rejected(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("API_CORS_ORIGINS", '["*"]')
+        with pytest.raises(ValidationError, match="must not contain"):
+            ApiSettings()
+
+    def test_wildcard_alongside_real_origin_rejected(self, clean_env: pytest.MonkeyPatch) -> None:
+        """A wildcard anywhere in the list is still a wildcard to Starlette."""
+        clean_env.setenv("API_CORS_ORIGINS", '["https://app.example", "*"]')
+        with pytest.raises(ValidationError, match="must not contain"):
+            ApiSettings()
+
+    def test_padded_wildcard_rejected(self, clean_env: pytest.MonkeyPatch) -> None:
+        """Whitespace must not smuggle the entry past the guard."""
+        clean_env.setenv("API_CORS_ORIGINS", '[" * "]')
+        with pytest.raises(ValidationError, match="must not contain"):
+            ApiSettings()
+
+    def test_real_origins_still_load(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("API_CORS_ORIGINS", '["https://app.example", "https://ops.example"]')
+        assert ApiSettings().cors_origins == ["https://app.example", "https://ops.example"]
+
+    def test_origin_merely_containing_a_star_is_allowed(
+        self, clean_env: pytest.MonkeyPatch
+    ) -> None:
+        """The guard matches the wildcard entry exactly — it is not a
+        substring ban, which would reject legitimate (if unusual) values."""
+        clean_env.setenv("API_CORS_ORIGINS", '["https://a*b.example"]')
+        assert ApiSettings().cors_origins == ["https://a*b.example"]
+
+    def test_root_settings_load_also_rejects(self, clean_env: pytest.MonkeyPatch) -> None:
+        """The guard must fire through the nested ``Settings()`` path too —
+        that is the one the API factory actually calls."""
+        clean_env.setenv("API_CORS_ORIGINS", '["*"]')
+        with pytest.raises(ValidationError, match="must not contain"):
+            Settings()
