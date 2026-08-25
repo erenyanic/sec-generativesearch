@@ -26,6 +26,7 @@ or a network, so the lockers run in the normal pytest job.
 
 from __future__ import annotations
 
+import ast
 import ipaddress
 import json
 import re
@@ -36,6 +37,7 @@ import pytest
 import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_SRC_ROOT = _REPO_ROOT / "src" / "sec_generative_search"
 _DOCKERFILE_API = _REPO_ROOT / "deploy" / "Dockerfile.api"
 _DOCKERFILE_FRONTEND = _REPO_ROOT / "deploy" / "Dockerfile.frontend"
 _ENTRYPOINT = _REPO_ROOT / "deploy" / "docker-entrypoint.sh"
@@ -1521,4 +1523,228 @@ def test_ci_workflow_quality_gates_are_blocking(ci_workflow: str) -> None:
     assert isinstance(triggers, dict) and "pull_request" in triggers, (
         "ci.yml does not trigger on `pull_request` — the gates cannot block a PR "
         "before merge unless they run on pull_request events"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ChromaDB attack-surface lockers
+# ---------------------------------------------------------------------------
+#
+# The pip-audit job suppresses four chromadb advisories (CVE-2026-45829 /
+# -45830 / -45831 / -45833). Every one of them lives in the Chroma **server**:
+# the FastAPI HTTP surface, its tenant model, and its RBAC authorization
+# provider. The suppressions are therefore only sound while this project keeps
+# embedding ChromaDB as a local ``chromadb.PersistentClient`` and never serves,
+# calls, or authorizes a Chroma HTTP endpoint.
+#
+# That precondition used to live in a workflow comment. These two lockers make
+# it executable: the first fails the moment a server-surface symbol appears in
+# ``src/``, the second fails the moment the ignore list drifts from the
+# reviewed set. Neither needs Docker or a network.
+
+# Client constructors that speak to a Chroma **server** rather than a local
+# file. ``PersistentClient`` (the sanctioned one) is deliberately absent.
+_CHROMA_SERVER_CLIENTS = frozenset({"HttpClient", "AsyncHttpClient", "CloudClient", "Client"})
+
+# The keyword that turns a collection's embedding-function config into remote
+# code execution (CVE-2026-45829 / -45833).
+_CHROMA_RCE_KEYWORD = "trust_remote_code"
+
+# Substrings identifying Chroma's authn/authz provider stack (CVE-2026-45831).
+_CHROMA_AUTHZ_MARKERS = ("AuthorizationProvider", "AuthenticationProvider", "SimpleRBAC")
+
+_EXPECTED_PIP_AUDIT_IGNORES = frozenset(
+    {
+        "CVE-2026-45829",
+        "CVE-2026-45830",
+        "CVE-2026-45831",
+        "CVE-2026-45833",
+    }
+)
+
+_IGNORE_VULN_RE = re.compile(r"--ignore-vuln\s+(\S+)")
+
+
+def _dotted_name(node: ast.AST) -> str:
+    """Render an attribute/name chain as a dotted string (``a.b.c``)."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted_name(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    return ""
+
+
+def _chroma_server_surface_violations(source: str, label: str) -> list[str]:
+    """Return every Chroma **server**-surface use in *source*.
+
+    AST-based on purpose: a substring grep over the tree trips on the
+    word ``PersistentClient`` inside a docstring (``database/reindex.py``
+    has exactly that), and would equally miss a symbol reached through an
+    ``import ... as`` alias.
+    """
+    violations: list[str] = []
+    tree = ast.parse(source)
+
+    # Resolve module aliases first: ``import chromadb as db`` makes
+    # ``db.HttpClient(...)`` the same call as ``chromadb.HttpClient(...)``,
+    # and matching the literal base name alone would sail straight past it.
+    chroma_module_names = {"chromadb"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "chromadb" or alias.name.startswith("chromadb."):
+                    chroma_module_names.add(alias.asname or alias.name.split(".")[0])
+
+    for node in ast.walk(tree):
+        # ``chromadb.HttpClient(...)`` / ``db.Client(...)`` for any binding
+        # of the chromadb module.
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in _CHROMA_SERVER_CLIENTS
+            and _dotted_name(node.value).split(".")[-1] in chroma_module_names
+        ):
+            violations.append(f"{label}:{node.lineno}: chromadb.{node.attr} (server client)")
+
+        # ``from chromadb import HttpClient`` / ``from chromadb.auth import
+        # SimpleRBACAuthorizationProvider`` (aliased or not). An import alias
+        # is neither a Name nor an Attribute, so the marker sweep below can
+        # never see it — both checks have to happen here.
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("chromadb"):
+                for alias in node.names:
+                    if alias.name in _CHROMA_SERVER_CLIENTS:
+                        violations.append(
+                            f"{label}:{node.lineno}: from {module} import "
+                            f"{alias.name} (server client)"
+                        )
+            for alias in node.names:
+                if any(marker in alias.name for marker in _CHROMA_AUTHZ_MARKERS):
+                    violations.append(
+                        f"{label}:{node.lineno}: from {module} import "
+                        f"{alias.name} (Chroma authz provider)"
+                    )
+
+        # ``import chromadb.auth`` / ``import chromadb.auth as ...``
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("chromadb.auth"):
+                    violations.append(
+                        f"{label}:{node.lineno}: import {alias.name} (Chroma authz stack)"
+                    )
+
+        # ``trust_remote_code=True`` anywhere at all.
+        if isinstance(node, ast.keyword) and node.arg == _CHROMA_RCE_KEYWORD:
+            violations.append(f"{label}:{node.lineno}: {_CHROMA_RCE_KEYWORD}= (remote-code config)")
+
+        # Any reference to Chroma's authn/authz provider stack.
+        if isinstance(node, ast.Name | ast.Attribute):
+            rendered = node.id if isinstance(node, ast.Name) else node.attr
+            if any(marker in rendered for marker in _CHROMA_AUTHZ_MARKERS):
+                violations.append(f"{label}:{node.lineno}: {rendered} (Chroma authz provider)")
+
+    return violations
+
+
+@pytest.mark.security
+def test_chromadb_usage_stays_embedded_only() -> None:
+    """``src/`` must never reach the Chroma server surface.
+
+    This is the executable half of the pip-audit suppressions documented
+    in ``ci.yml``. All four ignored advisories are server-side; the
+    moment this project opens an ``HttpClient``, enables
+    ``trust_remote_code``, or configures an authorization provider, they
+    stop being unreachable and the matching ``--ignore-vuln`` MUST be
+    removed in the same change.
+
+    Scoped to ``src/`` deliberately: ``tests/`` constructs a real
+    ``PersistentClient`` in many places, and widening the scan would
+    force exclusions that hollow it out.
+    """
+    violations: list[str] = []
+    for path in sorted(_SRC_ROOT.rglob("*.py")):
+        violations.extend(
+            _chroma_server_surface_violations(
+                path.read_text(encoding="utf-8"),
+                str(path.relative_to(_REPO_ROOT)),
+            )
+        )
+
+    assert not violations, (
+        "src/ reaches the ChromaDB *server* attack surface, which the pip-audit "
+        "suppressions in .github/workflows/ci.yml assume is unreachable "
+        "(CVE-2026-45829/-45830/-45831/-45833 are all server-side). Either revert "
+        "the change or remove the matching --ignore-vuln entries in the same "
+        "commit:\n  " + "\n  ".join(violations)
+    )
+
+
+@pytest.mark.security
+def test_the_chromadb_scan_actually_finds_planted_violations() -> None:
+    """Non-vacuity guard for the scan above.
+
+    ``test_chromadb_usage_stays_embedded_only`` passes on a clean tree,
+    so on its own it cannot distinguish "no violations" from "scanner is
+    broken". Each planted sample below must be caught, and the
+    sanctioned embedded usage must NOT be.
+    """
+    planted = (
+        "import chromadb\nclient = chromadb.HttpClient(host='chroma')\n",
+        "import chromadb as db\nclient = db.HttpClient(host='chroma')\n",
+        "import chromadb.auth as ca\nprovider = ca.SimpleRBACAuthorizationProvider()\n",
+        "import chromadb\nclient = chromadb.Client()\n",
+        "from chromadb import HttpClient\n",
+        "from chromadb import HttpClient as Remote\n",
+        "collection.modify(configuration={'trust_remote_code': True})\n"
+        "fn(trust_remote_code=True)\n",
+        "from chromadb.auth import SimpleRBACAuthorizationProvider\n",
+        "from chromadb.auth import SimpleRBACAuthorizationProvider as P\n",
+        "import chromadb.auth\n",
+        "provider = chromadb.auth.SimpleRBACAuthorizationProvider()\n",
+    )
+    for sample in planted:
+        assert _chroma_server_surface_violations(sample, "<planted>"), (
+            f"the ChromaDB server-surface scan missed a planted violation:\n{sample}"
+        )
+
+    # The sanctioned embedded client must stay clean — including the
+    # docstring mention that a substring grep would false-positive on.
+    sanctioned = (
+        '"""Opens a chromadb.PersistentClient and an HttpClient-free path."""\n'
+        "import chromadb\n"
+        "import chromadb as db\n"
+        "client = chromadb.PersistentClient(path='/app/data/chroma_db')\n"
+        "other = db.PersistentClient(path='/app/data/chroma_db')\n"
+    )
+    assert not _chroma_server_surface_violations(sanctioned, "<sanctioned>"), (
+        "the ChromaDB server-surface scan false-positives on the sanctioned "
+        "embedded PersistentClient usage"
+    )
+
+
+@pytest.mark.security
+def test_ci_pip_audit_ignore_set_is_exactly_the_reviewed_cves(ci_workflow: str) -> None:
+    """Pin the ``--ignore-vuln`` set so a fifth suppression is a reviewed edit.
+
+    Suppressing a CVE is a security decision with an expiry condition
+    (a fixed release ships, or the reachability argument stops holding).
+    Appending one quietly is exactly the failure mode this pins shut —
+    the same posture as the route-inventory allow-lists.
+    """
+    found = set(_IGNORE_VULN_RE.findall(ci_workflow))
+
+    unreviewed = found - _EXPECTED_PIP_AUDIT_IGNORES
+    assert not unreviewed, (
+        f"ci.yml suppresses CVEs that are not in the reviewed set: {sorted(unreviewed)}. "
+        "Adding a --ignore-vuln entry is a deliberate security decision: document why "
+        "the advisory is unreachable AND that no fixed release exists, then add it to "
+        "_EXPECTED_PIP_AUDIT_IGNORES in the same commit"
+    )
+
+    stale = _EXPECTED_PIP_AUDIT_IGNORES - found
+    assert not stale, (
+        f"ci.yml no longer suppresses {sorted(stale)}, but the locker still expects it. "
+        "If a fixed chromadb release shipped and the ignore was dropped, drop it from "
+        "_EXPECTED_PIP_AUDIT_IGNORES too (and re-audit the rest)"
     )

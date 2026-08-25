@@ -145,9 +145,45 @@ jobs:
         #     the embedded-only usage above stays true — adding the Chroma
         #     server would reopen the surface and this ignore MUST be
         #     removed in that same change.
+        #
+        #   CVE-2026-45830 (added 2026-08-25) — missing authorization
+        #     validation lets any *authenticated* user read/write/update/
+        #     delete data in another tenant's collection. NOT applicable:
+        #     the tenant model is a property of the Chroma *server*'s
+        #     request authorization. An embedded PersistentClient has no
+        #     authenticated callers and no cross-tenant request path — the
+        #     process that opens the file already owns every collection in
+        #     it.
+        #
+        #   CVE-2026-45831 (added 2026-08-25) — SimpleRBACAuthorizationProvider
+        #     checks that a user holds a permission but never which tenant /
+        #     database / collection it applies to. NOT applicable: that
+        #     provider is only instantiated by the server's auth stack, and
+        #     this project configures no Chroma authn/authz provider at all.
+        #
+        #   CVE-2026-45833 (added 2026-08-25) — the *authenticated* twin of
+        #     CVE-2026-45829: the same trust_remote_code code injection,
+        #     reached through the collection-UPDATE endpoint by a caller
+        #     holding UPDATE_COLLECTION. NOT applicable for the same reason
+        #     as 45829 — no HTTP endpoint is served, and trust_remote_code
+        #     is never enabled.
+        #
+        # All four are server-surface and, as of 2026-08-25, have NO fixed
+        # release: chromadb 1.5.9 is the PyPI head, so there is nowhere to
+        # bump. Their shared precondition — this project embeds ChromaDB via
+        # `chromadb.PersistentClient` ONLY — is ENFORCED, not merely
+        # asserted, by tests/ops/test_deployment_artifacts.py::
+        # test_chromadb_usage_stays_embedded_only; the ignore set below is
+        # pinned by ::test_ci_pip_audit_ignore_set_is_exactly_the_reviewed_cves.
+        # Adding a Chroma server, an HttpClient, or an authz provider makes
+        # every one of these live and MUST remove the matching ignore in
+        # that same change.
         run: |
           python -m pip_audit -r audit-requirements.txt \
-            --ignore-vuln CVE-2026-45829
+            --ignore-vuln CVE-2026-45829 \
+            --ignore-vuln CVE-2026-45830 \
+            --ignore-vuln CVE-2026-45831 \
+            --ignore-vuln CVE-2026-45833
 
   secret-scan:
     # Scan the working tree for accidentally-committed
