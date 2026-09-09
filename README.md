@@ -10,14 +10,14 @@ This is a **generative** system: a language model writes the answer. That answer
 
 ## Where your data goes (read this first)
 
-Because an LLM generates the answer, **by default this system is not fully local, and does not keep your data to yourself.** Being honest about that is more useful than a privacy badge:
+Because an LLM generates the answer, **this system is not fully local by default.** Where each step sends your data:
 
 - **Generation goes to an LLM — remote by default.** To answer a question, the system sends your question text **and the retrieved filing excerpts** to whichever LLM provider you configure. By default that is a remote bring-your-own-key vendor (OpenAI, Anthropic, Gemini, Mistral, DeepSeek, Grok, Qwen, Kimi, MiniMax, MiMo, Z.ai, or OpenRouter), and **that provider sees your prompts**. A **self-hosted `local_llm`** option (Ollama / llama.cpp-server / vLLM / LM Studio) lets you point generation at a model server **you** run — loopback by default — so the prompt need not reach any third party. Even then the prompt is still transmitted over the wire to that endpoint: *"local" means a server you control, not that nothing ever leaves the process.*
-- **Retrieval is local by default.** The default embedder (`google/embeddinggemma-300m`, 768-dim) runs on your own machine, so the *retrieval* step — embedding your query and the filing chunks — does not call out to a third party. This avoids adding a **second** external service on top of the LLM; on its own it does **not** make the pipeline private, because with a remote LLM the prompt still leaves your machine at generation time (pairing it with a loopback `local_llm` endpoint is what keeps the prompt on-box).
+- **Retrieval is local by default.** The default embedder (`google/embeddinggemma-300m`, 768-dim) runs on your own machine, so the *retrieval* step — embedding your query and the filing chunks — does not call out to a third party. That keeps the LLM provider as the only external service in the default configuration. It does not by itself make the pipeline private: with a remote LLM the prompt still leaves your machine at generation time. Pairing local retrieval with a loopback `local_llm` endpoint keeps the prompt on your own host.
 - **A hosted embedder is opt-in and widens the exposure.** If you set `EMBEDDING_PROVIDER=openai|gemini|mistral|qwen`, every query and every filing chunk is also sent to that embedding API. Only do this when that exposure is acceptable.
 - **Filings are public.** The filing text itself is public SEC data. What is sensitive is the *pattern* of your activity — which companies, when, and what you asked — which is exactly what reaches the LLM provider.
 
-What the project **does** protect well: your search queries and chat history are never persisted to disk, provider API keys are encrypted client-side (the server never sees your password or key-encryption key), and the database can be encrypted at rest. See [Security design](#security-design) below.
+What the project protects: your search queries and chat history are never persisted to disk, provider API keys are encrypted client-side (the server never sees your password or key-encryption key), and the database can be encrypted at rest. See [Security design](#security-design) below.
 
 ---
 
@@ -176,7 +176,7 @@ sec-rag ingest batch tickers.txt --form 10-Q
 sec-rag manage list
 sec-rag manage status
 sec-rag manage remove AAPL
-sec-rag manage clear -y          # always proceeds; CLI does not honour demo mode
+sec-rag manage clear -y          # always proceeds; not subject to API_DEMO_MODE
 
 # Semantic search (retrieval only, no LLM call)
 sec-rag search "capital expenditure trends" --ticker AAPL
@@ -221,7 +221,7 @@ The admin key never reaches the browser: a server-side Next.js proxy injects it,
 
 ## LLM providers
 
-Twelve hosted providers, each via its first-party SDK, plus a self-hosted `local_llm` endpoint. Supply a key and the system uses that provider's default model unless you pick another. **Defaults are reflected from the codebase** (`src/sec_generative_search/providers/`):
+Twelve hosted providers, each via its first-party SDK, plus a self-hosted `local_llm` endpoint. Supply a key and the system uses that provider's default model unless you pick another. Current defaults, as defined in `src/sec_generative_search/providers/`:
 
 | Provider   | Default chat model            | Embedding (if used)          |
 | ---------- | ----------------------------- | ---------------------------- |
@@ -237,7 +237,7 @@ Twelve hosted providers, each via its first-party SDK, plus a self-hosted `local
 | MiMo       | `mimo-v2.5`                   | —                            |
 | Z.ai       | `glm-5`                       | —                            |
 | OpenRouter | `qwen/qwen3.6-plus`           | — (accepts any model slug)   |
-| Local LLM  | `llama3.2` (any slug)         | — (self-hosted, FREE)        |
+| Local LLM  | `llama3.2` (any slug)         | — (self-hosted)              |
 | Local      | — (no LLM; embedding only)    | `google/embeddinggemma-300m` |
 
 `local_llm` targets a self-hosted OpenAI-wire server (`LOCAL_LLM_BASE_URL`, loopback by default; see [Configuration](#configuration)). Keys are never accepted via URL parameters or shell flags. Provide them through an environment variable, the `sec-rag provider set` prompt, or the SPA Provider Settings page (encrypted in the per-user vault).
@@ -285,7 +285,7 @@ All deployment artefacts live under [`deploy/`](deploy/): the two Dockerfiles, t
 | Per-session EDGAR identity                                                    | Prevents shared-identity rate-limit collapse in multi-tenant deployments.                            |
 | Content-free correlation IDs and metric labels                                | Ticker, query, and `session_id` never reach a log aggregator or metrics axis.                        |
 
-**Honest limits.** None of this protects the prompt once it reaches the LLM provider — that is inherent to remote generation. SQLCipher protects a stolen database file, not a compromised running process (the key is in memory at runtime). A malicious browser extension can read the in-memory vault. HTTPS and host security are prerequisites, not features.
+**Limitations.** None of this protects the prompt once it reaches the LLM provider — that is inherent to remote generation. SQLCipher protects a stolen database file, not a compromised running process (the key is in memory at runtime). A malicious browser extension can read the in-memory vault. HTTPS and host security are prerequisites, not features.
 
 ---
 
