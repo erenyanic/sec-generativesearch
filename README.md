@@ -358,7 +358,7 @@ SEC-GenerativeSearch/
 
 ## Licensing & usage
 
-**SEC-GenerativeSearch** is licensed under the **Business Source License 1.1 (BSL 1.1)**. The goal is to keep the code open for developers, students, and researchers to study the RAG architecture, chunking, and security design, while protecting it against unauthorised commercial exploitation and competing hosted offerings.
+**SEC-GenerativeSearch** is licensed under the **Business Source License 1.1 (BSL 1.1)**. The goal is to keep the code open for developers, students, and researchers to study the RAG architecture, chunking, and security design, while protecting it against unauthorized commercial exploitation and competing hosted offerings.
 
 **Free & open** — personal and academic projects, non-commercial research, and temporary internal evaluation (including running the full stack locally to assess fit).
 
