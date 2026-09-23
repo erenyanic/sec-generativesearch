@@ -61,6 +61,7 @@ from sec_generative_search.api.websocket import router as websocket_router
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.credentials import InMemorySessionCredentialStore
 from sec_generative_search.core.edgar_identity import InMemorySessionEdgarIdentityStore
+from sec_generative_search.core.exceptions import ConfigurationError
 from sec_generative_search.core.logging import get_logger
 from sec_generative_search.core.types import EmbedderStamp
 from sec_generative_search.database import ChromaDBClient, FilingStore, MetadataRegistry
@@ -83,13 +84,51 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+async def _warm_embedder(embedder: object, model_name: str) -> None:
+    """Load the embedder's model now, failing the boot if it cannot load.
+
+    Duck-typed on ``warm_up`` (never ``isinstance``), mirroring the
+    ``maybe_unload`` seam.  Settings already reject the flag for hosted
+    embedders, so a hosted provider is never called at boot.  The load
+    runs in a worker thread to keep the loop free.
+
+    An operator who asked for readiness-before-traffic gets a refusal,
+    not a silent fallback to the first-request download.  This module's
+    log line and the raised message carry the model slug and exception
+    *type* only — never the exception text.  The cause stays chained so
+    the boot traceback keeps the loader's diagnosis (no request data
+    exists at boot).
+    """
+    warm_up = getattr(embedder, "warm_up", None)
+    if not callable(warm_up):
+        return
+    logger.info("Embedder warm-up: loading model=%s before accepting traffic", model_name)
+    try:
+        await asyncio.to_thread(warm_up)
+    except Exception as exc:
+        logger.error(
+            "Embedder warm-up failed (model=%s): %s",
+            model_name,
+            type(exc).__name__,
+        )
+        raise ConfigurationError(
+            "EMBEDDING_WARM_ON_BOOT=true but the embedding model could not be loaded.",
+            details=(
+                "Check HF_TOKEN (the default model is gated), outbound access to "
+                "huggingface.co or a pre-populated HF_HOME cache, and the "
+                "[local-embeddings] extra."
+            ),
+        ) from exc
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Boot every singleton, expose them on ``app.state``, and tear down.
 
     Order is load-bearing:
 
-    1. Embedder — fails early on missing admin env var.
+    1. Embedder — fails early on missing admin env var; optionally
+       warmed (``EMBEDDING_WARM_ON_BOOT``), failing the boot on error.
     2. ``EmbedderStamp`` from the registry — the storage seal.
     3. ``ChromaDBClient`` — opens (or creates) the sealed collection.
     4. ``MetadataRegistry`` — opens SQLite/SQLCipher and applies
@@ -104,6 +143,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # 1. Embedder — administrative selection, default-env resolver only.
     embedder = build_embedder(settings.embedding)
+
+    # 1b. Optional warm-up (``EMBEDDING_WARM_ON_BOOT``, local-only).  Runs
+    # before uvicorn binds, so a cold weight download finishes before the
+    # startup probe can pass instead of stalling the first user request.
+    if settings.embedding.warm_on_boot:
+        await _warm_embedder(embedder, settings.embedding.model_name)
 
     # 2. Stamp via the registry — single source of truth for dimension.
     dimension = ProviderRegistry.get_dimension(

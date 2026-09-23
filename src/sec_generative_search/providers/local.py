@@ -268,6 +268,17 @@ class LocalEmbeddingProvider(BaseEmbeddingProvider):
         """``True`` when the model is currently resident in memory."""
         return self._model is not None
 
+    def warm_up(self) -> None:
+        """Load the model now instead of on the first embed call.
+
+        Backs ``EMBEDDING_WARM_ON_BOOT``: the API lifespan calls it
+        before the server binds, so a cold weight download finishes
+        before the startup probe passes rather than inside a user
+        request.  Idempotent; loader errors propagate unchanged so the
+        caller can fail the boot.
+        """
+        self._ensure_model()
+
     def maybe_unload(self, now: float | None = None) -> bool:
         """Unload the model when it has been idle past the threshold.
 

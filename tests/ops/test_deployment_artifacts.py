@@ -220,10 +220,20 @@ def test_no_baked_secret_in_image_definition(dockerfile: str, entrypoint: str) -
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "HUGGING_FACE_TOKEN",
+        # The variable the factory actually reads for the (gated) local
+        # embedder — ``HUGGING_FACE_TOKEN`` above is a dead knob (F35).
+        "HF_TOKEN",
     )
     for name in secret_env:
         bad = re.search(rf"\b{name}=(?!\s|$|\$)\S", blob)
         assert not bad, f"image definition assigns a literal value to {name} — never bake a secret"
+    # A build ARG is recorded in the image history even without a default, so
+    # a token must never arrive that way (only a BuildKit secret mount would do).
+    for name in ("HF_TOKEN", "HUGGING_FACE_TOKEN"):
+        assert not re.search(rf"^\s*ARG\s+{name}\b", dockerfile, re.MULTILINE), (
+            f"Dockerfile declares ARG {name} — build args persist in the image "
+            "history; use RUN --mount=type=secret instead"
+        )
 
 
 @pytest.mark.security
@@ -280,6 +290,137 @@ def test_server_runs_single_worker_behind_proxy(dockerfile: str) -> None:
         "uvicorn must run exactly one worker (in-process TaskManager contract)"
     )
     assert "--proxy-headers" in cmd, "uvicorn must run with --proxy-headers behind nginx/GFE"
+
+
+# ---------------------------------------------------------------------------
+# Boot-time egress: tokenizer bake + model-cache placement (F25)
+#
+#   - The tiktoken BPE files are fetched in the BUILDER stage into a cache
+#     under /opt/venv — the only tree the runtime stage inherits — and the
+#     runtime ENV names the same path. Without this the API lifespan downloads
+#     cl100k_base from Azure blob storage on every fresh container.
+#   - The image's HF_HOME sits on the /app/data volume, and the entrypoint's
+#     fallback default names the same path (the entrypoint re-owns it).
+# ---------------------------------------------------------------------------
+
+_TIKTOKEN_ENCODINGS = ("cl100k_base", "o200k_base")
+
+
+def _dockerfile_stages(dockerfile: str) -> dict[str, str]:
+    """Map each ``FROM … AS <name>`` stage to its instructions.
+
+    Comment lines are dropped and ``\\``-continuations joined, so a path
+    quoted in a comment can never satisfy an assertion.
+    """
+    lines = [ln for ln in dockerfile.splitlines() if not ln.lstrip().startswith("#")]
+    flat = re.sub(r"\\\s*\n", " ", "\n".join(lines))
+    stages: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for line in flat.splitlines():
+        match = re.match(r"^FROM\s+\S+\s+AS\s+(\S+)", line.strip(), re.IGNORECASE)
+        if match:
+            current = stages.setdefault(match.group(1), [])
+            continue
+        if current is not None:
+            current.append(line)
+    return {name: "\n".join(body) for name, body in stages.items()}
+
+
+def _env_value(stage: str, name: str) -> str | None:
+    """Last value an ``ENV`` instruction in *stage* assigns to *name*."""
+    values = [
+        m.group(1)
+        for line in stage.splitlines()
+        if line.strip().startswith("ENV")
+        for m in re.finditer(rf"\b{name}=(\"[^\"]*\"|\S+)", line)
+    ]
+    return values[-1].strip('"') if values else None
+
+
+def test_tiktoken_encodings_are_baked_into_the_inherited_venv(dockerfile: str) -> None:
+    stages = _dockerfile_stages(dockerfile)
+    assert {"builder", "runtime"} <= set(stages), f"expected builder + runtime stages: {stages}"
+    builder, runtime = stages["builder"], stages["runtime"]
+
+    cache_dir = _env_value(builder, "TIKTOKEN_CACHE_DIR")
+    assert cache_dir, "builder stage never sets TIKTOKEN_CACHE_DIR before the prefetch"
+    assert cache_dir.startswith("/opt/venv/"), (
+        f"TIKTOKEN_CACHE_DIR={cache_dir!r} is outside /opt/venv — the runtime stage "
+        "inherits the builder only through COPY --from=builder /opt/venv, so the "
+        "baked BPE files would be lost"
+    )
+    assert re.search(r"^COPY\s+--from=builder\s+/opt/venv\s+/opt/venv", runtime, re.M), (
+        "runtime stage no longer inherits /opt/venv from the builder"
+    )
+    assert _env_value(runtime, "TIKTOKEN_CACHE_DIR") == cache_dir, (
+        "runtime TIKTOKEN_CACHE_DIR must name the builder's baked cache — otherwise "
+        "tiktoken falls back to <tmp>/data-gym-cache and downloads at boot"
+    )
+
+    # The prefetch must run AFTER the cache ENV (else it fills /tmp) and name
+    # every encoding the codebase can reach.
+    env_at = builder.find("TIKTOKEN_CACHE_DIR=")
+    prefetch = [
+        (builder.find(line), line)
+        for line in builder.splitlines()
+        if line.strip().startswith("RUN") and "get_encoding" in line
+    ]
+    assert prefetch, "builder stage never prefetches the tiktoken encodings"
+    position, command = prefetch[-1]
+    assert position > env_at, "tiktoken prefetch runs before TIKTOKEN_CACHE_DIR is set"
+    for encoding in _TIKTOKEN_ENCODINGS:
+        assert f"get_encoding('{encoding}')" in command or (
+            f'get_encoding("{encoding}")' in command
+        ), f"tiktoken prefetch does not fetch {encoding}"
+
+
+def test_tiktoken_prefetch_covers_every_encoding_the_catalogue_reaches() -> None:
+    # The baked cache is root-owned and read-only to the server; with a
+    # user-specified TIKTOKEN_CACHE_DIR tiktoken RAISES on a failed cache
+    # write instead of downloading. So an encoding outside the baked set is a
+    # hard failure at runtime, not a slow path — keep the set exhaustive.
+    tiktoken = pytest.importorskip("tiktoken")
+    from sec_generative_search.providers.catalogue import ModelCatalogue
+    from sec_generative_search.providers.registry import ProviderRegistry, ProviderSurface
+
+    baseline = ModelCatalogue.load_baseline()
+    llm_providers = [
+        entry.name
+        for entry in ProviderRegistry.all_entries(ProviderSurface.LLM, include_unavailable=True)
+    ]
+    assert any(baseline.list_llm_models(name) for name in llm_providers), "empty catalogue"
+    reached = {"cl100k_base"}  # retrieval / orchestrator / fallback counter
+    for provider in llm_providers:
+        for slug in baseline.list_llm_models(provider):
+            try:
+                reached.add(tiktoken.model.encoding_name_for_model(slug))
+            except KeyError:
+                reached.add("cl100k_base")  # openai_compat.count_tokens fallback
+    missing = reached - set(_TIKTOKEN_ENCODINGS)
+    assert not missing, (
+        f"catalogued models reach tiktoken encodings the image does not bake: "
+        f"{sorted(missing)} — add them to the Dockerfile prefetch and this locker"
+    )
+
+
+def test_hf_home_is_on_the_volume_and_matches_the_entrypoint(
+    dockerfile: str, entrypoint: str
+) -> None:
+    runtime = _dockerfile_stages(dockerfile)["runtime"]
+    hf_home = _env_value(runtime, "HF_HOME")
+    assert hf_home, "runtime stage never sets HF_HOME"
+    volumes = re.findall(r'^VOLUME\s+\[\s*"([^"]+)"', runtime, re.MULTILINE)
+    assert volumes, "runtime stage declares no VOLUME"
+    assert any(hf_home.startswith(v.rstrip("/") + "/") for v in volumes), (
+        f"HF_HOME={hf_home!r} is not under a declared VOLUME {volumes} — the gated "
+        "embedder weights would be re-downloaded on every new container"
+    )
+    fallback = re.search(r'HF_HOME="\$\{HF_HOME:-([^}]+)\}"', entrypoint)
+    assert fallback, "entrypoint no longer defaults HF_HOME"
+    assert fallback.group(1) == hf_home, (
+        f"entrypoint HF_HOME default {fallback.group(1)!r} != image HF_HOME "
+        f"{hf_home!r} — the entrypoint would create/re-own the wrong directory"
+    )
 
 
 @pytest.mark.security
@@ -472,6 +613,7 @@ _SECRET_ENV = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "HUGGING_FACE_TOKEN",
+    "HF_TOKEN",
 )
 
 
@@ -1007,6 +1149,44 @@ def test_cloud_api_persists_data_via_gcsfuse(cloud_api: dict[str, Any]) -> None:
     )
 
 
+def test_cloud_api_hf_cache_is_not_on_the_fuse_volume(cloud_api: dict[str, Any]) -> None:
+    # F25: the image default HF_HOME is on /app/data, which on Cloud Run is
+    # gcsfuse — memory-mapping ~0.6 GB of weights over FUSE on every cold
+    # start. The manifest must pin the cache to container-local disk.
+    container = _service_container(cloud_api)
+    env = _env_by_name(container)
+    assert "HF_HOME" in env and "value" in env["HF_HOME"], (
+        "api-service.yaml must set HF_HOME explicitly — the image default "
+        "(/app/data/hf) is on the gcsfuse volume"
+    )
+    hf_home = str(env["HF_HOME"]["value"])
+    for mount in container.get("volumeMounts") or []:
+        path = str(mount.get("mountPath", "")).rstrip("/")
+        assert hf_home != path and not hf_home.startswith(path + "/"), (
+            f"HF_HOME={hf_home!r} sits on the {path!r} volume mount (gcsfuse)"
+        )
+
+
+@pytest.mark.security
+def test_cloud_api_local_embedder_is_warmed_with_a_secret_managed_token(
+    cloud_api: dict[str, Any],
+) -> None:
+    env = _env_by_name(_service_container(cloud_api))
+    if env.get("EMBEDDING_PROVIDER", {}).get("value") != "local":
+        pytest.skip("cloud API does not use the local embedder")
+    # google/embeddinggemma-300m is gated: no token, no weights.
+    assert "HF_TOKEN" in env, "local (gated) embedder configured without HF_TOKEN"
+    assert _uses_secret_manager(env["HF_TOKEN"]), (
+        "HF_TOKEN must resolve from Secret Manager (valueFrom.secretKeyRef)"
+    )
+    # Every new instance downloads the weights; warm them before the startup
+    # probe passes rather than inside the first user request.
+    assert str(env.get("EMBEDDING_WARM_ON_BOOT", {}).get("value", "")).lower() == "true", (
+        "api-service.yaml must set EMBEDDING_WARM_ON_BOOT=true (fresh instances "
+        "re-download the embedder)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Keyless, GFE-TLS frontend service.
 # ---------------------------------------------------------------------------
@@ -1388,6 +1568,26 @@ def test_ci_workflow_torch_is_cpu_only(ci_workflow: str) -> None:
             "the CPU wheel index (…/whl/cpu) — the default PyPI torch wheel is the "
             "CUDA build; pin --index-url …/whl/cpu to keep CI CPU-only"
         )
+
+
+def test_ci_workflow_caches_the_tiktoken_encodings(ci_workflow: str) -> None:
+    # F25/F31: without a cache every CI run downloads cl100k_base + o200k_base
+    # (~5 MB, ~15 s of the suite). The pytest step's TIKTOKEN_CACHE_DIR must be
+    # exactly the path an actions/cache step restores.
+    steps = yaml.safe_load(ci_workflow)["jobs"]["test"]["steps"]
+    cached = {
+        str(step.get("with", {}).get("path", "")).strip()
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/cache@")
+    }
+    pytest_steps = [s for s in steps if "pytest" in str(s.get("run", ""))]
+    assert pytest_steps, "ci.yml test job has no pytest step"
+    cache_dirs = {str((s.get("env") or {}).get("TIKTOKEN_CACHE_DIR", "")) for s in pytest_steps}
+    assert "" not in cache_dirs, "the pytest step does not set TIKTOKEN_CACHE_DIR"
+    assert cache_dirs <= cached, (
+        f"pytest TIKTOKEN_CACHE_DIR {sorted(cache_dirs)} is not restored by an "
+        f"actions/cache step (cached paths: {sorted(cached)})"
+    )
 
 
 @pytest.mark.security

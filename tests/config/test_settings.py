@@ -311,6 +311,8 @@ class TestEmbeddingSettingsDefaults:
         assert s.device == "auto"
         assert s.batch_size == 32
         assert s.idle_timeout_minutes == 0
+        # Warm-up is opt-in: the default boot stays lazy (F25).
+        assert s.warm_on_boot is False
 
     def test_env_override_hosted_provider(self, clean_env: pytest.MonkeyPatch) -> None:
         clean_env.setenv("EMBEDDING_PROVIDER", "openai")
@@ -439,6 +441,21 @@ class TestEmbeddingSettingsLocalOnlyKnobGuard:
         clean_env.setenv("EMBEDDING_MODEL_NAME", "text-embedding-3-small")
         clean_env.setenv("EMBEDDING_IDLE_TIMEOUT_MINUTES", "5")
         with pytest.raises(ValidationError, match="idle_timeout_minutes=5"):
+            EmbeddingSettings()
+
+    def test_local_provider_accepts_warm_on_boot(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("EMBEDDING_PROVIDER", "local")
+        clean_env.setenv("EMBEDDING_WARM_ON_BOOT", "true")
+        assert EmbeddingSettings().warm_on_boot is True
+
+    @pytest.mark.security
+    def test_hosted_provider_rejects_warm_on_boot(self, clean_env: pytest.MonkeyPatch) -> None:
+        """Warming a hosted embedder would be a keyed third-party call at
+        every boot — refused at settings load, before any provider exists."""
+        clean_env.setenv("EMBEDDING_PROVIDER", "openai")
+        clean_env.setenv("EMBEDDING_MODEL_NAME", "text-embedding-3-small")
+        clean_env.setenv("EMBEDDING_WARM_ON_BOOT", "true")
+        with pytest.raises(ValidationError, match="warm_on_boot=True"):
             EmbeddingSettings()
 
     def test_hosted_provider_error_names_every_offender(

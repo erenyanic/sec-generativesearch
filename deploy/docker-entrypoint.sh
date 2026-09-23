@@ -14,7 +14,7 @@ set -euo pipefail
 
 APP_USER="${APP_USER:-appuser}"
 APP_DATA_DIR="${APP_DATA_DIR:-/app/data}"
-HF_HOME="${HF_HOME:-/app/cache/huggingface}"
+HF_HOME="${HF_HOME:-/app/data/hf}"
 
 # Privileged init path. If the orchestrator already pinned a non-root user
 # (e.g. Kubernetes ``runAsUser``), there is nothing to chown and no privilege

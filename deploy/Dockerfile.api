@@ -65,6 +65,20 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install ".[encryption,metrics,local-embeddings]"
 
+# Bake the tiktoken BPE files into the image (F25). RetrievalService builds its
+# cl100k_base counter inside the API lifespan, and with an empty cache tiktoken
+# downloads it from Azure blob storage — a boot-time egress dependency. The
+# cache MUST sit under /opt/venv: that tree is the only thing the runtime stage
+# inherits (COPY --from=builder /opt/venv). It lands root-owned, so the
+# unprivileged server can read but never rewrite it, and tiktoken re-verifies
+# each blob's pinned SHA-256 on every read. Exactly the two encodings the
+# codebase can reach are fetched: cl100k_base (retrieval, orchestrator,
+# Anthropic/Gemini approximation, fallback for every uncatalogued slug) and
+# o200k_base (the catalogued OpenAI models). The runtime ENV below MUST name
+# the same path.
+ENV TIKTOKEN_CACHE_DIR=/opt/venv/tiktoken-cache
+RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); tiktoken.get_encoding('o200k_base')"
+
 # --------------------------------------------------------------------------
 # Runtime stage
 # --------------------------------------------------------------------------
@@ -73,7 +87,8 @@ FROM ${PYTHON_BASE} AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:${PATH}" \
-    HF_HOME=/app/cache/huggingface \
+    TIKTOKEN_CACHE_DIR=/opt/venv/tiktoken-cache \
+    HF_HOME=/app/data/hf \
     APP_USER=appuser \
     APP_DATA_DIR=/app/data
 
@@ -102,9 +117,13 @@ RUN mkdir -p "${APP_DATA_DIR}" "${HF_HOME}" \
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# SQLite + ChromaDB persistence (and, by default, the HF model cache nested
-# under /app). Operators MUST attach a durable volume here — task_history is
-# the only crash-durable ingest record.
+# SQLite + ChromaDB persistence, plus the HF model cache (HF_HOME=/app/data/hf)
+# so the gated embedder weights are downloaded once per volume, not once per
+# container. Operators MUST attach a durable volume here — task_history is the
+# only crash-durable ingest record. Exception: on a FUSE-backed volume (Cloud
+# Run gcsfuse) the manifest overrides HF_HOME to container-local disk, so the
+# weights are never memory-mapped over FUSE. Keep HF_HOME in lockstep with the
+# default in docker-entrypoint.sh.
 VOLUME ["/app/data"]
 EXPOSE 8000
 

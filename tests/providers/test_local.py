@@ -211,6 +211,27 @@ class TestLazyLoad:
         assert provider.is_loaded
         assert len(loader.calls) == 1
 
+    def test_warm_up_loads_once_without_encoding(self, loader: _StubLoader) -> None:
+        # EMBEDDING_WARM_ON_BOOT seam: load the weights, encode nothing,
+        # and stay idempotent so a later embed reuses the warmed model.
+        provider = LocalEmbeddingProvider(loader=loader, device="cpu")
+        provider.warm_up()
+        provider.warm_up()
+        assert provider.is_loaded
+        assert len(loader.calls) == 1
+        assert loader.model.encode_calls == []
+        provider.embed_texts(["x"])
+        assert len(loader.calls) == 1
+
+    def test_warm_up_propagates_loader_failure(self) -> None:
+        def failing_loader(**_: Any) -> Any:
+            raise OSError("gated repo")
+
+        provider = LocalEmbeddingProvider(loader=failing_loader, device="cpu")
+        with pytest.raises(OSError, match="gated repo"):
+            provider.warm_up()
+        assert not provider.is_loaded
+
     def test_token_forwarded_only_when_supplied(self, loader: _StubLoader) -> None:
         with_token = LocalEmbeddingProvider(_HF_TOKEN, loader=loader, device="cpu")
         with_token.embed_texts(["x"])

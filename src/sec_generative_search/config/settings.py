@@ -57,9 +57,10 @@ class EmbeddingSettings(BaseSettings):
     ``provider`` selects the embedding backend and is validated against
     :class:`~sec_generative_search.providers.registry.ProviderRegistry` so
     typos surface at settings load rather than at first embed call.  The
-    local-only knobs (``device``, ``batch_size``, ``idle_timeout_minutes``)
-    have no meaning for hosted providers; a ``model_validator`` rejects
-    non-default values whenever ``provider != "local"``.
+    local-only knobs (``device``, ``batch_size``, ``idle_timeout_minutes``,
+    ``warm_on_boot``) have no meaning for hosted providers; a
+    ``model_validator`` rejects non-default values whenever
+    ``provider != "local"``.
 
     Credentials never live here — :mod:`sec_generative_search.providers.factory`
     resolves them at construction time via an injected ``api_key_resolver``.
@@ -70,6 +71,10 @@ class EmbeddingSettings(BaseSettings):
     device: str = "auto"  # "cuda", "cpu", or "auto"
     batch_size: int = 32
     idle_timeout_minutes: int = 0  # 0 = disabled; auto-unload model after idle
+    # Load the local model inside the API lifespan, before the server binds,
+    # so a cold download happens before the startup probe passes rather than
+    # inside the first user request.  Fail-fast on error.  Local-only.
+    warm_on_boot: bool = False
 
     model_config = SettingsConfigDict(env_prefix="EMBEDDING_")
 
@@ -112,8 +117,9 @@ class EmbeddingSettings(BaseSettings):
     def _validate_local_only_knobs(self) -> "EmbeddingSettings":
         """Reject non-default local-only knobs when the provider is hosted.
 
-        ``device``, ``batch_size``, and ``idle_timeout_minutes`` are only
-        meaningful for :class:`LocalEmbeddingProvider`.  Silently
+        ``device``, ``batch_size``, ``idle_timeout_minutes`` and
+        ``warm_on_boot`` are only meaningful for
+        :class:`LocalEmbeddingProvider`.  Silently
         accepting them with a hosted provider would invite
         misconfiguration where an operator thinks they have tuned a
         hosted embedder — fail loudly and name every offending field.
@@ -128,6 +134,10 @@ class EmbeddingSettings(BaseSettings):
             offenders.append(f"batch_size={self.batch_size!r}")
         if self.idle_timeout_minutes != 0:
             offenders.append(f"idle_timeout_minutes={self.idle_timeout_minutes!r}")
+        if self.warm_on_boot:
+            # Security-relevant, not just tidiness: warming a hosted embedder
+            # would make a keyed third-party network call at every boot.
+            offenders.append(f"warm_on_boot={self.warm_on_boot!r}")
 
         if offenders:
             raise ValueError(

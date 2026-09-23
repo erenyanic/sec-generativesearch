@@ -108,6 +108,20 @@ spec:
             # text never leave the instance for a third-party embedder.
             - name: EMBEDDING_PROVIDER
               value: local
+            # HF model cache on CONTAINER-LOCAL disk, never the gcsfuse volume
+            # at /app/data (the image default): memory-mapping ~0.6 GB of
+            # weights over FUSE on every cold start is slower than the download
+            # it would save. Every new instance re-downloads, which is why the
+            # warm-up below runs the download before the startup probe passes.
+            - name: HF_HOME
+              value: /app/cache/huggingface
+            # Load the embedder inside the lifespan, before uvicorn binds, so
+            # the cold download never stalls a user request. Fail-fast: a
+            # missing HF_TOKEN or blocked egress fails the revision's startup
+            # probe instead of the first search. Budget: startupProbe below
+            # allows ~310 s.
+            - name: EMBEDDING_WARM_ON_BOOT
+              value: "true"
             - name: LLM_PROVIDER
               value: anthropic
             - name: LOG_FORMAT
@@ -148,17 +162,26 @@ spec:
                 secretKeyRef:
                   name: sec-gs-anthropic-key
                   key: latest
+            # Hugging Face read token. google/embeddinggemma-300m (the default
+            # embedder) is a GATED model — without an accepted-licence token
+            # the weights cannot be downloaded at all.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sec-gs-hf-token
+                  key: latest
           volumeMounts:
-            # Durable Tier-2/3 state: SQLite/SQLCipher + ChromaDB + the HF cache
-            # nest under /app/data (HF_HOME is /app/cache, but the SQLite +
-            # ChromaDB stores are the crash-durable records that need the bucket).
+            # Durable Tier-2/3 state: SQLite/SQLCipher + ChromaDB under
+            # /app/data. The HF model cache is deliberately NOT here (HF_HOME
+            # is overridden to container-local disk above).
             - name: data
               mountPath: /app/data
           startupProbe:
             httpGet:
               path: /api/health
               port: 8000
-            # The local embedder + SQLCipher open can take a while on cold start.
+            # Cold start = SQLCipher open + the embedder warm-up (weight
+            # download + load); 10 + 30 × 10 s ≈ 310 s budget.
             initialDelaySeconds: 10
             periodSeconds: 10
             failureThreshold: 30
