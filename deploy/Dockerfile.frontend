@@ -1,4 +1,8 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.26.0@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+# The syntax frontend above is an image BuildKit pulls and runs to parse this
+# file, so it is digest-pinned like the FROM bases (a floating tag is a
+# silent-substitution vector). Re-pin with:
+#   docker buildx imagetools inspect docker/dockerfile:1 --format '{{.Manifest.Digest}}'
 
 # ===========================================================================
 # SEC-GenerativeSearch — Next.js frontend image

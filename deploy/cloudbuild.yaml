@@ -57,6 +57,9 @@ steps:
   # Re-pin to a newer release with:
   #   docker buildx imagetools inspect moby/buildkit:<vX.Y.Z> \
   #     --format '{{.Manifest.Digest}}'
+  # deploy/buildkitd.toml routes BuildKit's Docker Hub pulls through
+  # mirror.gcr.io: its container does not inherit the worker daemon's registry
+  # settings, so without it every pull is anonymous against Docker Hub's limits.
   - id: buildx-builder
     name: gcr.io/cloud-builders/docker
     args:
@@ -68,6 +71,8 @@ steps:
       - docker-container
       - --driver-opt
       - image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+      - --buildkitd-config
+      - deploy/buildkitd.toml
       - --bootstrap
 
   # --- API image: context = repo root, Dockerfile = deploy/Dockerfile.api -----

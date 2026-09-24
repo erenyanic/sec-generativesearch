@@ -57,9 +57,12 @@ _GITIGNORE = _REPO_ROOT / ".gitignore"
 _CLOUD_API = _REPO_ROOT / "deploy" / "cloud" / "api-service.yaml"
 _CLOUD_FRONTEND = _REPO_ROOT / "deploy" / "cloud" / "frontend-service.yaml"
 _CLOUD_JOB = _REPO_ROOT / "deploy" / "cloud" / "demo-reset-job.yaml"
-_DEPLOY_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "deploy.yml"
-_CI_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "ci.yml"
+_WORKFLOWS_DIR = _REPO_ROOT / ".github" / "workflows"
+_DEPLOY_WORKFLOW = _WORKFLOWS_DIR / "deploy.yml"
+_CI_WORKFLOW = _WORKFLOWS_DIR / "ci.yml"
+_AUDIT_WORKFLOW = _WORKFLOWS_DIR / "dependency-audit.yml"
 _CLOUDBUILD = _REPO_ROOT / "deploy" / "cloudbuild.yaml"
+_BUILDKITD_CONFIG = _REPO_ROOT / "deploy" / "buildkitd.toml"
 _FRONTEND_PACKAGE_JSON = _REPO_ROOT / "frontend" / "package.json"
 
 _DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}\b")
@@ -151,6 +154,29 @@ def test_deployment_artifacts_exist() -> None:
 # ---------------------------------------------------------------------------
 # Supply chain: digest-pinned bases
 # ---------------------------------------------------------------------------
+
+
+_PARSER_DIRECTIVE_RE = re.compile(r"^#\s*([A-Za-z]+)\s*=\s*(\S+)")
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "path", [_DOCKERFILE_API, _DOCKERFILE_FRONTEND], ids=lambda path: path.name
+)
+def test_dockerfile_syntax_frontend_is_digest_pinned(path: Path) -> None:
+    # A `# syntax=` parser directive makes BuildKit pull and RUN that image to
+    # parse the Dockerfile — an executor, exactly like the FROM bases, so a
+    # floating tag is the same silent-substitution vector. Directives are only
+    # honoured in the leading comment block, so scan just that.
+    for line in path.read_text(encoding="utf-8").splitlines():
+        directive = _PARSER_DIRECTIVE_RE.match(line)
+        if directive is None:
+            break
+        if directive.group(1).lower() == "syntax":
+            assert _DIGEST_RE.search(directive.group(2)), (
+                f"{path.name}: syntax frontend {directive.group(2)!r} is not "
+                "digest-pinned (@sha256:...)"
+            )
 
 
 @pytest.mark.security
@@ -777,17 +803,18 @@ def test_api_lock_satisfies_every_dependency_the_image_declares(
     )
 
 
-def test_api_lock_is_not_git_ignored() -> None:
-    # `*.txt` is ignored repo-wide, and `gcloud builds submit` derives its upload
-    # set from .gitignore (the repo has no .gcloudignore): without the
-    # `!deploy/requirements.txt` carve-out Cloud Build never receives the lock —
-    # even if the file was force-added to git. --no-index tests the rules, not
-    # the index.
+@pytest.mark.parametrize("path", [_API_LOCK_IN_CONTEXT, "deploy/buildkitd.toml"])
+def test_committed_build_inputs_are_not_git_ignored(path: str) -> None:
+    # `gcloud builds submit` derives its upload set from .gitignore (the repo has
+    # no .gcloudignore), so an ignored build input never reaches Cloud Build —
+    # even if the file was force-added to git. The lock needs the
+    # `!deploy/requirements.txt` carve-out because `*.txt` is ignored repo-wide.
+    # --no-index tests the rules, not the index.
     git = shutil.which("git")
     if git is None:
         pytest.skip("git is not installed")
     result = subprocess.run(  # noqa: S603 — fixed argv, no shell
-        [git, "check-ignore", "-q", "--no-index", _API_LOCK_IN_CONTEXT],
+        [git, "check-ignore", "-q", "--no-index", path],
         cwd=_REPO_ROOT,
         capture_output=True,
         check=False,
@@ -795,8 +822,8 @@ def test_api_lock_is_not_git_ignored() -> None:
     if result.returncode == 128:
         pytest.skip("not a git work tree")
     assert result.returncode == 1, (
-        f"{_API_LOCK_IN_CONTEXT} matches a .gitignore rule — neither git nor "
-        "`gcloud builds submit` would carry it; restore the carve-out"
+        f"{path} matches a .gitignore rule — neither git nor `gcloud builds submit` "
+        "would carry it; add a carve-out"
     )
 
 
@@ -1724,15 +1751,107 @@ def test_deploy_workflow_artifacts_exist() -> None:
     assert _CLOUDBUILD.is_file(), "deploy/cloudbuild.yaml is missing"
 
 
+# ---------------------------------------------------------------------------
+# Every workflow file — generalised supply-chain lockers
+#
+# These hold for EVERY file under .github/workflows/, so a new workflow (e.g.
+# the scheduled dependency audit) cannot escape them: actions pinned by commit
+# SHA, no `github.event.*` interpolated into a `run:` script, and no GCP /
+# deployment credential outside deploy.yml.
+# ---------------------------------------------------------------------------
+
+_WORKFLOW_FILES = sorted(_WORKFLOWS_DIR.glob("*.y*ml"))
+_GCP_CREDENTIAL_NEEDLES = (
+    "google-github-actions",
+    "workload_identity_provider",
+    "credentials_json",
+    "id-token",
+    "gcloud",
+    "secretmanager",
+    "secret-manager",
+)
+
+
+def test_workflow_lockers_see_every_workflow() -> None:
+    # The parametrised lockers below iterate this glob; if it ever matched
+    # nothing they would silently pass on an empty set.
+    names = {path.name for path in _WORKFLOW_FILES}
+    assert {"ci.yml", "deploy.yml", "dependency-audit.yml"} <= names, names
+
+
 @pytest.mark.security
-def test_deploy_workflow_actions_are_sha_pinned(deploy_workflow: str) -> None:
-    refs = _USES_RE.findall(deploy_workflow)
-    assert refs, "deploy.yml declares no `uses:` actions"
-    for ref in refs:
+@pytest.mark.parametrize("workflow", _WORKFLOW_FILES, ids=lambda path: path.name)
+def test_every_workflow_pins_actions_by_commit_sha(workflow: Path) -> None:
+    for ref in _USES_RE.findall(workflow.read_text(encoding="utf-8")):
         assert _SHA_PINNED_USES_RE.match(ref), (
-            f"deploy.yml Action {ref!r} is not pinned by a 40-hex commit SHA — a "
-            "floating tag is a silent-substitution vector (mirror ci.yml)"
+            f"{workflow.name}: Action {ref!r} is not pinned by a 40-hex commit SHA — "
+            "a floating tag is a silent-substitution / supply-chain vector"
         )
+
+
+@pytest.mark.security
+@pytest.mark.parametrize("workflow", _WORKFLOW_FILES, ids=lambda path: path.name)
+def test_no_workflow_interpolates_event_data_into_a_run_script(workflow: Path) -> None:
+    # Parsed per step, so single-line `run:` values are covered as well as blocks.
+    for command in _workflow_run_commands(workflow.read_text(encoding="utf-8")):
+        assert "${{ github.event" not in command, (
+            f"{workflow.name} interpolates a `github.event.*` value directly into a "
+            "`run:` script — route it through an env var (command-injection guard)"
+        )
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    "workflow",
+    [path for path in _WORKFLOW_FILES if path != _DEPLOY_WORKFLOW],
+    ids=lambda path: path.name,
+)
+def test_only_the_deploy_workflow_touches_gcp(workflow: Path) -> None:
+    lowered = workflow.read_text(encoding="utf-8").lower()
+    for needle in _GCP_CREDENTIAL_NEEDLES:
+        assert needle not in lowered, (
+            f"{workflow.name} references {needle!r} — deployment/GCP credentials must "
+            "live only in deploy.yml"
+        )
+
+
+@pytest.mark.security
+def test_scheduled_lock_audit_cannot_deploy_and_uses_the_reviewed_ignores() -> None:
+    """The weekly lock audit (F26 follow-up) is read-only and can never deploy.
+
+    deploy.yml fires on `workflow_run` of the workflow named "CI", so this one
+    must never take that name; it runs on a clock (plus manual dispatch) with a
+    read-only token, and audits the image lock with exactly the reviewed
+    chromadb ignore set — a fifth suppression here is as unreviewed as in ci.yml.
+    """
+    text = _AUDIT_WORKFLOW.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(text)
+    assert workflow.get("name") != "CI", (
+        "the scheduled audit is named 'CI' — every scheduled run would trigger deploy.yml"
+    )
+    triggers = _workflow_triggers(text)
+    assert isinstance(triggers, dict), "dependency-audit.yml declares no triggers"
+    assert {"schedule", "workflow_dispatch"} <= set(triggers), (
+        f"dependency-audit.yml must run on a schedule (+ manual dispatch): {sorted(triggers)}"
+    )
+    assert workflow.get("permissions") == {"contents": "read"}, (
+        "dependency-audit.yml must run with a read-only token (`contents: read`)"
+    )
+    for name, job in workflow.get("jobs", {}).items():
+        assert job.get("permissions") in (None, {"contents": "read"}), (
+            f"dependency-audit.yml job {name!r} widens the token permissions"
+        )
+    audits = [
+        command
+        for command in _workflow_run_commands(text)
+        if "pip_audit" in command and _API_LOCK_IN_CONTEXT in command
+    ]
+    assert len(audits) == 1, "dependency-audit.yml must run exactly one audit of the image lock"
+    (command,) = audits
+    assert "--disable-pip" in command, "the lock audit must be a pinned-version lookup"
+    assert set(_IGNORE_VULN_RE.findall(command)) == _EXPECTED_PIP_AUDIT_IGNORES, (
+        "the scheduled lock audit must carry exactly the reviewed chromadb ignore set"
+    )
 
 
 @pytest.mark.security
@@ -1789,34 +1908,6 @@ def test_deploy_workflow_pins_image_digests(deploy_workflow: str) -> None:
     assert "gcloud run jobs replace" in deploy_workflow, (
         "deploy.yml must apply the demo-reset Job via `gcloud run jobs replace`"
     )
-
-
-@pytest.mark.security
-def test_deploy_workflow_no_event_interpolation_in_run(deploy_workflow: str) -> None:
-    for body in _run_block_bodies(deploy_workflow):
-        assert "${{ github.event" not in body, (
-            "deploy.yml interpolates a `github.event.*` value directly into a "
-            "`run:` shell — route it through an env var (command-injection guard)"
-        )
-
-
-@pytest.mark.security
-def test_ci_workflow_stays_gcp_credential_free(ci_workflow: str) -> None:
-    # ci.yml must stay free of WIF auth, gcloud, and Secret Manager references.
-    lowered = ci_workflow.lower()
-    for needle in (
-        "google-github-actions",
-        "workload_identity_provider",
-        "credentials_json",
-        "id-token",
-        "gcloud",
-        "secretmanager",
-        "secret-manager",
-    ):
-        assert needle not in lowered, (
-            f"ci.yml references {needle!r} — deployment/GCP credentials must live "
-            "only in deploy.yml; ci.yml stays GCP-credential-free"
-        )
 
 
 @pytest.mark.security
@@ -1983,6 +2074,30 @@ def test_cloudbuild_buildkit_executor_is_digest_pinned(cloudbuild: dict[str, Any
 
 
 @pytest.mark.security
+def test_cloudbuild_buildkit_config_only_mirrors_docker_hub_via_google(
+    cloudbuild: dict[str, Any],
+) -> None:
+    # BuildKit's container does not inherit the worker daemon's registry
+    # settings, so deploy/buildkitd.toml routes Docker Hub pulls through
+    # mirror.gcr.io (anonymous shared-IP pulls hit Docker Hub's limits). The
+    # file must stay exactly that one stanza: a plain-http / insecure registry,
+    # a second mirror, or any daemon setting would slip in unreviewed.
+    creates = [
+        _step_args(step)
+        for step in cloudbuild.get("steps", [])
+        if _step_args(step)[:2] == ["buildx", "create"]
+    ]
+    assert len(creates) == 1, "expected exactly one `buildx create` step"
+    assert _flag_values(creates[0], "--buildkitd-config") == ["deploy/buildkitd.toml"], (
+        "the buildx builder must load deploy/buildkitd.toml (--buildkitd-config)"
+    )
+    config = tomllib.loads(_BUILDKITD_CONFIG.read_text(encoding="utf-8"))
+    assert config == {"registry": {"docker.io": {"mirrors": ["mirror.gcr.io"]}}}, (
+        f"deploy/buildkitd.toml must hold only the docker.io → mirror.gcr.io stanza; got {config}"
+    )
+
+
+@pytest.mark.security
 def test_deploy_workflow_derives_the_cache_epoch_from_the_clock(deploy_workflow: str) -> None:
     submit = [body for body in _run_block_bodies(deploy_workflow) if "gcloud builds submit" in body]
     assert len(submit) == 1, "deploy.yml must submit exactly one Cloud Build"
@@ -2023,17 +2138,6 @@ def test_deploy_workflow_derives_the_cache_epoch_from_the_clock(deploy_workflow:
 # All assertions are on the tracked `.github/workflows/ci.yml`; no network,
 # gcloud, or Docker daemon needed.
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.security
-def test_ci_workflow_actions_are_sha_pinned(ci_workflow: str) -> None:
-    refs = _USES_RE.findall(ci_workflow)
-    assert refs, "ci.yml declares no `uses:` actions"
-    for ref in refs:
-        assert _SHA_PINNED_USES_RE.match(ref), (
-            f"ci.yml Action {ref!r} is not pinned by a 40-hex commit SHA — a "
-            "floating tag is a silent-substitution / supply-chain vector"
-        )
 
 
 @pytest.mark.security
@@ -2089,15 +2193,6 @@ def test_ci_workflow_caches_the_tiktoken_encodings(ci_workflow: str) -> None:
         f"pytest TIKTOKEN_CACHE_DIR {sorted(cache_dirs)} is not restored by an "
         f"actions/cache step (cached paths: {sorted(cached)})"
     )
-
-
-@pytest.mark.security
-def test_ci_workflow_no_event_interpolation_in_run(ci_workflow: str) -> None:
-    for body in _run_block_bodies(ci_workflow):
-        assert "${{ github.event" not in body, (
-            "ci.yml interpolates a `github.event.*` value directly into a `run:` "
-            "shell — route it through an env var (command-injection guard)"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -2448,6 +2543,21 @@ def test_ci_pip_audit_ignore_set_is_exactly_the_reviewed_cves(ci_workflow: str) 
         f"ci.yml no longer suppresses {sorted(stale)}, but the locker still expects it. "
         "If a fixed chromadb release shipped and the ignore was dropped, drop it from "
         "_EXPECTED_PIP_AUDIT_IGNORES too (and re-audit the rest)"
+    )
+
+
+@pytest.mark.security
+@pytest.mark.parametrize("workflow", _WORKFLOW_FILES, ids=lambda path: path.name)
+def test_no_workflow_suppresses_an_unreviewed_cve(workflow: Path) -> None:
+    # The reviewed set above is pinned against ci.yml; this closes the side door
+    # of adding a fifth suppression in any other workflow (e.g. the scheduled
+    # lock audit).
+    unreviewed = (
+        set(_IGNORE_VULN_RE.findall(workflow.read_text(encoding="utf-8")))
+        - _EXPECTED_PIP_AUDIT_IGNORES
+    )
+    assert not unreviewed, (
+        f"{workflow.name} suppresses CVEs outside the reviewed set: {sorted(unreviewed)}"
     )
 
 

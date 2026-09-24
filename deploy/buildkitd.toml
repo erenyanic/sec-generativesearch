@@ -1,0 +1,17 @@
+# BuildKit daemon config for the Cloud Build API builder (deploy/cloudbuild.yaml,
+# step `buildx-builder`, passed with --buildkitd-config).
+#
+# The docker-container driver runs BuildKit in its own container, which does not
+# inherit the Cloud Build worker daemon's registry configuration: without this
+# file every Docker Hub pull it makes (the python base, the Dockerfile syntax
+# frontend) goes anonymously to docker.io from shared worker IPs, where Docker
+# Hub's unauthenticated pull limits apply. mirror.gcr.io is Google's Docker Hub
+# pull-through cache; BuildKit falls back to docker.io itself on a mirror miss.
+#
+# Integrity does not rest on the mirror: every image BuildKit pulls here is
+# digest-pinned, so a mirror can only ever serve the exact content we named.
+#
+# Keep this file to this one stanza — never a plain-http or insecure registry
+# (locked by tests/ops/test_deployment_artifacts.py).
+[registry."docker.io"]
+  mirrors = ["mirror.gcr.io"]
