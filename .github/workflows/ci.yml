@@ -198,6 +198,22 @@ jobs:
             --ignore-vuln CVE-2026-45831 \
             --ignore-vuln CVE-2026-45833
 
+      - name: Audit the API release-image lock
+        # deploy/requirements.txt is the exact hash-pinned set that
+        # deploy/Dockerfile.api installs (F26), including the SQLCipher and
+        # on-device-embedder extras the snapshot above never contains
+        # (pysqlcipher3, sentence-transformers, transformers, ...). A pure
+        # pinned-version lookup: no resolution, no install. torch is outside
+        # the lock (its wheel index is a Docker build-arg), so it is outside
+        # this audit too. The ignore set is the reviewed one above, verbatim:
+        # the chromadb server-surface reasoning holds inside the image as well.
+        run: |
+          python -m pip_audit -r deploy/requirements.txt --disable-pip \
+            --ignore-vuln CVE-2026-45829 \
+            --ignore-vuln CVE-2026-45830 \
+            --ignore-vuln CVE-2026-45831 \
+            --ignore-vuln CVE-2026-45833
+
   secret-scan:
     # Scan the working tree for accidentally-committed
     # credentials.  Uses ``detect-secrets`` (pure Python, installed from

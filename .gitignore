@@ -38,6 +38,12 @@ data/
 !deploy/
 !deploy/**/*.json
 
+# The API image's compiled, hash-pinned dependency lock (F26), despite the
+# blanket *.txt rule above. Load-bearing twice: git must track it, and
+# `gcloud builds submit` (no .gcloudignore) derives its upload set from this
+# file — without the carve-out Cloud Build never receives the lock.
+!deploy/requirements.txt
+
 # Track the vendored model-metadata/pricing catalogue even though *.json is
 # ignored above. This is reviewed, secret-scanned package data, not runtime
 # output.

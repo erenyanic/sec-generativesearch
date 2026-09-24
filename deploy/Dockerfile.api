@@ -4,10 +4,17 @@
 # SEC-GenerativeSearch — FastAPI backend image
 # ===========================================================================
 # Multi-stage build:
-#   - builder : compiles wheels (incl. pysqlcipher3 against libsqlcipher-dev)
-#               into an isolated virtualenv.
-#   - runtime : copies that venv onto a fresh base carrying only the runtime
-#               shared libs + gosu, runs as an unprivileged user.
+#   - builder : installs every THIRD-PARTY package (torch + the hash-pinned
+#               lock deploy/requirements.txt; pysqlcipher3 compiled against
+#               libsqlcipher-dev) into an isolated virtualenv. Never sees src/.
+#   - project : builds the application wheel. The only stage that sees src/.
+#   - runtime : copies the dependency venv onto a fresh base carrying only the
+#               runtime shared libs + gosu, installs the application wheel on
+#               top, runs as an unprivileged user.
+#
+# Layer-cache contract (F26): a source-only edit rebuilds the project stage and
+# the final small runtime layers — never the dependency install and never the
+# multi-GB venv layer the runtime inherits.
 #
 # Deployment extras baked in: [encryption,metrics,local-embeddings].
 #   - encryption       → pysqlcipher3 (SQLCipher at-rest encryption, B/C).
@@ -51,19 +58,25 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
 # Torch wheel index. Default = CPU-only build; override with --build-arg for
-# CUDA. Installed first and explicitly so the project resolve below reuses the
-# already-satisfied torch instead of pulling a default-index (CUDA) wheel.
+# CUDA. torch is the ONE dependency outside the hash-pinned lock below: its
+# wheel index is a build-arg, so no single set of hashes fits every variant
+# (the lock is compiled with torch omitted). Keep the specifier in lockstep
+# with pyproject.toml's [local-embeddings] extra.
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 RUN pip install --upgrade pip \
     && pip install "torch>=2.2" --index-url "${TORCH_INDEX_URL}"
 
-# Copy project metadata + source, then a non-editable install with the
-# deployment extras. pyproject/README land in their own layer so a
-# source-only edit does not bust the dependency layer cache.
-WORKDIR /app
-COPY pyproject.toml README.md ./
-COPY src ./src
-RUN pip install ".[encryption,metrics,local-embeddings]"
+# Every other third-party package comes from the compiled lock (F26), and the
+# lock is the ONLY file this stage takes from the build context — so a source
+# edit can never bust this layer. --require-hashes: every downloaded artefact
+# must match a sha256 recorded in the lock. --no-deps: install exactly the
+# pinned set and resolve nothing outside it. pip check then fails the build if
+# the lock and the index-resolved torch disagree. Regenerate the lock with the
+# command in its header whenever pyproject.toml's dependencies change.
+COPY deploy/requirements.txt /tmp/requirements.txt
+RUN pip install --require-hashes --no-deps -r /tmp/requirements.txt \
+    && pip check \
+    && rm /tmp/requirements.txt
 
 # Bake the tiktoken BPE files into the image (F25). RetrievalService builds its
 # cl100k_base counter inside the API lifespan, and with an empty cache tiktoken
@@ -75,9 +88,30 @@ RUN pip install ".[encryption,metrics,local-embeddings]"
 # codebase can reach are fetched: cl100k_base (retrieval, orchestrator,
 # Anthropic/Gemini approximation, fallback for every uncatalogued slug) and
 # o200k_base (the catalogued OpenAI models). The runtime ENV below MUST name
-# the same path.
+# the same path. tiktoken arrives with the lock, so this download is cached
+# with the dependency layers rather than repeated on every source edit.
 ENV TIKTOKEN_CACHE_DIR=/opt/venv/tiktoken-cache
 RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); tiktoken.get_encoding('o200k_base')"
+
+# --------------------------------------------------------------------------
+# Project stage
+# --------------------------------------------------------------------------
+# Builds the application wheel and nothing else. Independent of the builder, so
+# BuildKit runs it in parallel and a source edit touches only this stage plus
+# the last runtime layers. --no-deps: /wheels MUST hold our wheel alone — the
+# runtime installs everything in it without an index, so a dependency wheel
+# here would bypass the lock's hashes.
+FROM ${PYTHON_BASE} AS project
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
+WORKDIR /build
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip wheel --no-deps --wheel-dir /wheels .
 
 # --------------------------------------------------------------------------
 # Runtime stage
@@ -116,6 +150,16 @@ RUN mkdir -p "${APP_DATA_DIR}" "${HF_HOME}" \
 
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# The application itself, last and on its own (F26): a source edit changes only
+# this small layer while the venv layer above stays byte-identical. --no-index
+# + --no-deps: install our wheel from the local path and nothing else — every
+# dependency is already in the venv from the hashed lock. pip check fails the
+# build if the lock no longer satisfies a dependency pyproject.toml declares.
+COPY --from=project /wheels /tmp/wheels
+RUN pip install --no-deps --no-index --no-cache-dir --disable-pip-version-check /tmp/wheels/*.whl \
+    && pip check --disable-pip-version-check \
+    && rm -rf /tmp/wheels
 
 # SQLite + ChromaDB persistence, plus the HF model cache (HF_HOME=/app/data/hf)
 # so the gated embedder weights are downloaded once per volume, not once per

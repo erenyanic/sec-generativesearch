@@ -267,7 +267,7 @@ docker run --rm -p 8000:8000 \
   sec-gs-api:local
 ```
 
-All deployment artefacts live under [`deploy/`](deploy/): the two Dockerfiles, the Compose + nginx stack (`docker-compose.yml`, `nginx/`), and the GCP Cloud Run manifests (`cloud/`) with their Cloud Build config and Grafana dashboard.
+All deployment artefacts live under [`deploy/`](deploy/): the two Dockerfiles, the API image's hash-pinned dependency lock (`requirements.txt`, recompiled whenever `pyproject.toml` dependencies change), the Compose + nginx stack (`docker-compose.yml`, `nginx/`), and the GCP Cloud Run manifests (`cloud/`) with their Cloud Build config and Grafana dashboard.
 
 ---
 
@@ -311,7 +311,7 @@ pnpm build
 pnpm audit:ci
 ```
 
-**Backend:** 2699 tests, of which 981 are security-regression locks (`@pytest.mark.security`). **Frontend:** 294 tests across security and functional trees. A security-tree failure is a release blocker.
+**Backend:** 2709 tests, of which 988 are security-regression locks (`@pytest.mark.security`). **Frontend:** 294 tests across security and functional trees. A security-tree failure is a release blocker.
 
 ---
 

@@ -41,8 +41,11 @@ deploy/certs/
 venv/
 env/
 ENV/
-__pycache__/
-*.py[cod]
+# `**/` so nested bytecode (src/**/__pycache__) stays out too: a bare
+# `__pycache__/` matches the context root only, and every local test run would
+# then rewrite the `COPY src` input and bust its layer cache (F26).
+**/__pycache__/
+**/*.py[cod]
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/

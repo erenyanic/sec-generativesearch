@@ -97,12 +97,18 @@ jobs:
       - name: Build and push both images via Cloud Build
         # Cloud Build builds api (context `.`) + frontend (context `frontend/`)
         # per deploy/cloudbuild.yaml and pushes them tagged by the commit SHA.
+        # _CACHE_EPOCH keys the API layer cache (F26) to the UTC ISO year-week,
+        # so the first deploy of every week rebuilds cold (fully hash-verified)
+        # and no cache entry is reused for longer. It comes from the runner's
+        # clock, never from event data. %G pairs with %V — %Y would mislabel
+        # the days around New Year.
         run: |
+          cache_epoch="$(date -u +%G-w%V)"
           gcloud builds submit \
             --project "$GCP_PROJECT_ID" \
             --region "$GCP_REGION" \
             --config deploy/cloudbuild.yaml \
-            --substitutions "_REGION=$GCP_REGION,_REPO=$REPO,_COMMIT_SHA=$DEPLOY_SHA" \
+            --substitutions "_REGION=$GCP_REGION,_REPO=$REPO,_COMMIT_SHA=$DEPLOY_SHA,_CACHE_EPOCH=$cache_epoch" \
             .
 
       - name: Resolve immutable @sha256 image digests

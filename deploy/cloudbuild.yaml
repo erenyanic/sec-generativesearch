@@ -29,10 +29,17 @@ substitutions:
   _REPO: sec-gs
   # _COMMIT_SHA is REQUIRED (no default) — supplied by deploy.yml at submit time
   # so a missing value fails the build loudly rather than pushing a bad tag.
+  # _CACHE_EPOCH is REQUIRED for the same reason (deploy.yml sets it to the UTC
+  # ISO year-week): a default would pin one never-rotated layer cache.
 
 options:
   # No user-specified logs bucket; stream build logs to Cloud Logging only.
   logging: CLOUD_LOGGING_ONLY
+
+# A cold API build (torch + the full hashed lock, pysqlcipher3 compiled) plus
+# the cache export can outrun Cloud Build's 10-minute default. Cold builds are
+# the first of every cache epoch, so this bound must hold for them.
+timeout: 3600s
 
 # Cloud Build pushes every image listed here once the steps succeed.
 images:
@@ -40,15 +47,62 @@ images:
   - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/frontend:${_COMMIT_SHA}"
 
 steps:
+  # --- BuildKit builder for the API layer cache (F26) --------------------------
+  # Cloud Build workers are ephemeral: a Dockerfile layer cache helps only if it
+  # outlives the worker, so build-api imports/exports one from this project's
+  # Artifact Registry repo (no new IAM — the build SA already pushes there).
+  # docker-container driver: the default docker driver cannot export a registry
+  # cache. The BuildKit image executes every build step, so it is digest-pinned
+  # like the Dockerfile bases — a floating tag is a silent-substitution vector.
+  # Re-pin to a newer release with:
+  #   docker buildx imagetools inspect moby/buildkit:<vX.Y.Z> \
+  #     --format '{{.Manifest.Digest}}'
+  - id: buildx-builder
+    name: gcr.io/cloud-builders/docker
+    args:
+      - buildx
+      - create
+      - --name
+      - sec-gs-builder
+      - --driver
+      - docker-container
+      - --driver-opt
+      - image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+      - --bootstrap
+
   # --- API image: context = repo root, Dockerfile = deploy/Dockerfile.api -----
+  # Registry layer cache keyed by ${_CACHE_EPOCH}. A cache hit reuses a layer
+  # WITHOUT re-running the step that made it, so the hash-verified dependency
+  # install only re-executes when its inputs change — or when the epoch rolls
+  # over: the first build of every week is cold. That bounds how long a
+  # poisoned cache entry could persist, and how stale the apt + torch layers
+  # (not version-pinned) can grow, to one week.
+  #   mode=max           cache every stage; the builder's dependency install is
+  #                      not in the final image, so min mode would miss it.
+  #   image-manifest     store the cache as a plain OCI image manifest.
+  #   ignore-error=true  the cache is an optimisation: a failed export never
+  #                      blocks a deploy (the next build is merely cold).
+  #   --load             hand the image to the worker daemon so `images:` below
+  #                      pushes and records it exactly as a plain build did.
+  #   --provenance=false parity with the plain `docker build` this replaced:
+  #                      the classic image store cannot load attestations.
   - id: build-api
     name: gcr.io/cloud-builders/docker
     args:
+      - buildx
       - build
+      - --builder
+      - sec-gs-builder
       - --file
       - deploy/Dockerfile.api
       - --tag
       - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/api:${_COMMIT_SHA}"
+      - --cache-from
+      - "type=registry,ref=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/api-buildcache:${_CACHE_EPOCH}"
+      - --cache-to
+      - "type=registry,ref=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/api-buildcache:${_CACHE_EPOCH},mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"
+      - --provenance=false
+      - --load
       - .
 
   # --- Frontend image: context = frontend/, Dockerfile = deploy/Dockerfile.frontend

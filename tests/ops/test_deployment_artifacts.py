@@ -30,11 +30,18 @@ import ast
 import ipaddress
 import json
 import re
+import shlex
+import shutil
+import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import Version
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC_ROOT = _REPO_ROOT / "src" / "sec_generative_search"
@@ -442,6 +449,364 @@ def test_dockerfile_never_bakes_a_wildcard_trusted_proxy_set(dockerfile: str) ->
         "Dockerfile sets a wildcard FORWARDED_ALLOW_IPS — every per-IP rate-limit "
         "window becomes spoofable via X-Forwarded-For"
     )
+
+
+# ---------------------------------------------------------------------------
+# Dependency layers independent of src/ + the hash-pinned image lock (F26)
+#
+#   - LAYER CACHE. The builder stage — whose /opt/venv the runtime inherits —
+#     takes exactly one file from the build context: the compiled lock. A
+#     source edit then never re-runs the dependency install and never changes
+#     the multi-GB venv layer; the application arrives as a wheel from its own
+#     stage and is installed last.
+#   - SUPPLY CHAIN. Every third-party package except torch comes from that
+#     lock under --require-hashes --no-deps, and the application wheel installs
+#     with --no-deps --no-index — nothing resolves outside the lock.
+#   - LOCK INTEGRITY. The lock is ==-pinned and sha256-hashed, PyPI-only, omits
+#     torch (its wheel index is a build-arg), and still satisfies every
+#     dependency pyproject.toml declares for the baked extras.
+# ---------------------------------------------------------------------------
+
+_API_LOCK = _REPO_ROOT / "deploy" / "requirements.txt"
+_API_LOCK_IN_CONTEXT = "deploy/requirements.txt"
+_PYPROJECT = _REPO_ROOT / "pyproject.toml"
+# The extras Dockerfile.api bakes — the lock is compiled from exactly these.
+_IMAGE_EXTRAS = ("encryption", "metrics", "local-embeddings")
+# Installed from the TORCH_INDEX_URL build-arg (CPU default, CUDA opt-in), so
+# no single set of lock hashes can fit it.
+_INDEX_RESOLVED_PACKAGES = frozenset({"torch"})
+# The image's marker environment (python:3.12-slim-bookworm, x86_64).
+_IMAGE_MARKER_ENV = {
+    "python_version": "3.12",
+    "python_full_version": "3.12.13",
+    "sys_platform": "linux",
+    "platform_system": "Linux",
+    "platform_machine": "x86_64",
+    "os_name": "posix",
+    "implementation_name": "cpython",
+    "platform_python_implementation": "CPython",
+}
+_LOCK_PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==(\S+)")
+_LOCK_HASH_RE = re.compile(r"--hash=sha256:[0-9a-f]{64}(?:\s|$)")
+# pip options that consume the next token as their value.
+_PIP_VALUE_OPTIONS = frozenset(
+    {
+        "-r",
+        "--requirement",
+        "-c",
+        "--constraint",
+        "-i",
+        "--index-url",
+        "--extra-index-url",
+        "-f",
+        "--find-links",
+        "--trusted-host",
+        "-w",
+        "--wheel-dir",
+    }
+)
+# pip options that point at a package source other than the default index.
+_PIP_SOURCE_OPTIONS = frozenset(
+    {"-i", "--index-url", "--extra-index-url", "-f", "--find-links", "--trusted-host"}
+)
+
+
+@pytest.fixture(scope="module")
+def api_lock() -> str:
+    return _API_LOCK.read_text(encoding="utf-8")
+
+
+def _lock_requirement_lines(lock: str) -> list[str]:
+    """Logical lines of a requirements file: comments dropped, ``\\`` joined."""
+    kept = [line for line in lock.splitlines() if not line.lstrip().startswith("#")]
+    joined = re.sub(r"\\\s*\n", " ", "\n".join(kept))
+    return [line.strip() for line in joined.splitlines() if line.strip()]
+
+
+def _lock_pins(lock: str) -> dict[str, str]:
+    """Canonical package name → pinned version for every ``==`` entry."""
+    pins: dict[str, str] = {}
+    for line in _lock_requirement_lines(lock):
+        match = _LOCK_PIN_RE.match(line)
+        if match:
+            pins[canonicalize_name(match.group(1))] = match.group(2)
+    return pins
+
+
+def _context_copy_sources(line: str) -> list[str]:
+    """Build-context sources of a ``COPY`` line (``[]`` for ``COPY --from=``)."""
+    tokens = line.split()
+    if not tokens or tokens[0] != "COPY" or any(t.startswith("--from=") for t in tokens):
+        return []
+    operands = [t for t in tokens[1:] if not t.startswith("--")]
+    return operands[:-1]
+
+
+def _pip_commands(stage: str) -> list[str]:
+    """Every ``pip …`` command a stage runs, in order (``RUN`` split on ``&&``)."""
+    commands: list[str] = []
+    for line in stage.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("RUN "):
+            commands += [
+                part.strip()
+                for part in stripped[len("RUN ") :].split("&&")
+                if part.strip().startswith("pip ")
+            ]
+    return commands
+
+
+def _parse_pip(command: str) -> tuple[str, dict[str, str | None], list[str]]:
+    """Split a ``pip`` command into (sub-command, options, positionals)."""
+    tokens = shlex.split(command)
+    options: dict[str, str | None] = {}
+    positionals: list[str] = []
+    rest = iter(tokens[2:])
+    for token in rest:
+        if not token.startswith("-"):
+            positionals.append(token)
+            continue
+        name, has_value, value = token.partition("=")
+        if has_value:
+            options[name] = value
+        elif name in _PIP_VALUE_OPTIONS:
+            options[name] = next(rest, "")
+        else:
+            options[name] = None
+    return tokens[1], options, positionals
+
+
+def test_api_dependency_layers_are_independent_of_the_source_tree(dockerfile: str) -> None:
+    stages = _dockerfile_stages(dockerfile)
+    builder, runtime = stages["builder"], stages["runtime"]
+
+    builder_sources = [
+        source for line in builder.splitlines() for source in _context_copy_sources(line.strip())
+    ]
+    assert builder_sources == [_API_LOCK_IN_CONTEXT], (
+        f"the builder stage copies {builder_sources} from the build context — it must "
+        f"take only {_API_LOCK_IN_CONTEXT}, or a source/metadata edit busts the "
+        "dependency install and the multi-GB venv layer the runtime inherits"
+    )
+
+    source_stages = sorted(
+        name
+        for name, body in stages.items()
+        for line in body.splitlines()
+        for source in _context_copy_sources(line.strip())
+        if source.split("/")[0] == "src"
+    )
+    assert len(source_stages) == 1, f"expected exactly one stage to copy src/: {source_stages}"
+    (project_stage,) = source_stages
+    assert project_stage not in {"builder", "runtime"}, (
+        f"src/ is copied into the {project_stage!r} stage — it must reach the image "
+        "only as a wheel built in its own stage"
+    )
+
+    lines = [line.strip() for line in runtime.splitlines()]
+    venv_at = next(
+        (i for i, ln in enumerate(lines) if re.match(r"^COPY\s+--from=builder\s+/opt/venv\s", ln)),
+        None,
+    )
+    wheel_at = next(
+        (i for i, ln in enumerate(lines) if ln.startswith(f"COPY --from={project_stage} ")),
+        None,
+    )
+    install_at = next(
+        (i for i, ln in enumerate(lines) if ln.startswith("RUN ") and ".whl" in ln), None
+    )
+    assert None not in (venv_at, wheel_at, install_at), (
+        "runtime must COPY the builder venv, then COPY + install the application wheel"
+    )
+    assert venv_at < wheel_at < install_at, (
+        "the application wheel must be installed AFTER the venv COPY — the small "
+        "per-edit layer goes last so the venv layer above stays cached"
+    )
+
+
+@pytest.mark.security
+def test_api_image_installs_third_party_code_only_from_the_hashed_lock(dockerfile: str) -> None:
+    # Supply-chain lock: the ONLY sanctioned pip invocations are the installer
+    # self-upgrade, torch from the TORCH_INDEX_URL build-arg, the hash-pinned
+    # lock, and our own wheel. Any other `pip install <pkg>` would resolve an
+    # unpinned, unhashed package straight from an index.
+    stages = _dockerfile_stages(dockerfile)
+    lock_dest = next(
+        line.split()[-1]
+        for line in stages["builder"].splitlines()
+        if _context_copy_sources(line.strip()) == [_API_LOCK_IN_CONTEXT]
+    )
+    sequence: dict[str, list[str]] = {name: [] for name in stages}
+    for name, body in stages.items():
+        for command in _pip_commands(body):
+            sub, options, positionals = _parse_pip(command)
+            where = f"[{name}] {command!r}"
+            if sub == "check":
+                sequence[name].append("check")
+                continue
+            if sub == "wheel":
+                assert "--no-deps" in options, (
+                    f"{where}: `pip wheel` without --no-deps also collects dependency "
+                    "wheels, which the runtime would then install unhashed"
+                )
+                assert not _PIP_SOURCE_OPTIONS & options.keys(), f"{where}: extra index"
+                sequence[name].append("wheel")
+                continue
+            assert sub == "install", f"{where}: unexpected pip sub-command"
+            if positionals and all(p.endswith(".whl") for p in positionals):
+                assert "--no-deps" in options and "--no-index" in options, (
+                    f"{where}: the application wheel must install with --no-deps "
+                    "--no-index — every dependency is already in the venv from the lock"
+                )
+                sequence[name].append("wheel-install")
+            elif "-r" in options or "--requirement" in options:
+                assert (options.get("-r") or options.get("--requirement")) == lock_dest, (
+                    f"{where}: installs a requirements file other than the copied lock"
+                )
+                assert "--require-hashes" in options and "--no-deps" in options, (
+                    f"{where}: the lock must install with --require-hashes (every "
+                    "artefact matches a pinned sha256) and --no-deps (nothing outside it)"
+                )
+                assert not positionals, f"{where}: extra packages beside the lock"
+                assert not _PIP_SOURCE_OPTIONS & options.keys(), (
+                    f"{where}: the lock must resolve from the default index only"
+                )
+                sequence[name].append("lock")
+            elif positionals == ["pip"] and set(options) == {"--upgrade"}:
+                sequence[name].append("self-upgrade")
+            elif len(positionals) == 1 and re.match(r"^torch\b", positionals[0]):
+                assert options == {"--index-url": "${TORCH_INDEX_URL}"}, (
+                    f"{where}: torch must come from the TORCH_INDEX_URL build-arg alone"
+                )
+                sequence[name].append("torch")
+            else:
+                raise AssertionError(
+                    f"{where}: unsanctioned `pip install` — third-party code must come "
+                    f"from the hash-pinned {_API_LOCK_IN_CONTEXT}, never an ad-hoc resolve"
+                )
+
+    builder_steps = [s for s in sequence["builder"] if s != "self-upgrade"]
+    assert builder_steps == ["torch", "lock", "check"], (
+        f"builder must install torch, then the hashed lock, then `pip check`: {builder_steps}"
+    )
+    assert sequence["runtime"] == ["wheel-install", "check"], (
+        "runtime must install only the application wheel and then `pip check` "
+        f"(fails the build if the lock no longer satisfies pyproject.toml): {sequence['runtime']}"
+    )
+    assert sum(steps.count("wheel") for steps in sequence.values()) == 1, (
+        "exactly one stage must build the application wheel"
+    )
+
+
+@pytest.mark.security
+def test_api_lock_is_fully_pinned_hashed_and_pypi_only(api_lock: str) -> None:
+    lines = _lock_requirement_lines(api_lock)
+    assert lines, f"{_API_LOCK_IN_CONTEXT} is empty"
+    for line in lines:
+        assert not line.startswith("-"), (
+            f"the lock carries a pip option line {line.split()[0]!r}: index / "
+            "find-links / trusted-host / editable lines let it pull from somewhere "
+            "other than PyPI (dependency confusion) or bypass the hash check"
+        )
+        assert "://" not in line and " @ " not in line, (
+            f"the lock carries a URL / VCS / path requirement: {line[:80]!r}"
+        )
+        match = _LOCK_PIN_RE.match(line)
+        assert match, f"lock entry is not an exact `==` pin: {line[:80]!r}"
+        assert _LOCK_HASH_RE.search(line), (
+            f"lock entry {match.group(1)}=={match.group(2)} carries no sha256 hash — "
+            "pip --require-hashes would refuse the whole install"
+        )
+    leaked = sorted(
+        name
+        for name in _lock_pins(api_lock)
+        if name in _INDEX_RESOLVED_PACKAGES or name.startswith("nvidia-") or name == "triton"
+    )
+    assert not leaked, (
+        f"the lock pins {leaked}: torch comes from the TORCH_INDEX_URL build-arg, and "
+        "nvidia-*/triton mean it was compiled against the CUDA torch (GBs of GPU "
+        "runtime in the CPU image). Recompile with `--torch-backend cpu "
+        "--no-emit-package torch` (see the lock header)"
+    )
+
+
+@pytest.mark.security
+def test_api_lock_satisfies_every_dependency_the_image_declares(
+    api_lock: str, dockerfile: str
+) -> None:
+    # A stale lock silently overrides pyproject.toml: raising a lower bound, or
+    # excluding a bad release, does nothing to the image until the lock is
+    # recompiled. The motivating case is `fastapi>=0.115,!=0.136.3` — 0.136.3
+    # is the compromised release (MAL-2026-4750); a lock pinning it would ship
+    # the malware no matter what pyproject.toml says.
+    project = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))["project"]
+    declared = [Requirement(spec) for spec in project["dependencies"]]
+    for extra in _IMAGE_EXTRAS:
+        declared += [Requirement(spec) for spec in project["optional-dependencies"][extra]]
+
+    pins = _lock_pins(api_lock)
+    problems: list[str] = []
+    for requirement in declared:
+        name = canonicalize_name(requirement.name)
+        if name in _INDEX_RESOLVED_PACKAGES:
+            continue
+        if requirement.marker is not None and not requirement.marker.evaluate(_IMAGE_MARKER_ENV):
+            continue
+        pinned = pins.get(name)
+        if pinned is None:
+            problems.append(f"{requirement} — not in the lock")
+        elif not requirement.specifier.contains(Version(pinned), prereleases=True):
+            problems.append(f"{requirement} — the lock pins {pinned}")
+    assert not problems, (
+        f"{_API_LOCK_IN_CONTEXT} no longer satisfies pyproject.toml: {problems}. "
+        "Recompile it with the command in its header, in the same commit"
+    )
+
+    # torch is the one declared dependency outside the lock: the Dockerfile's
+    # index-resolved install must carry pyproject.toml's specifier verbatim.
+    declared_torch = {r.specifier for r in declared if canonicalize_name(r.name) == "torch"}
+    installed_torch = {
+        Requirement(positional).specifier
+        for command in _pip_commands(_dockerfile_stages(dockerfile)["builder"])
+        for positional in _parse_pip(command)[2]
+        if re.match(r"^torch\b", positional)
+    }
+    assert declared_torch and installed_torch == declared_torch, (
+        f"Dockerfile installs torch{sorted(map(str, installed_torch))} but pyproject.toml "
+        f"declares torch{sorted(map(str, declared_torch))} — keep them in lockstep"
+    )
+
+
+def test_api_lock_is_not_git_ignored() -> None:
+    # `*.txt` is ignored repo-wide, and `gcloud builds submit` derives its upload
+    # set from .gitignore (the repo has no .gcloudignore): without the
+    # `!deploy/requirements.txt` carve-out Cloud Build never receives the lock —
+    # even if the file was force-added to git. --no-index tests the rules, not
+    # the index.
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not installed")
+    result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        [git, "check-ignore", "-q", "--no-index", _API_LOCK_IN_CONTEXT],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 128:
+        pytest.skip("not a git work tree")
+    assert result.returncode == 1, (
+        f"{_API_LOCK_IN_CONTEXT} matches a .gitignore rule — neither git nor "
+        "`gcloud builds submit` would carry it; restore the carve-out"
+    )
+
+
+def test_dockerignore_keeps_nested_bytecode_out_of_the_context(dockerignore: str) -> None:
+    # A bare `__pycache__/` matches the context root only; src/**/__pycache__
+    # would ride along and every local test run would rewrite the `COPY src`
+    # input, busting its layer cache without a source edit.
+    entries = {line.strip().rstrip("/") for line in dockerignore.splitlines()}
+    for pattern in ("**/__pycache__", "**/*.py[cod]"):
+        assert pattern in entries, f".dockerignore does not exclude nested {pattern!r}"
 
 
 # ==========================================================================
@@ -1496,6 +1861,142 @@ def test_cloudbuild_bakes_no_secret() -> None:
         assert needle not in text, f"cloudbuild.yaml carries secret-shaped material: {needle!r}"
 
 
+# ---------------------------------------------------------------------------
+# API registry layer cache on Cloud Build (F26)
+#
+# Cloud Build workers are ephemeral, so the API build imports/exports a BuildKit
+# layer cache from Artifact Registry. A cache hit reuses a layer WITHOUT
+# re-running the step that made it — including the hash-verified dependency
+# install — so the cache itself is a trust input. These lockers keep it:
+#
+#   - SCOPED. Cache refs live in this project's own Artifact Registry repo
+#     (same write boundary as the images), never a third-party registry, and
+#     never under the deployable `api` image name.
+#   - ROTATED. The cache tag carries ${_CACHE_EPOCH}, which has no default and
+#     which deploy.yml derives from the runner's UTC clock (ISO year-week) —
+#     never from event data. The first build of each epoch is cold, bounding
+#     poisoned-entry persistence and apt/torch staleness to one week.
+#   - COMPLETE + NON-BLOCKING. mode=max (the builder stage is not in the final
+#     image, so min mode would miss the dependency install); ignore-error=true
+#     (a failed export never blocks a deploy); --load (the `images:` push reads
+#     the worker daemon).
+#   - PINNED EXECUTOR. The BuildKit image that runs every build step is
+#     digest-pinned, like the Dockerfile bases.
+# ---------------------------------------------------------------------------
+
+_ARTIFACT_REGISTRY_REPO = "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/"
+
+
+def _step_args(step: dict[str, Any]) -> list[str]:
+    return [str(arg) for arg in step.get("args", [])]
+
+
+def _flag_values(args: list[str], flag: str) -> list[str]:
+    """Values of *flag* in an argv list, in both ``--flag v`` and ``--flag=v`` form."""
+    values = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == flag]
+    values += [arg.partition("=")[2] for arg in args if arg.startswith(f"{flag}=")]
+    return values
+
+
+def _cache_spec(value: str) -> dict[str, str]:
+    """``type=registry,ref=…,mode=max`` → ``{"type": "registry", …}``."""
+    return dict(part.split("=", 1) for part in value.split(",") if "=" in part)
+
+
+@pytest.mark.security
+def test_cloudbuild_api_layer_cache_is_scoped_rotated_and_non_blocking(
+    cloudbuild: dict[str, Any],
+) -> None:
+    api_args = _step_args(_cloudbuild_step(cloudbuild, "build-api"))
+    assert api_args[:2] == ["buildx", "build"], (
+        f"build-api must run `docker buildx build` to use the registry cache; got {api_args[:2]}"
+    )
+    cache_from = [_cache_spec(v) for v in _flag_values(api_args, "--cache-from")]
+    cache_to = [_cache_spec(v) for v in _flag_values(api_args, "--cache-to")]
+    assert cache_from and len(cache_to) == 1, (
+        "build-api must import (--cache-from) and export (one --cache-to) a layer cache"
+    )
+    for spec in [*cache_from, *cache_to]:
+        ref = spec.get("ref", "")
+        assert spec.get("type") == "registry", f"cache must be a registry cache: {spec}"
+        assert ref.startswith(_ARTIFACT_REGISTRY_REPO), (
+            f"cache ref {ref!r} is outside this project's Artifact Registry repo — a "
+            "third-party cache would let an outside party feed layers into the image"
+        )
+        assert not ref.startswith(f"{_ARTIFACT_REGISTRY_REPO}api:"), (
+            f"cache ref {ref!r} shares the deployable image's name; keep it separate"
+        )
+        assert ref.endswith(":${_CACHE_EPOCH}"), (
+            f"cache ref {ref!r} is not keyed by ${{_CACHE_EPOCH}} — a never-rotated "
+            "cache lets one poisoned or stale layer persist indefinitely"
+        )
+    (export,) = cache_to
+    assert export.get("mode") == "max", (
+        "--cache-to must use mode=max: the builder stage (the dependency install) "
+        "is not in the final image, so min mode caches nothing worth having"
+    )
+    assert export.get("ignore-error") == "true", (
+        "--cache-to must set ignore-error=true — a cache export failure must never block a deploy"
+    )
+    assert "--load" in api_args, (
+        "build-api must --load the image into the worker daemon; the `images:` push "
+        "reads it from there"
+    )
+    assert "_CACHE_EPOCH" not in (cloudbuild.get("substitutions") or {}), (
+        "cloudbuild.yaml must not default _CACHE_EPOCH — a default is a cache that "
+        "never rotates; require it at submit time"
+    )
+
+
+@pytest.mark.security
+def test_cloudbuild_buildkit_executor_is_digest_pinned(cloudbuild: dict[str, Any]) -> None:
+    steps = cloudbuild.get("steps", [])
+    api_index = next(i for i, s in enumerate(steps) if s.get("id") == "build-api")
+    builders = _flag_values(_step_args(steps[api_index]), "--builder")
+    assert len(builders) == 1, "build-api must name its buildx builder explicitly"
+    creates = [
+        (i, _step_args(step))
+        for i, step in enumerate(steps)
+        if _step_args(step)[:2] == ["buildx", "create"]
+        and builders[0] in _flag_values(_step_args(step), "--name")
+    ]
+    assert len(creates) == 1, f"no single step creates the {builders[0]!r} builder"
+    ((create_index, create_args),) = creates
+    assert create_index < api_index, "the buildx builder must be created before build-api"
+    assert _flag_values(create_args, "--driver") == ["docker-container"], (
+        "the builder must use the docker-container driver (the only one here that "
+        "can export a registry cache)"
+    )
+    images = [
+        opt.partition("=")[2]
+        for opt in _flag_values(create_args, "--driver-opt")
+        if opt.startswith("image=")
+    ]
+    assert images, (
+        "the buildx builder does not pin its BuildKit image — buildx would pull a "
+        "floating `moby/buildkit:buildx-stable-1`"
+    )
+    assert all(_DIGEST_RE.search(image) for image in images), (
+        f"BuildKit image not digest-pinned (@sha256:...): {images}. It executes every "
+        "build step; a floating tag is a silent-substitution vector"
+    )
+
+
+@pytest.mark.security
+def test_deploy_workflow_derives_the_cache_epoch_from_the_clock(deploy_workflow: str) -> None:
+    submit = [body for body in _run_block_bodies(deploy_workflow) if "gcloud builds submit" in body]
+    assert len(submit) == 1, "deploy.yml must submit exactly one Cloud Build"
+    (body,) = submit
+    epoch = re.search(r'^\s*(\w+)="\$\(date -u \+%G-w%V\)"\s*$', body, re.MULTILINE)
+    assert epoch, (
+        "deploy.yml must derive the cache epoch from the UTC ISO year-week "
+        '(`epoch="$(date -u +%G-w%V)"`) — a clock-bounded key, never event data'
+    )
+    assert f"_CACHE_EPOCH=${epoch.group(1)}" in body, (
+        "deploy.yml does not pass the clock-derived epoch as _CACHE_EPOCH"
+    )
+
+
 # ===========================================================================
 # CI workflow supply-chain checks.
 # ===========================================================================
@@ -1947,4 +2448,35 @@ def test_ci_pip_audit_ignore_set_is_exactly_the_reviewed_cves(ci_workflow: str) 
         f"ci.yml no longer suppresses {sorted(stale)}, but the locker still expects it. "
         "If a fixed chromadb release shipped and the ignore was dropped, drop it from "
         "_EXPECTED_PIP_AUDIT_IGNORES too (and re-audit the rest)"
+    )
+
+
+@pytest.mark.security
+def test_ci_workflow_audits_the_api_image_lock(ci_workflow: str) -> None:
+    """The release image's exact dependency set is CVE-audited on every PR (F26).
+
+    The resolved-environment audit above never contains the SQLCipher or
+    on-device-embedder extras (CI installs neither), so without this step the
+    packages the API image actually ships — pysqlcipher3, sentence-transformers,
+    transformers and their trees — would go unaudited. It is also the
+    compensating control for pinning: a stale lock carrying a newly-advised
+    version turns CI red instead of shipping quietly.
+    """
+    steps = yaml.safe_load(ci_workflow)["jobs"]["dependency-scan"]["steps"]
+    audits = [
+        str(step.get("run", ""))
+        for step in steps
+        if "pip_audit" in str(step.get("run", ""))
+        and _API_LOCK_IN_CONTEXT in str(step.get("run", ""))
+    ]
+    assert len(audits) == 1, (
+        f"the dependency-scan job must run exactly one pip-audit over {_API_LOCK_IN_CONTEXT}"
+    )
+    (command,) = audits
+    assert "--disable-pip" in command, (
+        "the lock audit must be a pure pinned-version lookup (--disable-pip): resolving "
+        "it would pull the default-index CUDA torch and compile pysqlcipher3 in CI"
+    )
+    assert set(_IGNORE_VULN_RE.findall(command)) == _EXPECTED_PIP_AUDIT_IGNORES, (
+        "the lock audit must carry exactly the reviewed chromadb ignore set"
     )
