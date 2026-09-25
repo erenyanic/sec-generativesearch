@@ -41,8 +41,19 @@ services:
     image: sec-gs-api:local
     restart: unless-stopped
     # Exactly one replica — the in-process TaskManager mints task IDs in-process.
+    # GPU by default: the embedder is too slow on a CPU for real use, so the
+    # image ships CUDA torch and the container reserves one NVIDIA GPU (needs
+    # the NVIDIA Container Toolkit on the host; without it `up` refuses to start
+    # rather than silently embedding on the CPU). CPU-only host: add
+    # `-f deploy/docker-compose.cpu.yml` (CPU torch, no reservation).
     deploy:
       replicas: 1
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     # Non-secret config arrives at runtime via .env; nothing is baked. The file
     # is optional so Scenario A (no auth) can run without one.
     env_file:
@@ -61,6 +72,9 @@ services:
       # exactly the `sec_gs` subnet pinned under `networks:` below; change both
       # together if the range collides with an existing network.
       FORWARDED_ALLOW_IPS: 10.201.7.0/24
+      # Embed on the reserved GPU or fail loudly: "auto" would silently fall
+      # back to the CPU if CUDA were unusable (e.g. a driver mismatch).
+      EMBEDDING_DEVICE: cuda
     # Docker secrets mount read-only at /run/secrets/<name> and fail loudly if
     # the source file is missing (a plain bind mount would silently create a
     # directory there and break SQLCipher).

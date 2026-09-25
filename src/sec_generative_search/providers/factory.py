@@ -177,6 +177,20 @@ def build_embedder(
 
     # ``local`` accepts ``None`` (uses its internal sentinel); every
     # other provider requires a real key per ``_ProviderBase``.
+    if settings.provider == "local":
+        # The local-only knobs MUST reach the on-device provider — without
+        # this, EMBEDDING_DEVICE / EMBEDDING_BATCH_SIZE are silently ignored
+        # and a GPU deployment pinned to "cuda" falls back to the CPU.
+        # Hosted adapters never receive them (the settings validator rejects
+        # them for a hosted provider). ``idle_timeout_minutes`` is deliberately
+        # NOT forwarded yet: idle unload can null the model mid-encode
+        # (OPTIMIZATIONS.md F15) — wire it together with that fix.
+        return provider_cls(
+            api_key,
+            model=settings.model_name,
+            device=settings.device,
+            batch_size=settings.batch_size,
+        )
     return provider_cls(api_key, model=settings.model_name)
 
 

@@ -108,6 +108,12 @@ spec:
             # text never leave the instance for a third-party embedder.
             - name: EMBEDDING_PROVIDER
               value: local
+            # This revision reserves an L4 GPU, so the embedder must run on it:
+            # "auto" would silently fall back to the CPU if CUDA were unusable
+            # (a CPU-torch image, a driver mismatch). Pinned to "cuda", the
+            # boot-time warm-up below refuses to start instead.
+            - name: EMBEDDING_DEVICE
+              value: cuda
             # HF model cache on CONTAINER-LOCAL disk, never the gcsfuse volume
             # at /app/data (the image default): memory-mapping ~0.6 GB of
             # weights over FUSE on every cold start is slower than the download

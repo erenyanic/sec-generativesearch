@@ -334,6 +334,56 @@ class TestBuildEmbedderLocal:
         assert isinstance(embedder, LocalEmbeddingProvider)
 
 
+class TestBuildEmbedderForwardsLocalKnobs:
+    """``EMBEDDING_DEVICE`` / ``EMBEDDING_BATCH_SIZE`` must reach the on-device
+    provider. The factory used to drop them, so a GPU deployment pinned to
+    ``cuda`` silently embedded on the CPU. A recording stub stands in for the
+    adapter, so this runs without the ``[local-embeddings]`` extra."""
+
+    @staticmethod
+    def _record_constructions(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+        calls: list[dict[str, Any]] = []
+
+        class _Recorder:
+            def __init__(self, api_key: str | None, **kwargs: Any) -> None:
+                calls.append({"api_key": api_key, **kwargs})
+
+        monkeypatch.setattr(ProviderRegistry, "get_class", lambda _name, _surface: _Recorder)
+        return calls
+
+    def test_local_provider_receives_device_and_batch_size(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._record_constructions(monkeypatch)
+        settings = EmbeddingSettings(
+            provider="local",
+            model_name="google/embeddinggemma-300m",
+            device="cuda",
+            batch_size=8,
+            idle_timeout_minutes=5,
+        )
+        build_embedder(settings, api_key_resolver=lambda _name: None)
+        # idle_timeout_minutes is deliberately NOT forwarded until the
+        # idle-unload race (OPTIMIZATIONS.md F15) is fixed.
+        assert calls == [
+            {
+                "api_key": None,
+                "model": "google/embeddinggemma-300m",
+                "device": "cuda",
+                "batch_size": 8,
+            }
+        ]
+
+    def test_hosted_provider_receives_no_local_only_knobs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._record_constructions(monkeypatch)
+        fake_key = "sk-test-1234ABCD"  # pragma: allowlist secret
+        settings = EmbeddingSettings(provider="openai", model_name="text-embedding-3-small")
+        build_embedder(settings, api_key_resolver=lambda _name: fake_key)
+        assert calls == [{"api_key": fake_key, "model": "text-embedding-3-small"}]
+
+
 class TestBuildEmbedderExtrasGating:
     def test_missing_extras_surfaces_registry_key_error(
         self, monkeypatch: pytest.MonkeyPatch

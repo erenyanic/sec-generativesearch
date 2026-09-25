@@ -115,8 +115,10 @@ async def _warm_embedder(embedder: object, model_name: str) -> None:
             "EMBEDDING_WARM_ON_BOOT=true but the embedding model could not be loaded.",
             details=(
                 "Check HF_TOKEN (the default model is gated), outbound access to "
-                "huggingface.co or a pre-populated HF_HOME cache, and the "
-                "[local-embeddings] extra."
+                "huggingface.co or a pre-populated HF_HOME cache, the "
+                "[local-embeddings] extra, and — with EMBEDDING_DEVICE=cuda — that "
+                "a usable GPU is visible to the process (NVIDIA driver + container "
+                "toolkit, a CUDA torch build)."
             ),
         ) from exc
 

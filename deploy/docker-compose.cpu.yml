@@ -1,0 +1,23 @@
+# ===========================================================================
+# SEC-GenerativeSearch — CPU-only override for the Compose stack
+# ===========================================================================
+# The base file is GPU by default: CUDA torch in the image, one NVIDIA GPU
+# reserved for the api service, EMBEDDING_DEVICE=cuda (fail loudly, never a
+# silent CPU fallback). This override is the explicit opt-out for a host
+# without an NVIDIA GPU + NVIDIA Container Toolkit — evaluation and small
+# corpora only, the on-device embedder is slow on a CPU:
+#
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.cpu.yml up -d --build
+#
+# `!reset` (Compose v2.24+) removes the base file's GPU reservation.
+services:
+  api:
+    build:
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+    environment:
+      EMBEDDING_DEVICE: cpu
+    deploy:
+      resources:
+        reservations:
+          devices: !reset []

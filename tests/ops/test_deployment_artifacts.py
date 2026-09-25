@@ -1580,6 +1580,133 @@ def test_cloud_api_local_embedder_is_warmed_with_a_secret_managed_token(
 
 
 # ---------------------------------------------------------------------------
+# GPU by default — the on-device embedder is too slow on a CPU for real use.
+#
+# EMBEDDING_DEVICE defaults to "auto", which picks CUDA only when the installed
+# torch was built with it: a CPU-torch image — or a GPU the container cannot
+# use — silently embeds on the CPU. So every GPU deployment (a) builds the image
+# from a CUDA torch index and (b) pins EMBEDDING_DEVICE=cuda, turning an
+# unusable GPU into a loud failure. CPU is an explicit, coherent opt-out.
+# ---------------------------------------------------------------------------
+
+_COMPOSE_CPU_OVERRIDE = _REPO_ROOT / "deploy" / "docker-compose.cpu.yml"
+_CUDA_INDEX_RE = re.compile(r"^https://download\.pytorch\.org/whl/cu\d+/?$")
+_CPU_INDEX_RE = re.compile(r"^https://download\.pytorch\.org/whl/cpu/?$")
+
+
+class _Reset:
+    """A Compose ``!reset`` value: the key is cleared in the merged config."""
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+
+class _ComposeLoader(yaml.SafeLoader):
+    """``SafeLoader`` that also understands Compose's ``!reset`` merge tag."""
+
+
+def _construct_reset(loader: yaml.SafeLoader, node: yaml.Node) -> _Reset:
+    if isinstance(node, yaml.SequenceNode):
+        return _Reset(loader.construct_sequence(node))
+    if isinstance(node, yaml.MappingNode):
+        return _Reset(loader.construct_mapping(node))
+    return _Reset(loader.construct_scalar(node))
+
+
+_ComposeLoader.add_constructor("!reset", _construct_reset)
+
+
+def _key_values(value: Any) -> dict[str, str]:
+    """A Compose ``build.args``/``environment`` block, or buildx ``--build-arg``
+    values, as a dict — both the mapping and the ``K=V`` list forms."""
+    if isinstance(value, dict):
+        return {str(key): str(val) for key, val in value.items()}
+    return dict(str(item).split("=", 1) for item in value or [] if "=" in str(item))
+
+
+def _effective_torch_index(dockerfile: str, build_args: dict[str, str]) -> str:
+    """The torch wheel index a build uses: its build-arg, else the ARG default."""
+    return build_args.get("TORCH_INDEX_URL", _collect_arg_defaults(dockerfile)["TORCH_INDEX_URL"])
+
+
+def test_api_image_defaults_to_cuda_torch_without_pinning_the_device(dockerfile: str) -> None:
+    default = _collect_arg_defaults(dockerfile).get("TORCH_INDEX_URL", "")
+    assert _CUDA_INDEX_RE.match(default), (
+        f"Dockerfile.api's default TORCH_INDEX_URL {default!r} is not a CUDA index — "
+        "the embedder is GPU-by-default; CPU torch must be an explicit build-arg"
+    )
+    assert _env_value(_dockerfile_stages(dockerfile)["runtime"], "EMBEDDING_DEVICE") is None, (
+        "the image must not pin EMBEDDING_DEVICE: 'auto' keeps a plain `docker run` "
+        "without a GPU working; GPU deployments pin 'cuda' in their own manifests"
+    )
+
+
+def test_cloud_run_gpu_revision_builds_cuda_torch_and_pins_the_device(
+    cloud_api: dict[str, Any], cloudbuild: dict[str, Any], dockerfile: str
+) -> None:
+    container = _service_container(cloud_api)
+    limits = (container.get("resources") or {}).get("limits") or {}
+    assert "nvidia.com/gpu" in limits, (
+        "GPU is the product default: api-service.yaml must request a GPU for the embedder"
+    )
+    build_args = _key_values(
+        _flag_values(_step_args(_cloudbuild_step(cloudbuild, "build-api")), "--build-arg")
+    )
+    index = _effective_torch_index(dockerfile, build_args)
+    assert _CUDA_INDEX_RE.match(index), (
+        f"the Cloud Run revision reserves a GPU but build-api installs torch from "
+        f"{index!r} — a CPU-torch image leaves the GPU idle and embeds on the CPU"
+    )
+    device = _env_by_name(container).get("EMBEDDING_DEVICE", {}).get("value")
+    assert device == "cuda", (
+        f"api-service.yaml sets EMBEDDING_DEVICE={device!r}; a GPU revision must pin "
+        "'cuda' so an unusable GPU refuses the boot instead of silently using the CPU"
+    )
+
+
+def test_compose_reserves_a_gpu_for_cuda_torch_and_pins_the_device(
+    compose: dict[str, Any], dockerfile: str
+) -> None:
+    api = _services(compose)["api"]
+    reservations = ((api.get("deploy") or {}).get("resources") or {}).get("reservations") or {}
+    gpus = [
+        device
+        for device in reservations.get("devices") or []
+        if device.get("driver") == "nvidia" and "gpu" in (device.get("capabilities") or [])
+    ]
+    assert gpus, "GPU is the product default: the Compose api service must reserve an NVIDIA GPU"
+    index = _effective_torch_index(dockerfile, _key_values((api.get("build") or {}).get("args")))
+    assert _CUDA_INDEX_RE.match(index), (
+        f"Compose reserves a GPU but builds the api image from {index!r} — CPU torch "
+        "would leave it idle"
+    )
+    device = _key_values(api.get("environment")).get("EMBEDDING_DEVICE")
+    assert device == "cuda", (
+        f"Compose sets EMBEDDING_DEVICE={device!r}; with a reserved GPU it must pin "
+        "'cuda' so an unusable GPU fails loudly instead of silently using the CPU"
+    )
+
+
+def test_compose_cpu_override_is_a_coherent_opt_out() -> None:
+    # The opt-out must flip all three together: CPU torch, EMBEDDING_DEVICE=cpu,
+    # and no GPU reservation — any mix either fails to start or boots and dies.
+    override = yaml.load(
+        _COMPOSE_CPU_OVERRIDE.read_text(encoding="utf-8"),
+        Loader=_ComposeLoader,  # noqa: S506 — a SafeLoader subclass; adds only `!reset`
+    )
+    api = override["services"]["api"]
+    index = _key_values((api.get("build") or {}).get("args")).get("TORCH_INDEX_URL", "")
+    assert _CPU_INDEX_RE.match(index), f"the CPU override builds torch from {index!r}"
+    assert _key_values(api.get("environment")).get("EMBEDDING_DEVICE") == "cpu", (
+        "the CPU override must set EMBEDDING_DEVICE=cpu"
+    )
+    devices = api["deploy"]["resources"]["reservations"]["devices"]
+    assert isinstance(devices, _Reset), (
+        "the CPU override must `!reset` the base file's GPU reservation"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Keyless, GFE-TLS frontend service.
 # ---------------------------------------------------------------------------
 
@@ -2128,9 +2255,9 @@ def test_deploy_workflow_derives_the_cache_epoch_from_the_clock(deploy_workflow:
 #   - SCAN GATES. The three dependency/secret scanners (pip-audit,
 #     detect-secrets, pnpm audit) are non-negotiable PR blockers and must not
 #     silently vanish from CI.
-#   - CPU-ONLY TORCH. The CUDA torch wheel (~2 GB, GPU runtime) is a Docker
-#     build-arg opt-in only (deploy/Dockerfile.api `TORCH_INDEX_URL`, default
-#     …/whl/cpu); it must never enter the CI dependency set.
+#   - CPU-ONLY TORCH IN CI. The CUDA torch wheel (+ GBs of nvidia-* runtime) is
+#     what the deployment images ship (deploy/Dockerfile.api `TORCH_INDEX_URL`
+#     defaults to …/whl/cu126); it must never enter the CI dependency set.
 #   - COMMAND-INJECTION GUARD. No `${{ github.event.* }}` interpolation inside a
 #     `run:` shell — ci.yml states this design principle in its own header
 #     comment; this test enforces it (mirrors the deploy.yml guard).
@@ -2158,11 +2285,11 @@ def test_ci_workflow_carries_supply_chain_scan_gates(ci_workflow: str) -> None:
 @pytest.mark.security
 def test_ci_workflow_torch_is_cpu_only(ci_workflow: str) -> None:
     # A CUDA torch wheel index has no place in CI: the test job never exercises a
-    # real model load, and the GPU build is a deploy/Dockerfile.api build-arg
-    # opt-in (`TORCH_INDEX_URL`, default …/whl/cpu). Pin CPU-only directly.
+    # real model load or a GPU. The CUDA build belongs to the deployment images
+    # (deploy/Dockerfile.api `TORCH_INDEX_URL`, default …/whl/cu126), never CI.
     assert "download.pytorch.org/whl/cu" not in ci_workflow, (
         "ci.yml references a CUDA torch wheel index (…/whl/cu…) — CI must stay "
-        "CPU-only; the GPU wheel is a Docker build-arg opt-in, never a CI dependency"
+        "CPU-only; the GPU wheel belongs to the deployment image, never a CI dependency"
     )
     # Forward guard: plain `pip install torch` on Linux resolves the default-index
     # CUDA build. If a future change installs the heavy [local-embeddings] extra

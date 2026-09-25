@@ -27,12 +27,16 @@
 #                        embedder google/embeddinggemma-300m — keeps query +
 #                        filing text on own infrastructure.
 #
-# CPU torch is the default. For a CUDA image pass the build arg:
+# CUDA torch is the default: the embedder is meant to run on a GPU (on a CPU it
+# is too slow for real use), and EMBEDDING_DEVICE=auto only picks CUDA when the
+# installed torch was built with it — a CPU-torch image would silently embed on
+# the CPU even on a GPU host. cu126 serves the same torch release as the CPU
+# index and runs on any driver for CUDA >= 12.6 (Cloud Run L4: driver 580 /
+# CUDA 13.0); older CUDA indexes stop early (cu124's newest torch is 2.6.0), so
+# check a candidate index's /torch/ listing before switching. For a CPU-only
+# host (smaller, faster to build) opt out explicitly:
 #   docker build -f deploy/Dockerfile.api \
-#     --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 .
-# cu126 serves the same torch release as the CPU index; older CUDA indexes
-# stop early (cu124's newest torch is 2.6.0). Check a candidate index with
-# its /torch/ listing before switching.
+#     --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu .
 #
 # Digest-pinned base (supply-chain hardening). Resolve a fresh digest with:
 #   docker buildx imagetools inspect python:3.12-slim-bookworm \
@@ -64,12 +68,14 @@ RUN apt-get update \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# Torch wheel index. Default = CPU-only build; override with --build-arg for
-# CUDA. torch is the ONE dependency outside the hash-pinned lock below: its
-# wheel index is a build-arg, so no single set of hashes fits every variant
-# (the lock is compiled with torch omitted). Keep the specifier in lockstep
-# with pyproject.toml's [local-embeddings] extra.
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+# Torch wheel index. Default = CUDA 12.6 (see the header); override with
+# --build-arg for a CPU-only image. torch is the ONE dependency outside the
+# hash-pinned lock below: its wheel index is a build-arg, so no single set of
+# hashes fits every variant. The lock is compiled against CPU torch with torch
+# omitted, which keeps it variant-agnostic: the accelerator payload (nvidia-*,
+# triton) arrives only from this step, never from the lock. Keep the
+# specifier in lockstep with pyproject.toml's [local-embeddings] extra.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126
 RUN pip install --upgrade pip \
     && pip install "torch>=2.2" --index-url "${TORCH_INDEX_URL}"
 

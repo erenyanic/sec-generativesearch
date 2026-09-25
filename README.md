@@ -260,12 +260,15 @@ Local quick run:
 
 ```bash
 docker build -f deploy/Dockerfile.api -t sec-gs-api:local .
-docker run --rm -p 8000:8000 \
+docker run --rm -p 8000:8000 --gpus all \
   -e EDGAR_IDENTITY_NAME="Your Name" \
   -e EDGAR_IDENTITY_EMAIL="your@email.com" \
+  -e HF_TOKEN \
   -v sec_gs_data:/app/data \
   sec-gs-api:local
 ```
+
+The image ships CUDA torch because the on-device embedder is meant to run on a GPU; `--gpus all` needs the NVIDIA Container Toolkit. Without a GPU the container still starts but embeds on the CPU, which is slow. For a CPU-only host, build with `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu` (smaller image) and use `deploy/docker-compose.cpu.yml` with Compose. `HF_TOKEN` is needed because the default embedding model is gated.
 
 All deployment artefacts live under [`deploy/`](deploy/): the two Dockerfiles, the API image's hash-pinned dependency lock (`requirements.txt`, recompiled whenever `pyproject.toml` dependencies change), the Compose + nginx stack (`docker-compose.yml`, `nginx/`), and the GCP Cloud Run manifests (`cloud/`) with their Cloud Build config and Grafana dashboard.
 
@@ -311,7 +314,7 @@ pnpm build
 pnpm audit:ci
 ```
 
-**Backend:** 2721 tests, of which 998 are security-regression locks (`@pytest.mark.security`). **Frontend:** 294 tests across security and functional trees. A security-tree failure is a release blocker.
+**Backend:** 2727 tests, of which 998 are security-regression locks (`@pytest.mark.security`). **Frontend:** 294 tests across security and functional trees. A security-tree failure is a release blocker.
 
 ---
 
