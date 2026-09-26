@@ -187,16 +187,25 @@ class EncryptedCredentialStore:
             )
 
         now = datetime.now(UTC).isoformat()
-        sql = (
+        # UPDATE-then-INSERT, not ``INSERT … ON CONFLICT DO UPDATE``: the
+        # UPSERT clause needs SQLite >= 3.24, and the image's SQLCipher
+        # bundles 3.15.2.  The UPDATE opens the write transaction even when
+        # it matches no row, so another process cannot insert the same key
+        # before our INSERT commits.
+        sql_update = (
+            f"UPDATE {self._TABLE} SET api_key = ?, updated_at = ? "  # noqa: S608 — table name is a constant
+            "WHERE user_id = ? AND provider = ?"
+        )
+        sql_insert = (
             f"INSERT INTO {self._TABLE} "  # noqa: S608 — table name is a constant
             "(user_id, provider, api_key, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(user_id, provider) DO UPDATE SET "
-            "api_key = excluded.api_key, updated_at = excluded.updated_at"
+            "VALUES (?, ?, ?, ?, ?)"
         )
         try:
             with self._lock, self._conn:
-                self._conn.execute(sql, (key_id, provider, api_key, now, now))
+                cursor = self._conn.execute(sql_update, (api_key, now, key_id, provider))
+                if cursor.rowcount == 0:
+                    self._conn.execute(sql_insert, (key_id, provider, api_key, now, now))
         except self._db_error as exc:
             raise DatabaseError(
                 "Failed to upsert provider credential",

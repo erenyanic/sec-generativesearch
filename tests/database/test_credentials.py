@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -305,6 +306,41 @@ class TestCRUD:
     ) -> None:
         with pytest.raises(ValueError, match="non-empty"):
             encrypted_store.set("u", "openai", "")
+
+    def test_rotation_preserves_created_at_and_bumps_updated_at(
+        self,
+        encrypted_store: EncryptedCredentialStore,
+        encrypted_registry: MetadataRegistry,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One row per ``(user_id, provider)``; a rotation keeps its history."""
+        stamps = iter(
+            [
+                datetime(2026, 1, 1, tzinfo=UTC),
+                datetime(2026, 2, 1, tzinfo=UTC),
+            ]
+        )
+
+        class _Clock:
+            @staticmethod
+            def now(tz: object = None) -> datetime:
+                return next(stamps)
+
+        monkeypatch.setattr("sec_generative_search.database.credentials.datetime", _Clock)
+
+        encrypted_store.set("u", "openai", "sk-old-1234567890")
+        encrypted_store.set("u", "openai", "sk-new-ABCDEFGHIJ")
+
+        rows = encrypted_registry._conn.execute(
+            "SELECT api_key, created_at, updated_at FROM provider_credentials"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            (
+                "sk-new-ABCDEFGHIJ",
+                "2026-01-01T00:00:00+00:00",
+                "2026-02-01T00:00:00+00:00",
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
