@@ -9,9 +9,11 @@ service never embeds.
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import shutil
+import sqlite3
 import stat
 import tarfile
 from datetime import date
@@ -673,7 +675,9 @@ class TestSecurity:
 
     def test_manifest_does_not_carry_encryption_key(
         self,
-        seeded: tuple[str, str, EmbedderStamp],
+        chroma_path: str,
+        metadata_db_path: str,
+        stamp: EmbedderStamp,
         service: BackupService,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -684,11 +688,12 @@ class TestSecurity:
         the manifest carries only the *fact* of encryption via
         ``sqlcipher_encrypted``.
         """
+        # Key set *before* seeding: with pysqlcipher3 (the API image) the
+        # store is genuinely encrypted; without it (CI) it falls back to
+        # plain.  The manifest must be key-free either way.
         monkeypatch.setenv("DB_ENCRYPTION_KEY", "this-is-a-long-test-key-not-a-secret")
+        _seed_storage(chroma_path, metadata_db_path, stamp)
         output = tmp_path / "backup.tar.gz"
-        # The seeded SQLite was opened without encryption, so the
-        # snapshot will run plain regardless — the assertion here is on
-        # the manifest payload, not on the runtime branch.
         service.backup(output)
 
         with tarfile.open(output) as tar:
@@ -742,3 +747,174 @@ class TestSecurity:
 
         with pytest.raises(DatabaseError):
             service.restore(bogus, expected_stamp=stamp)
+
+
+# ---------------------------------------------------------------------------
+# SQLCipher snapshot — pysqlcipher3 has no ``Connection.backup()``
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSqlcipher:
+    """Stand-in for the pysqlcipher3 module that records what the snapshot runs."""
+
+    class Error(Exception):
+        pass
+
+    def __init__(self, *, fail_on: str | None = None) -> None:
+        self.fail_on = fail_on
+        self.connect_kwargs: dict = {}
+        self.statements: list[tuple[str, tuple]] = []
+        self.closed = False
+
+    def connect(self, path: str, **kwargs: object) -> _RecordingSqlcipher:
+        self.connect_kwargs = kwargs
+        return self
+
+    def execute(self, sql: str, params: tuple = ()) -> _RecordingSqlcipher:
+        self.statements.append((sql, params))
+        if self.fail_on is not None and self.fail_on in sql:
+            raise self.Error("simulated sqlcipher failure")
+        return self
+
+    def fetchall(self) -> list:
+        return []
+
+    def close(self) -> None:
+        self.closed = True
+
+
+_SNAPSHOT_KEY = "unit-test-key-not-a-secret"
+
+
+class TestSqlcipherSnapshotOrchestration:
+    """Runs everywhere: the encrypted branch's statement contract."""
+
+    def test_encrypted_snapshot_exports_inside_one_read_transaction(
+        self,
+        service: BackupService,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = _RecordingSqlcipher()
+        monkeypatch.setattr(
+            "sec_generative_search.database.backup._get_sqlite_module", lambda _key: fake
+        )
+        dest = tmp_path / "snap.sqlite"
+
+        service._snapshot_sqlite(dest, encryption_key=_SNAPSHOT_KEY, encrypted=True)
+
+        key_literal = f"x'{_SNAPSHOT_KEY.encode().hex()}'"
+        assert fake.statements == [
+            (f'PRAGMA key = "{key_literal}"', ()),
+            ("ATTACH DATABASE ? AS snapshot KEY ?", (str(dest), key_literal)),
+            ("BEGIN", ()),
+            ("SELECT sqlcipher_export('snapshot')", ()),
+            ("COMMIT", ()),
+        ]
+        # No implicit driver transactions around ATTACH / the export.
+        assert fake.connect_kwargs["isolation_level"] is None
+        assert fake.closed is True
+
+    @pytest.mark.security
+    def test_export_failure_is_typed_closes_and_never_echoes_the_key(
+        self,
+        service: BackupService,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake = _RecordingSqlcipher(fail_on="sqlcipher_export")
+        monkeypatch.setattr(
+            "sec_generative_search.database.backup._get_sqlite_module", lambda _key: fake
+        )
+
+        with pytest.raises(DatabaseError, match="sqlcipher_export") as excinfo:
+            service._snapshot_sqlite(
+                tmp_path / "snap.sqlite", encryption_key=_SNAPSHOT_KEY, encrypted=True
+            )
+
+        assert fake.closed is True
+        rendered = str(excinfo.value)
+        assert _SNAPSHOT_KEY not in rendered
+        assert _SNAPSHOT_KEY.encode().hex() not in rendered
+        # The key is bound into ATTACH, never interpolated into its SQL.
+        attach_sql = next(sql for sql, _ in fake.statements if sql.startswith("ATTACH"))
+        assert _SNAPSHOT_KEY.encode().hex() not in attach_sql
+
+
+def _sqlcipher_dump(path: Path, key: str) -> dict:
+    from pysqlcipher3 import dbapi2 as sqlcipher
+
+    conn = sqlcipher.connect(str(path))
+    try:
+        conn.execute(f"PRAGMA key = \"x'{key.encode().hex()}'\"")
+        tables = [
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        ]
+        return {
+            "schema": sorted(
+                tuple(row) for row in conn.execute("SELECT type, name, sql FROM sqlite_master")
+            ),
+            "rows": {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall()) for t in tables},  # noqa: S608
+        }
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("pysqlcipher3") is None,
+    reason="needs pysqlcipher3 (the [encryption] extra; present in the API image, not in CI)",
+)
+class TestSqlcipherBackupRoundTrip:
+    """The real driver: an encrypted deployment backs up and restores."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            # A passphrase (PBKDF2-derived), then 32 bytes (SQLCipher's raw-key form).
+            "unit-test-key-not-a-secret",
+            "0123456789abcdef0123456789abcdef",  # pragma: allowlist secret
+        ],
+    )
+    def test_encrypted_round_trip(
+        self,
+        chroma_path: str,
+        metadata_db_path: str,
+        stamp: EmbedderStamp,
+        service: BackupService,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        key: str,
+    ) -> None:
+        monkeypatch.setenv("DB_ENCRYPTION_KEY", key)
+        _seed_storage(chroma_path, metadata_db_path, stamp)
+        registry = MetadataRegistry(db_path=metadata_db_path)
+        assert registry.encrypted is True
+        registry.save_task_history(
+            "task-1", status="completed", tickers=["AAPL"], form_types=["10-K"], results=[]
+        )
+        registry.close()
+        source = _sqlcipher_dump(Path(metadata_db_path), key)
+
+        output = tmp_path / "backup.tar.gz"
+        assert service.backup(output).sqlcipher_encrypted is True
+
+        extracted = tmp_path / "extracted"
+        with tarfile.open(output) as tar:
+            tar.extract("metadata.sqlite", extracted, filter="data")
+        snapshot = extracted / "metadata.sqlite"
+        with pytest.raises(sqlite3.DatabaseError):
+            sqlite3.connect(snapshot).execute("SELECT * FROM sqlite_master").fetchall()
+        assert _sqlcipher_dump(snapshot, key) == source
+
+        shutil.rmtree(chroma_path)
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{metadata_db_path}{suffix}").unlink(missing_ok=True)
+        assert service.restore(output, expected_stamp=stamp).sqlcipher_encrypted is True
+
+        restored = MetadataRegistry(db_path=metadata_db_path)
+        try:
+            assert restored.encrypted is True
+            assert restored.count() == 1
+            assert restored.get_task_history("task-1") is not None
+        finally:
+            restored.close()

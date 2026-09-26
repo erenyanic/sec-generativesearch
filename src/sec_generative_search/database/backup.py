@@ -4,9 +4,11 @@
 
 - ``MANIFEST.json`` at the root: ``format_version``, ``created_at_utc``,
   ``embedder_stamp``, ``schema_version``, ``sqlcipher_encrypted``.
-- ``metadata.sqlite``: SQLite snapshot via the DB-API
-  ``Connection.backup()`` API (live-consistent under WAL); encrypted
-  in-place when the source is SQLCipher-encrypted.
+- ``metadata.sqlite``: live-consistent SQLite snapshot — the DB-API
+  ``Connection.backup()`` for a plain database; SQLCipher's
+  ``sqlcipher_export()`` under the same key for an encrypted one
+  (pysqlcipher3 has no ``backup()``), so it is encrypted from the first
+  page and plaintext never touches disk.
 - ``chroma/``: recursive copy of the ChromaDB persistence directory.
 
 The operator must quiesce writers before backup — Chroma exposes no
@@ -256,7 +258,7 @@ class BackupService:
                 encoding="utf-8",
             )
 
-            # SQLite live snapshot via Connection.backup().
+            # SQLite live snapshot (``backup()`` or ``sqlcipher_export()``).
             self._snapshot_sqlite(
                 staging / self._SQLITE_NAME,
                 encryption_key=encryption_key,
@@ -531,48 +533,37 @@ class BackupService:
         encryption_key: str | None,
         encrypted: bool,
     ) -> None:
-        """Live-snapshot the metadata SQLite file via ``Connection.backup()``.
+        """Live-snapshot the metadata SQLite file into *dest_path*.
 
-        The DB-API ``Connection.backup()`` call produces a consistent
-        snapshot under WAL without quiescing writers.  When the source
-        is SQLCipher-encrypted, the destination connection is keyed
-        with the same key so the snapshot is also encrypted in-place
-        — restoring on a host with the matching key just works,
-        without ever exposing plaintext on disk.
+        A plain database uses the DB-API ``Connection.backup()``, which is
+        consistent under WAL without quiescing writers.  An encrypted one
+        goes through :meth:`_export_sqlcipher_snapshot` — pysqlcipher3's
+        ``Connection`` has no ``backup()``.
         """
-        sqlite_module = _get_sqlite_module(encryption_key if encrypted else None)
-        hex_key: str | None = None
         if encrypted and encryption_key is not None:
-            hex_key = encryption_key.encode().hex()
+            self._export_sqlcipher_snapshot(dest_path, encryption_key)
+            return
 
         try:
-            src = sqlite_module.connect(
-                str(self._metadata_db_path),
-                check_same_thread=False,
-            )
-        except sqlite_module.Error as exc:
+            src = sqlite3.connect(str(self._metadata_db_path), check_same_thread=False)
+        except sqlite3.Error as exc:
             raise DatabaseError(
                 "Failed to open SQLite source for snapshot",
                 details=str(exc),
             ) from exc
 
         try:
-            if hex_key is not None:
-                src.execute(f"PRAGMA key = \"x'{hex_key}'\"")
-
             try:
-                dst = sqlite_module.connect(str(dest_path), check_same_thread=False)
-            except sqlite_module.Error as exc:
+                dst = sqlite3.connect(str(dest_path), check_same_thread=False)
+            except sqlite3.Error as exc:
                 raise DatabaseError(
                     "Failed to open SQLite destination for snapshot",
                     details=str(exc),
                 ) from exc
 
             try:
-                if hex_key is not None:
-                    dst.execute(f"PRAGMA key = \"x'{hex_key}'\"")
                 src.backup(dst)
-            except sqlite_module.Error as exc:
+            except sqlite3.Error as exc:
                 raise DatabaseError(
                     "SQLite snapshot via Connection.backup() failed",
                     details=str(exc),
@@ -580,6 +571,53 @@ class BackupService:
             finally:
                 dst.close()
         finally:
+            src.close()
+
+    def _export_sqlcipher_snapshot(self, dest_path: Path, encryption_key: str) -> None:
+        """Snapshot an encrypted database with SQLCipher's ``sqlcipher_export()``.
+
+        The destination is ``ATTACH``ed under the same key literal
+        :class:`MetadataRegistry` passes to ``PRAGMA key`` (bound, never
+        interpolated), so it derives the identical key and is encrypted from
+        its first page — restoring on a host with the matching key just
+        works, and plaintext never touches disk.  The export runs inside one
+        explicit read transaction, so every table comes from the same WAL
+        snapshot even while the API keeps writing (verified in-image: a row
+        committed mid-export is excluded).
+
+        ``isolation_level=None`` stops the driver issuing its own
+        ``BEGIN``/``COMMIT`` (and ``ATTACH`` is refused inside a
+        transaction).  Never install a trace callback on this connection:
+        pysqlcipher3 segfaults when one re-enters during the export.
+        """
+        sqlcipher = _get_sqlite_module(encryption_key)
+        key_literal = f"x'{encryption_key.encode().hex()}'"
+        try:
+            src = sqlcipher.connect(
+                str(self._metadata_db_path),
+                check_same_thread=False,
+                isolation_level=None,
+            )
+        except sqlcipher.Error as exc:
+            raise DatabaseError(
+                "Failed to open SQLite source for snapshot",
+                details=str(exc),
+            ) from exc
+
+        try:
+            # PRAGMA does not accept ``?`` binding; same literal as the registry.
+            src.execute(f'PRAGMA key = "{key_literal}"')
+            src.execute("ATTACH DATABASE ? AS snapshot KEY ?", (str(dest_path), key_literal))
+            src.execute("BEGIN")
+            src.execute("SELECT sqlcipher_export('snapshot')").fetchall()
+            src.execute("COMMIT")
+        except sqlcipher.Error as exc:
+            raise DatabaseError(
+                "SQLCipher snapshot via sqlcipher_export() failed",
+                details=str(exc),
+            ) from exc
+        finally:
+            # Closing rolls back an open transaction and detaches the snapshot.
             src.close()
 
     def _copy_chroma_tree(
