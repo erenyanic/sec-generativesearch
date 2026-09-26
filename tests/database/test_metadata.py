@@ -773,9 +773,10 @@ class TestConnectionPragmas:
         self,
         registry: MetadataRegistry,
     ) -> None:
-        """A transaction the block's caller leaves open (a failed commit *and*
-        rollback) is rolled back before FULL is restored, so no later write
-        can join it and commit under NORMAL."""
+        """A transaction left open inside the block (a commit that failed
+        without rolling back) is rolled back before FULL is restored —
+        pysqlcipher3 would otherwise implicitly commit it under NORMAL when
+        the restore PRAGMA runs; stdlib would let a later write join it."""
         with registry._lock:
             registry._conn.execute("CREATE TABLE stray (v INTEGER)")
             with registry._relaxed_sync_locked():

@@ -385,10 +385,11 @@ class MetadataRegistry:
         try:
             yield
         finally:
-            # A transaction left open by a failed commit *and* rollback must
-            # not be joined by a later write under NORMAL.  Current SQLite
-            # refuses the pragma below inside a transaction; the SQLite
-            # 3.15 bundled with the image's SQLCipher accepts it.
+            # Never restore over an open transaction (a commit that failed
+            # without rolling back).  pysqlcipher3 implicitly COMMITs an open
+            # transaction before a non-DML statement — measured in the image
+            # — so the PRAGMA below would commit it under NORMAL; the stdlib
+            # driver instead refuses the PRAGMA and a later write joins it.
             if self._conn.in_transaction:
                 self._conn.rollback()
             self._conn.execute("PRAGMA synchronous=FULL")
