@@ -18,25 +18,32 @@ import io
 import logging
 import sqlite3
 import threading
+import time
+import types
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from sec_generative_search.config.settings import ApiSettings, DatabaseSettings
 from sec_generative_search.core.exceptions import (
+    AuthError,
     DatabaseError,
     FilingLimitExceededError,
 )
 from sec_generative_search.core.logging import LOGGER_NAME, AccessionRedactionFilter
 from sec_generative_search.core.types import FilingIdentifier
+from sec_generative_search.core.user_auth import SALT_BYTES
 from sec_generative_search.database import (
     DatabaseStatistics,
     FilingRecord,
     MetadataRegistry,
     TickerStatistics,
 )
-from sec_generative_search.database.metadata import _scrub_error_message
+from sec_generative_search.database.credentials import EncryptedCredentialStore
+from sec_generative_search.database.metadata import _BUSY_TIMEOUT_MS, _scrub_error_message
+from sec_generative_search.database.users import UserStore
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -617,6 +624,268 @@ class TestPersistentConnection:
 
         assert errors == []
         assert registry.count() == 8
+
+
+# ---------------------------------------------------------------------------
+# Connection pragmas — busy timeout + scoped ``synchronous`` relaxation (F24)
+# ---------------------------------------------------------------------------
+
+
+_SYNC_LEVEL_NAMES = {0: "OFF", 1: "NORMAL", 2: "FULL", 3: "EXTRA"}
+
+
+def _sync_level(registry: MetadataRegistry) -> int:
+    with registry._lock:
+        return registry._conn.execute("PRAGMA synchronous").fetchone()[0]
+
+
+class _CommitTrace:
+    """Replay a connection's statement stream to find the ``synchronous``
+    level in force at every ``COMMIT``.
+
+    ``set_trace_callback`` sees every statement the driver runs, including
+    the implicit ``BEGIN`` / ``COMMIT`` — so the level each transaction
+    committed under is observable without a filesystem probe (``tmp_path``
+    is tmpfs, where ``fsync`` is a no-op anyway).
+    """
+
+    def __init__(self, registry: MetadataRegistry) -> None:
+        # Read, never assume, the level in force when tracing starts.
+        self.start_level = _SYNC_LEVEL_NAMES[_sync_level(registry)]
+        self.statements: list[str] = []
+        registry._conn.set_trace_callback(self.statements.append)
+
+    def commits(self) -> list[tuple[str, list[str]]]:
+        """Return ``(level, statements-in-transaction)`` for every COMMIT."""
+        level = self.start_level
+        out: list[tuple[str, list[str]]] = []
+        txn: list[str] = []
+        for raw in self.statements:
+            stmt = " ".join(raw.split()).upper()
+            if stmt.startswith("PRAGMA SYNCHRONOUS="):
+                level = stmt.split("=", 1)[1]
+            elif stmt == "BEGIN":
+                txn = []
+            elif stmt == "COMMIT":
+                out.append((level, txn))
+                txn = []
+            else:
+                txn.append(stmt)
+        return out
+
+
+def _filing(i: int) -> FilingIdentifier:
+    return FilingIdentifier(
+        ticker="AAPL",
+        form_type="10-K",
+        filing_date=date(2000 + i, 1, 1),
+        accession_number=f"0000320193-{i:02d}-000001",
+    )
+
+
+class TestConnectionPragmas:
+    def test_busy_timeout_is_pinned(self, registry: MetadataRegistry) -> None:
+        with registry._lock:
+            row = registry._conn.execute("PRAGMA busy_timeout").fetchone()
+        assert row[0] == _BUSY_TIMEOUT_MS == 5000
+
+    def test_busy_timeout_pin_overrides_a_zero_driver_default(
+        self,
+        tmp_db_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both measured drivers default to 5 s via ``connect(timeout=5.0)``;
+        the pragma is what keeps the wait if a driver ever defaults to 0."""
+        zero_timeout_driver = types.SimpleNamespace(
+            connect=lambda *a, **kw: sqlite3.connect(*a, timeout=0, **kw),
+            Row=sqlite3.Row,
+            Error=sqlite3.Error,
+            IntegrityError=sqlite3.IntegrityError,
+        )
+        monkeypatch.setattr(
+            "sec_generative_search.database.metadata._get_sqlite_module",
+            lambda _key: zero_timeout_driver,
+        )
+        registry = MetadataRegistry(db_path=tmp_db_path)
+        try:
+            with registry._lock:
+                row = registry._conn.execute("PRAGMA busy_timeout").fetchone()
+            assert row[0] == _BUSY_TIMEOUT_MS
+        finally:
+            registry.close()
+
+    def test_contended_write_waits_instead_of_raising(
+        self,
+        registry: MetadataRegistry,
+        tmp_db_path: str,
+    ) -> None:
+        """A second process holding the write lock (CLI, demo-reset Job)
+        makes the registry wait, not fail with ``database is locked``."""
+        other = sqlite3.connect(tmp_db_path, check_same_thread=False, timeout=0)
+        other.execute("BEGIN IMMEDIATE")
+        release = threading.Thread(target=lambda: (time.sleep(0.3), other.commit()))
+        started = time.monotonic()
+        release.start()
+        try:
+            registry.register_filing(_filing(1), chunk_count=1)
+        finally:
+            release.join()
+            other.close()
+        assert time.monotonic() - started >= 0.25
+        assert registry.count() == 1
+
+    @pytest.mark.security
+    def test_synchronous_defaults_to_full(self, registry: MetadataRegistry) -> None:
+        """FULL is the connection default — every write that does not opt in
+        to the ingest relaxation keeps power-loss durability."""
+        assert registry._wal is True
+        assert _sync_level(registry) == 2
+
+    def test_ingest_writes_commit_under_normal_then_restore_full(
+        self,
+        registry: MetadataRegistry,
+    ) -> None:
+        trace = _CommitTrace(registry)
+
+        registry.register_filing(_filing(1), chunk_count=1)
+        assert registry.register_filing_if_new(_filing(2), chunk_count=1) is True
+        _save_sample_task(registry)
+
+        assert [level for level, _ in trace.commits()] == ["NORMAL"] * 3
+        # Restored after every write — the pragma never leaks past the block.
+        assert trace.statements.count("PRAGMA synchronous=FULL") == 3
+        assert _sync_level(registry) == 2
+
+    def test_duplicate_check_short_circuit_restores_full(self, registry: MetadataRegistry) -> None:
+        registry.register_filing(_filing(1), chunk_count=1)
+        assert registry.register_filing_if_new(_filing(1), chunk_count=1) is False
+        assert _sync_level(registry) == 2
+
+    def test_failed_ingest_write_restores_full(self, registry: MetadataRegistry) -> None:
+        registry.register_filing(_filing(1), chunk_count=1)
+        with pytest.raises(DatabaseError):
+            registry.register_filing(_filing(1), chunk_count=1)
+        assert registry._conn.in_transaction is False
+        assert _sync_level(registry) == 2
+
+    @pytest.mark.security
+    def test_stray_open_transaction_is_rolled_back_not_committed_under_normal(
+        self,
+        registry: MetadataRegistry,
+    ) -> None:
+        """A transaction the block's caller leaves open (a failed commit *and*
+        rollback) is rolled back before FULL is restored, so no later write
+        can join it and commit under NORMAL."""
+        with registry._lock:
+            registry._conn.execute("CREATE TABLE stray (v INTEGER)")
+            with registry._relaxed_sync_locked():
+                registry._conn.execute("INSERT INTO stray VALUES (1)")
+                assert registry._conn.in_transaction is True
+            assert registry._conn.in_transaction is False
+            assert registry._conn.execute("SELECT COUNT(*) FROM stray").fetchone()[0] == 0
+        assert _sync_level(registry) == 2
+
+    def test_no_relaxation_without_wal(self) -> None:
+        """``NORMAL`` under a rollback journal can corrupt on power loss, so
+        the relaxation is a no-op wherever WAL did not engage."""
+        registry = MetadataRegistry(db_path=":memory:")  # in-memory refuses WAL
+        try:
+            assert registry._wal is False
+            trace = _CommitTrace(registry)
+            registry.register_filing(_filing(1), chunk_count=1)
+            assert [level for level, _ in trace.commits()] == ["FULL"]
+            assert not any("NORMAL" in stmt for stmt in trace.statements)
+        finally:
+            registry.close()
+
+    @pytest.mark.security
+    def test_account_and_credential_writes_commit_under_full(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The user store and the admin credential store share this
+        connection.  Interleaved with relaxed ingest writes, every
+        transaction that touches ``users`` or ``provider_credentials`` must
+        still commit under FULL — a password change, user delete or key
+        rotation rolled back by a power loss is a security regression."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "chroma").mkdir()
+        db_settings = DatabaseSettings(
+            chroma_path="./chroma",
+            metadata_db_path="./meta.sqlite",
+            encryption_key="unit-test-key-not-a-secret",
+            persist_provider_credentials=True,
+        )
+        registry = MetadataRegistry(
+            db_path=db_settings.metadata_db_path,
+            encryption_key=db_settings.encryption_key,
+        )
+        registry._encrypted = True  # pysqlcipher3 is absent in CI
+        try:
+            users = UserStore(
+                registry,
+                api_settings=ApiSettings(auth_pepper="pepper-not-a-secret"),
+                db_settings=db_settings,
+            )
+            creds = EncryptedCredentialStore(registry, settings=db_settings)
+            trace = _CommitTrace(registry)
+
+            # An account write first, before any ingest write has run the
+            # relax/restore cycle — a wrong connection default shows here.
+            user_id = users.create_user(
+                username="alice",
+                salt_m=b"s" * SALT_BYTES,
+                auth_proof=b"a" * 32,
+                ciphertext_vault=b"ct",
+                vault_iv=b"i" * 12,
+                kdf_algo="pbkdf2-sha256",
+                pbkdf2_iterations=600_000,
+                enrolment_nonce="nonce-1",
+            )
+            registry.register_filing(_filing(1), chunk_count=1)
+            registry.register_filing_if_new(_filing(2), chunk_count=1)
+            assert users.consume_enrolment_nonce(user_id, "nonce-1") is True
+            _save_sample_task(registry)
+            assert users.update_vault(user_id, ciphertext_vault=b"ct2", vault_iv=b"j" * 12)
+            registry.register_filing(_filing(3), chunk_count=1)
+            assert users.update_password(
+                user_id,
+                salt_m=b"t" * SALT_BYTES,
+                auth_proof=b"b" * 32,
+                ciphertext_vault=b"ct3",
+                vault_iv=b"k" * 12,
+                kdf_algo="pbkdf2-sha256",
+                pbkdf2_iterations=600_000,
+            )
+            with pytest.raises(AuthError):
+                users.verify_login("alice", b"wrong-proof-wrong-proof-wrong-pr")
+            registry.register_filing(_filing(4), chunk_count=1)
+            admin_key = "sk-test-not-a-real-key-000"  # pragma: allowlist secret
+            creds.set("__admin__", "openai", admin_key)
+            _save_sample_task(registry, task_id="task-2")
+            assert creds.delete("__admin__", "openai") is True
+            assert users.delete_user(user_id) is True
+
+            commits = trace.commits()
+            account = [
+                level
+                for level, stmts in commits
+                if any("USERS" in s or "PROVIDER_CREDENTIALS" in s for s in stmts)
+            ]
+            ingest = [
+                level
+                for level, stmts in commits
+                if any("FILINGS" in s or "TASK_HISTORY" in s for s in stmts)
+            ]
+            # Non-vacuous: create, nonce, vault, password, lockout counter,
+            # delete + credential set/delete all committed (8 txns).
+            assert len(account) == 8
+            assert set(account) == {"FULL"}
+            assert len(ingest) == 6
+            assert set(ingest) == {"NORMAL"}
+        finally:
+            registry.close()
 
 
 # ---------------------------------------------------------------------------

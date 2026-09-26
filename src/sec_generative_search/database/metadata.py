@@ -29,6 +29,8 @@ import re
 import sqlite3
 import threading
 import types
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,6 +57,13 @@ from sec_generative_search.database.migrations import (
 
 logger = get_logger(__name__)
 
+
+# Busy-handler budget (ms) for a contended write lock — a second process
+# (``sec-rag manage …`` while the API runs, the demo-reset Job) then makes
+# a write wait instead of failing with ``database is locked``.  Both the
+# stdlib driver and pysqlcipher3 already default to 5 s via
+# ``connect(timeout=5.0)``; the explicit pragma pins it driver-independently.
+_BUSY_TIMEOUT_MS = 5000
 
 # Columns a caller may sort ``list_filings`` by, mapped to their literal
 # SQL identifiers.  The mapping is the trust boundary for the sort clause:
@@ -256,7 +265,9 @@ class MetadataRegistry:
 
         Opens a single persistent SQLite connection that is reused across
         all method calls, protected by a threading lock.  WAL journal mode
-        is enabled for better concurrent read/write performance.
+        is enabled for better concurrent read/write performance, with a
+        5 s busy timeout and ``synchronous=FULL`` except around the
+        registry's own ingest writes (:meth:`_relaxed_sync_locked`).
 
         When *encryption_key* is provided (or ``DB_ENCRYPTION_KEY`` is set),
         the connection uses ``pysqlcipher3`` and issues ``PRAGMA key``
@@ -303,7 +314,21 @@ class MetadataRegistry:
             logger.debug("SQLCipher PRAGMA key applied")
 
         self._conn.row_factory = self._sqlite_module.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        journal_mode = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        self._wal = str(journal_mode).lower() == "wal"
+        if not self._wal:
+            logger.warning(
+                "SQLite WAL journal mode unavailable (journal_mode=%s); "
+                "ingest writes keep synchronous=FULL",
+                journal_mode,
+            )
+        # FULL is the connection default for every transaction: the user
+        # store and the admin credential store share this connection, and
+        # a password change, user delete or vault write must survive a
+        # power loss.  Only the registry's own ingest writes relax it — see
+        # :meth:`_relaxed_sync_locked`.
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._lock = threading.Lock()
 
         self._encrypted = self._encryption_key is not None and self._sqlite_module is not sqlite3
@@ -335,6 +360,38 @@ class MetadataRegistry:
     def encrypted(self) -> bool:
         """Whether the database connection is using SQLCipher encryption."""
         return self._encrypted
+
+    @contextmanager
+    def _relaxed_sync_locked(self) -> Iterator[None]:
+        """Commit one registry-owned ingest transaction under ``synchronous=NORMAL``.
+
+        Caller MUST hold ``self._lock`` and MUST open the transaction
+        *inside* this block — ``with self._lock, self._relaxed_sync_locked(),
+        self._conn:`` — so the commit lands before ``FULL`` is restored.
+
+        Scoped to the per-filing ingest writes (``register_filing*``,
+        ``save_task_history``), where the WAL fsync is the whole commit
+        cost.  Under WAL, ``NORMAL`` stays consistent after a crash and
+        durable across a process crash; a power loss may drop the last
+        commits.  That trade is acceptable for re-ingestable filing rows,
+        not for account or credential rows, so ``UserStore`` and
+        ``EncryptedCredentialStore`` never enter this block.  A no-op
+        without WAL — ``NORMAL`` under a rollback journal can corrupt.
+        """
+        if not self._wal:
+            yield
+            return
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            yield
+        finally:
+            # A transaction left open by a failed commit *and* rollback must
+            # not be joined by a later write under NORMAL.  Current SQLite
+            # refuses the pragma below inside a transaction; the SQLite
+            # 3.15 bundled with the image's SQLCipher accepts it.
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            self._conn.execute("PRAGMA synchronous=FULL")
 
     def _initialise_schema(self) -> None:
         """Bootstrap the schema-version table, run migrations, create tables.
@@ -523,7 +580,7 @@ class MetadataRegistry:
         ingested_at = datetime.now(UTC).isoformat()
 
         try:
-            with self._lock, self._conn:
+            with self._lock, self._relaxed_sync_locked(), self._conn:
                 self._conn.execute(
                     sql,
                     (
@@ -584,7 +641,7 @@ class MetadataRegistry:
         ingested_at = datetime.now(UTC).isoformat()
 
         try:
-            with self._lock, self._conn:
+            with self._lock, self._relaxed_sync_locked(), self._conn:
                 exists = self._conn.execute(
                     sql_check,
                     (filing_id.accession_number,),
@@ -1143,7 +1200,7 @@ class MetadataRegistry:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         try:
-            with self._lock, self._conn:
+            with self._lock, self._relaxed_sync_locked(), self._conn:
                 self._conn.execute(
                     sql,
                     (
