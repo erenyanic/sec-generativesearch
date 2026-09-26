@@ -10,9 +10,9 @@
 //      URL (`http://`, `https://`, `//cdn…`).
 //   2. No production dependency in `package.json` is a known
 //      remote-script loader (analytics, tag manager, CDN font shim).
-//      The current dependency set is `@tanstack/react-query`, `next`,
-//      `react`, `react-dom`, `recharts` — none of those load external
-//      resources at runtime. Update this allow-list with eyes open.
+//      The current dependency set is `next`, `react`, `react-dom` —
+//      none of those load external resources at runtime. Update this
+//      allow-list with eyes open.
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
@@ -64,13 +64,7 @@ describe("external-asset audit", () => {
       readFileSync(path.resolve(repoRoot, "package.json"), "utf-8"),
     ) as { dependencies?: Record<string, string> };
     const deps = Object.keys(pkg.dependencies ?? {});
-    const ALLOW = new Set([
-      "@tanstack/react-query",
-      "next",
-      "react",
-      "react-dom",
-      "recharts",
-    ]);
+    const ALLOW = new Set(["next", "react", "react-dom"]);
     const newcomers = deps.filter((name) => !ALLOW.has(name));
     // A new runtime dep is not necessarily a violation — it is a
     // deliberate, security-reviewed change. Force the reviewer to
