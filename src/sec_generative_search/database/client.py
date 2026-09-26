@@ -282,12 +282,20 @@ class ChromaDBClient:
         — the orchestrator's docstring contract says the storage layer
         must reject rather than silently writing chunks without vectors.
 
+        Chroma rejects an ``add`` above ``get_max_batch_size()`` records
+        (5 461 on chromadb 1.5.9) as a whole, so the write is sliced to
+        that size.  One ``add`` is atomic but the sequence is not: when a
+        later slice fails, the slices already written are deleted again
+        before the error propagates, keeping the call all-or-nothing —
+        neither ``FilingStore`` path rolls ChromaDB back on a ChromaDB
+        failure.
+
         Args:
             processed_filing: Output from :class:`PipelineOrchestrator`.
 
         Raises:
-            DatabaseError: Storage failed or ``processed_filing`` has no
-                embeddings.
+            DatabaseError: Storage failed, ``processed_filing`` has no
+                embeddings, or two chunks share an ID.
         """
         if processed_filing.embeddings is None:
             raise DatabaseError(
@@ -304,13 +312,26 @@ class ChromaDBClient:
         documents = [chunk.content for chunk in chunks]
         metadatas = [chunk.to_metadata() for chunk in chunks]
 
-        try:
-            self._collection.add(
-                ids=ids,
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=metadatas,
+        # A single ``add`` raises on a duplicate ID; across slices a repeat
+        # would be a silent no-op (Chroma skips existing IDs) and store
+        # fewer chunks than the registry records.  Keep the loud failure.
+        if len(set(ids)) != len(ids):
+            raise DatabaseError(
+                f"Refusing to store filing {filing_id.accession_number}: duplicate chunk IDs."
             )
+
+        written = 0
+        try:
+            step = self._client.get_max_batch_size()
+            for start in range(0, len(ids), step):
+                end = start + step
+                self._collection.add(
+                    ids=ids[start:end],
+                    embeddings=embeddings[start:end],
+                    documents=documents[start:end],
+                    metadatas=metadatas[start:end],
+                )
+                written = min(end, len(ids))
             logger.info(
                 "Stored %d chunks for %s %s (%s)",
                 len(chunks),
@@ -319,10 +340,34 @@ class ChromaDBClient:
                 filing_id.date_str,
             )
         except Exception as e:
+            if written:
+                self._rollback_partial_add(ids[:written], filing_id.accession_number)
             raise DatabaseError(
                 f"Failed to store filing {filing_id.accession_number}",
                 details=str(e),
             ) from e
+
+    def _rollback_partial_add(self, ids: list[str], accession_number: str) -> None:
+        """Best-effort delete of the slices a failed :meth:`store_filing` wrote.
+
+        Never raises — the caller re-raises the original failure, which
+        is the root cause.  ``delete(ids=…)`` is not batch-capped.
+        """
+        try:
+            self._collection.delete(ids=ids)
+            logger.info(
+                "Rolled back %d partially stored chunk(s) for %s",
+                len(ids),
+                accession_number,
+            )
+        except Exception as exc:
+            logger.error(
+                "Rollback of %d partially stored chunk(s) failed for %s (%s) — "
+                "ChromaDB may hold orphan chunks that the next delete will clean up",
+                len(ids),
+                accession_number,
+                type(exc).__name__,
+            )
 
     def delete_filing(self, accession_number: str) -> None:
         """Delete all chunks belonging to a filing by accession number."""

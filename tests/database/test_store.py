@@ -404,6 +404,60 @@ class TestStoreFilingFaults:
 # ---------------------------------------------------------------------------
 
 
+class _FailSecondAdd:
+    """Delegate to the real collection but fail its second ``add``."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._adds = 0
+
+    def add(self, **kwargs: Any) -> Any:
+        self._adds += 1
+        if self._adds == 2:
+            raise RuntimeError("simulated chroma add failure")
+        return self._inner.add(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class TestMultiSliceStoreFaults:
+    """A ChromaDB failure after some slices landed leaves *both* stores empty (F23).
+
+    Neither path's own rollback covers it — the atomic path only undoes the
+    SQLite claim and the carry-over path undoes nothing on a ChromaDB
+    failure — so ``ChromaDBClient.store_filing`` must clean up its slices.
+    """
+
+    @pytest.mark.security
+    @pytest.mark.parametrize("register_if_new", [True, False])
+    def test_partial_chroma_write_leaves_no_orphans(
+        self,
+        store: FilingStore,
+        chroma: ChromaDBClient,
+        registry: MetadataRegistry,
+        stamp: EmbedderStamp,
+        monkeypatch: pytest.MonkeyPatch,
+        register_if_new: bool,
+    ) -> None:
+        monkeypatch.setattr(chroma._client, "get_max_batch_size", lambda: 2)
+        real_collection = chroma._collection
+        chroma._collection = _FailSecondAdd(real_collection)
+        pf = _make_processed_filing(stamp, n_chunks=5)
+
+        with pytest.raises(DatabaseError, match="Failed to store filing"):
+            store.store_filing(pf, register_if_new=register_if_new)
+
+        assert chroma.collection_count() == 0
+        assert registry.count() == 0
+
+        # Nothing half-written blocks the retry.
+        chroma._collection = real_collection
+        assert store.store_filing(pf, register_if_new=register_if_new) is True
+        assert chroma.collection_count() == 5
+        assert registry.count() == 1
+
+
 class TestDeleteFiling:
     def test_delete_filing_removes_both_stores(
         self,

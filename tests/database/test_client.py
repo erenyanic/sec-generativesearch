@@ -12,6 +12,8 @@ speed gain.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,7 @@ from sec_generative_search.core.exceptions import (
     DatabaseError,
     EmbeddingCollectionMismatchError,
 )
+from sec_generative_search.core.logging import configure_logging
 from sec_generative_search.core.types import (
     Chunk,
     ContentType,
@@ -405,6 +408,159 @@ class TestStoreAndQuery:
     ) -> None:
         client = ChromaDBClient(openai_stamp, chroma_path=chroma_path)
         client.delete_filings_batch([])
+        assert client.collection_count() == 0
+
+
+class FaultyCollection:
+    """Delegate to a real collection; fail the Nth ``add`` and optionally every ``delete``.
+
+    A wrapper rather than a monkeypatch: the Chroma collection object is a
+    model whose attributes are not reliably patchable.
+    """
+
+    def __init__(self, inner: Any, *, fail_add_call: int = 0, fail_delete: bool = False) -> None:
+        self._inner = inner
+        self._fail_add_call = fail_add_call
+        self._fail_delete = fail_delete
+        self.add_sizes: list[int] = []
+        self.delete_calls = 0
+
+    def add(self, **kwargs: Any) -> Any:
+        self.add_sizes.append(len(kwargs["ids"]))
+        if len(self.add_sizes) == self._fail_add_call:
+            raise RuntimeError("simulated chroma add failure")
+        return self._inner.add(**kwargs)
+
+    def delete(self, **kwargs: Any) -> Any:
+        self.delete_calls += 1
+        if self._fail_delete:
+            raise RuntimeError("simulated chroma delete failure")
+        return self._inner.delete(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def cap_batch(client: ChromaDBClient, monkeypatch: pytest.MonkeyPatch, size: int) -> None:
+    """Shrink the client's reported batch cap so slicing runs on a few chunks."""
+    monkeypatch.setattr(client._client, "get_max_batch_size", lambda: size)
+
+
+@pytest.fixture
+def pkg_log_records(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """Surface package records to ``caplog`` (the package logger does not propagate)."""
+    configure_logging()
+    pkg_logger = logging.getLogger("sec_generative_search")
+    previous = pkg_logger.propagate
+    pkg_logger.propagate = True
+    caplog.set_level(logging.INFO, logger="sec_generative_search")
+    try:
+        yield caplog
+    finally:
+        pkg_logger.propagate = previous
+
+
+class TestBatchedStore:
+    """``store_filing`` slices by Chroma's batch cap and stays all-or-nothing (F23)."""
+
+    def test_filing_above_the_chroma_batch_cap_is_stored_whole(
+        self, openai_stamp: EmbedderStamp, chroma_path: str
+    ) -> None:
+        client = ChromaDBClient(openai_stamp, chroma_path=chroma_path)
+        cap = client._client.get_max_batch_size()
+        n_chunks = cap + 1  # the smallest filing a single add refuses whole
+        client.store_filing(_make_processed_filing(openai_stamp, n_chunks=n_chunks))
+        assert client.collection_count() == n_chunks
+
+    def test_slices_never_exceed_the_reported_cap(
+        self,
+        openai_stamp: EmbedderStamp,
+        chroma_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = ChromaDBClient(openai_stamp, chroma_path=chroma_path)
+        cap_batch(client, monkeypatch, 2)
+        proxy = FaultyCollection(client._collection)
+        client._collection = proxy
+        client.store_filing(_make_processed_filing(openai_stamp, n_chunks=5))
+        assert proxy.add_sizes == [2, 2, 1]
+        assert client.collection_count() == 5
+
+    @pytest.mark.security
+    def test_mid_sequence_failure_rolls_back_the_written_slices(
+        self,
+        openai_stamp: EmbedderStamp,
+        chroma_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Orphan chunks would be retrievable with no registry row — outside
+        retention eviction and the ``DB_MAX_FILINGS`` ceiling."""
+        client = ChromaDBClient(openai_stamp, chroma_path=chroma_path)
+        cap_batch(client, monkeypatch, 2)
+        proxy = FaultyCollection(client._collection, fail_add_call=2)
+        client._collection = proxy
+
+        with pytest.raises(DatabaseError, match="Failed to store filing") as excinfo:
+            client.store_filing(_make_processed_filing(openai_stamp, n_chunks=5))
+
+        assert isinstance(excinfo.value.__cause__, RuntimeError)
+        assert proxy.delete_calls == 1
+        assert client.collection_count() == 0
+
+    def test_first_slice_failure_needs_no_rollback(
+        self,
+        openai_stamp: EmbedderStamp,
+        chroma_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = ChromaDBClient(openai_stamp, chroma_path=chroma_path)
+        cap_batch(client, monkeypatch, 2)
+        proxy = FaultyCollection(client._collection, fail_add_call=1)
+        client._collection = proxy
+
+        with pytest.raises(DatabaseError):
+            client.store_filing(_make_processed_filing(openai_stamp, n_chunks=5))
+
+        assert proxy.delete_calls == 0
+        assert client.collection_count() == 0
+
+    def test_rollback_failure_never_masks_the_original_error(
+        self,
+        openai_stamp: EmbedderStamp,
+        chroma_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        pkg_log_records: pytest.LogCaptureFixture,
+    ) -> None:
+        client = ChromaDBClient(openai_stamp, chroma_path=chroma_path)
+        cap_batch(client, monkeypatch, 2)
+        client._collection = FaultyCollection(client._collection, fail_add_call=2, fail_delete=True)
+
+        with pytest.raises(DatabaseError) as excinfo:
+            client.store_filing(_make_processed_filing(openai_stamp, n_chunks=5))
+
+        assert str(excinfo.value.__cause__) == "simulated chroma add failure"
+        failures = [r for r in pkg_log_records.records if r.levelno == logging.ERROR]
+        assert len(failures) == 1
+        rendered = failures[0].getMessage()
+        assert "RuntimeError" in rendered
+        # Exception type only — driver text never reaches the log line.
+        assert "simulated chroma delete failure" not in rendered
+
+    def test_duplicate_chunk_ids_are_refused_before_any_write(
+        self,
+        openai_stamp: EmbedderStamp,
+        chroma_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One ``add`` refuses duplicate IDs; across slices a repeat would be a
+        silent no-op and store fewer chunks than the registry records."""
+        client = ChromaDBClient(openai_stamp, chroma_path=chroma_path)
+        cap_batch(client, monkeypatch, 2)
+        pf = _make_processed_filing(openai_stamp, n_chunks=3)
+        pf.chunks[2].chunk_index = 0  # same ID as chunk 0, in a later slice
+
+        with pytest.raises(DatabaseError, match="duplicate chunk IDs"):
+            client.store_filing(pf)
         assert client.collection_count() == 0
 
 
