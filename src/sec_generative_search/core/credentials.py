@@ -132,10 +132,17 @@ _DEFAULT_SESSION_TTL_SECONDS = 60 * 60  # one hour
 
 @dataclass
 class _SessionEntry:
-    """One session's credentials.  Mutable; held only inside the store's lock."""
+    """One session's credentials.  Mutable; held only inside the store's lock.
+
+    ``user_id`` is the user-tier login bound to the session (``None`` for an
+    operator / anonymous session).  It rides the entry so every seam that
+    drops the session — :meth:`InMemorySessionCredentialStore.clear`, TTL
+    eviction, the global sweep — drops the binding in the same step.
+    """
 
     credentials: dict[str, str] = field(default_factory=dict)
     last_touched: float = 0.0
+    user_id: int | None = None
 
 
 class InMemorySessionCredentialStore:
@@ -167,6 +174,13 @@ class InMemorySessionCredentialStore:
             sessions are swept at TTL by :meth:`_maybe_sweep_locked`, but
             there is no cap on genuinely-active concurrent sessions.  Higher
             layers own rate-limiting session minting if a hard cap is needed.
+
+    Session → user binding: :meth:`bind_user` / :meth:`user_for` /
+    :meth:`unbind_user` attach the user-tier login to the session's entry
+    (not part of :class:`CredentialStore`).  The binding shares the entry's
+    sliding TTL and sweep, and :meth:`clear` drops it with the credentials,
+    so a rotated, logged-out or abandoned ``session_id`` can never keep
+    authorising user-tier writes.
 
     Audit logging: :meth:`set` and :meth:`delete` emit structured
     audit-log entries with the session-id tail and the masked
@@ -315,7 +329,9 @@ class InMemorySessionCredentialStore:
                 removed = False
             else:
                 removed = entry.credentials.pop(provider, None) is not None
-                if not entry.credentials:
+                # A bound entry outlives its last credential — deleting a
+                # provider key must not sign the user out.
+                if not entry.credentials and entry.user_id is None:
                     del self._sessions[key_id]
         if removed:
             audit_log(
@@ -336,6 +352,11 @@ class InMemorySessionCredentialStore:
             return set(entry.credentials.keys())
 
     def clear(self, key_id: str) -> int:
+        """Drop the whole session — credentials **and** any user binding.
+
+        Returns the number of credentials removed (the binding is not
+        counted).
+        """
         with self._lock:
             self._maybe_sweep_locked()
             entry = self._sessions.pop(key_id, None)
@@ -351,6 +372,52 @@ class InMemorySessionCredentialStore:
                 ),
             )
         return count
+
+    # ------------------------------------------------------------------
+    # Session → user binding (user tier; outside the CredentialStore protocol)
+    # ------------------------------------------------------------------
+
+    def bind_user(self, key_id: str, user_id: int) -> None:
+        """Bind a user-tier login to the session, replacing any prior binding."""
+        with self._lock:
+            self._maybe_sweep_locked()
+            self._evict_if_expired(key_id)
+            entry = self._sessions.get(key_id)
+            if entry is None:
+                entry = _SessionEntry()
+                self._sessions[key_id] = entry
+            entry.user_id = user_id
+            self._touch(entry)
+
+    def user_for(self, key_id: str) -> int | None:
+        """Return the bound user id, or ``None`` if unbound / expired.
+
+        A hit refreshes the sliding TTL, as a credential read does.
+        """
+        with self._lock:
+            self._maybe_sweep_locked()
+            self._evict_if_expired(key_id)
+            entry = self._sessions.get(key_id)
+            if entry is None or entry.user_id is None:
+                return None
+            self._touch(entry)
+            return entry.user_id
+
+    def unbind_user(self, key_id: str) -> bool:
+        """Drop the session's user binding.  Returns ``True`` iff one existed.
+
+        Credentials stay; an entry left with neither is removed.
+        """
+        with self._lock:
+            self._maybe_sweep_locked()
+            self._evict_if_expired(key_id)
+            entry = self._sessions.get(key_id)
+            if entry is None or entry.user_id is None:
+                return False
+            entry.user_id = None
+            if not entry.credentials:
+                del self._sessions[key_id]
+            return True
 
 
 # ---------------------------------------------------------------------------

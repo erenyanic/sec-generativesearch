@@ -39,6 +39,7 @@ from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.credentials import (
     ApiKeyResolver,
     CredentialStore,
+    InMemorySessionCredentialStore,
     chain_resolvers,
     encrypted_user_resolver,
     session_resolver,
@@ -311,7 +312,7 @@ def get_retrieval_service(request: Request) -> RetrievalService:
     return request.app.state.retrieval_service
 
 
-def get_session_store(request: Request) -> CredentialStore:
+def get_session_store(request: Request) -> InMemorySessionCredentialStore:
     return request.app.state.session_store
 
 

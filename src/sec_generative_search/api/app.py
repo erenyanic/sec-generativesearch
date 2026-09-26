@@ -172,8 +172,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     retrieval_service = RetrievalService(embedder=embedder, chroma_client=chroma)
 
     # 7. In-memory session credential store.  TTL mirrors the cookie's
-    # ``Max-Age`` so a credential cannot outlive the cookie that points
-    # at it (lazy eviction; no background thread).
+    # ``Max-Age`` so a credential — or the user-tier ``session_id →
+    # user_id`` binding it also carries — cannot outlive the cookie that
+    # points at it (lazy eviction; no background thread).
     session_store = InMemorySessionCredentialStore(
         ttl_seconds=settings.api.session_ttl_seconds,
     )
@@ -226,13 +227,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         login_username_window = _SlidingWindow(settings.api.rate_limit_login_per_username)
 
-    # 9c. ``session_id → user_id`` mapping for the user-tier routes.
-    # Process-local dict; entries evict on logout and on rotation.  The
-    # parallel ``session_store`` (provider-key cache) is keyed by
-    # ``session_id`` opaquely — this dict adds the typed link the auth
-    # follow-up routes need without widening that store's protocol.
-    session_user_index: dict[str, int] = {}
-
     # Background ingestion TaskManager. The fetcher / orchestrator chain
     # is built fresh per app — both are stateless apart from the
     # process-global ``edgar.set_identity`` mutation, which the manager
@@ -270,7 +264,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.encrypted_credential_store = encrypted_store
     app.state.user_store = user_store
     app.state.login_username_window = login_username_window
-    app.state.session_user_index = session_user_index
     app.state.task_manager = task_manager
 
     logger.info(

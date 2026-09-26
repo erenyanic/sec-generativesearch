@@ -107,7 +107,6 @@ def auth_app(auth_env: None):
     app.state.encrypted_credential_store = None
     app.state.user_store = user_store
     app.state.login_username_window = username_window
-    app.state.session_user_index = {}
 
     yield app
 
@@ -441,25 +440,137 @@ class TestVaultUpdate:
 
 @pytest.mark.security
 class TestSignOut:
-    def test_signout_clears_session_index(self, auth_app, auth_client: TestClient) -> None:
+    def test_signout_drops_the_session_user_binding(
+        self, auth_app, auth_client: TestClient
+    ) -> None:
         _enrol_user(auth_app, auth_proof=b"p" * 32)
-        auth_client.post(
+        login = auth_client.post(
             "/api/auth/login",
             json={"username": "alice", "auth_proof": _b64(b"p" * 32)},
         )
-        # The session_user_index must have an entry.
-        assert auth_app.state.session_user_index
-        # Sign out.
+        jar = SimpleCookie()
+        jar.load(login.headers["set-cookie"])
+        session_id = jar[SESSION_COOKIE_NAME].value
+        store: InMemorySessionCredentialStore = auth_app.state.session_store
+        # The binding must be resident first (non-vacuity).
+        assert store.user_for(session_id) is not None
         r = auth_client.delete("/api/auth/session")
         assert r.status_code == 200
         assert r.json()["cleared"] is True
-        # The index is now empty.
-        assert not auth_app.state.session_user_index
+        assert store.user_for(session_id) is None
+        assert session_id not in store._sessions
 
     def test_signout_without_session_is_idempotent(self, auth_client: TestClient) -> None:
         r = auth_client.delete("/api/auth/session")
         assert r.status_code == 200
         assert r.json()["cleared"] is False
+
+
+# ---------------------------------------------------------------------------
+# session → user binding lives in the session store and dies with it (F18)
+# ---------------------------------------------------------------------------
+
+
+def _minted_session_id(response) -> str:
+    """Read the freshly minted id out of the response ``Set-Cookie``."""
+    jar = SimpleCookie()
+    jar.load(response.headers["set-cookie"])
+    return jar[SESSION_COOKIE_NAME].value
+
+
+def _login_as_alice(auth_app, auth_client: TestClient) -> str:
+    _enrol_user(auth_app, auth_proof=b"p" * 32)
+    response = auth_client.post(
+        "/api/auth/login",
+        json={"username": "alice", "auth_proof": _b64(b"p" * 32)},
+    )
+    assert response.status_code == 200
+    return _minted_session_id(response)
+
+
+def _vault_update_as(auth_client: TestClient, session_id: str) -> int:
+    """Replay ``session_id`` alone against the proof-less vault write."""
+    auth_client.cookies.clear()
+    auth_client.cookies.set(SESSION_COOKIE_NAME, session_id)
+    response = auth_client.post(
+        "/api/auth/vault",
+        json={"ciphertext_vault": _b64(b"attacker-ct"), "vault_iv": _b64(b"\x01" * 12)},
+    )
+    return response.status_code
+
+
+@pytest.mark.security
+class TestSessionUserBindingLockstep:
+    """Every seam that revokes or rotates a ``session_id`` drops its user binding.
+
+    ``POST /api/auth/vault`` authorises on the binding alone (no proof), so a
+    binding that outlives its session lets a replayed cookie overwrite that
+    user's vault.  Before F18 the binding lived in a process-lifetime dict
+    that only ``auth.py`` maintained — the legacy ``session.py`` rotation
+    and logout seams never dropped it.
+    """
+
+    def test_bound_session_can_update_the_vault(self, auth_app, auth_client: TestClient) -> None:
+        # Non-vacuity control for the replays below.
+        session_id = _login_as_alice(auth_app, auth_client)
+        assert _vault_update_as(auth_client, session_id) == 200
+
+    def test_legacy_logout_unbinds_the_user(self, auth_app, auth_client: TestClient) -> None:
+        session_id = _login_as_alice(auth_app, auth_client)
+        assert auth_client.post("/api/session/logout").status_code == 200
+        assert _vault_update_as(auth_client, session_id) == 401
+
+    def test_legacy_rotation_unbinds_the_prior_session(
+        self, auth_app, auth_client: TestClient
+    ) -> None:
+        session_id = _login_as_alice(auth_app, auth_client)
+        rotated = auth_client.post("/api/session")
+        assert rotated.status_code == 201
+        assert _minted_session_id(rotated) != session_id
+        assert _vault_update_as(auth_client, session_id) == 401
+
+    def test_sign_out_unbinds_the_user(self, auth_app, auth_client: TestClient) -> None:
+        session_id = _login_as_alice(auth_app, auth_client)
+        response = auth_client.delete("/api/auth/session")
+        assert response.json() == {"cleared": True}
+        assert _vault_update_as(auth_client, session_id) == 401
+
+    def test_login_rotation_unbinds_the_prior_session(
+        self, auth_app, auth_client: TestClient
+    ) -> None:
+        session_id = _login_as_alice(auth_app, auth_client)
+        again = auth_client.post(
+            "/api/auth/login",
+            json={"username": "alice", "auth_proof": _b64(b"p" * 32)},
+        )
+        assert again.status_code == 200
+        assert _vault_update_as(auth_client, session_id) == 401
+
+    def test_expired_binding_is_a_401_not_a_500(self, auth_app, auth_client: TestClient) -> None:
+        now = [1000.0]
+        auth_app.state.session_store = InMemorySessionCredentialStore(
+            ttl_seconds=60, clock=lambda: now[0]
+        )
+        session_id = _login_as_alice(auth_app, auth_client)
+        now[0] += 61.0
+        assert _vault_update_as(auth_client, session_id) == 401
+
+    def test_deleting_the_last_session_key_keeps_the_user_signed_in(
+        self, auth_app, auth_client: TestClient
+    ) -> None:
+        session_id = _login_as_alice(auth_app, auth_client)
+        store: InMemorySessionCredentialStore = auth_app.state.session_store
+        store.set(session_id, "openai", "sk-test-not-a-real-key-000")  # pragma: allowlist secret
+        assert store.delete(session_id, "openai") is True
+        assert _vault_update_as(auth_client, session_id) == 200
+
+    def test_deleted_user_binding_is_dropped(self, auth_app, auth_client: TestClient) -> None:
+        session_id = _login_as_alice(auth_app, auth_client)
+        user_store: UserStore = auth_app.state.user_store
+        user_id = auth_app.state.session_store.user_for(session_id)
+        assert user_store.delete_user(user_id) is True
+        assert _vault_update_as(auth_client, session_id) == 401
+        assert auth_app.state.session_store.user_for(session_id) is None
 
 
 # ---------------------------------------------------------------------------

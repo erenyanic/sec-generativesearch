@@ -62,7 +62,7 @@ from sec_generative_search.api.schemas import (
     VaultUpdateResponse,
 )
 from sec_generative_search.config.settings import get_settings
-from sec_generative_search.core.credentials import CredentialStore
+from sec_generative_search.core.credentials import InMemorySessionCredentialStore
 from sec_generative_search.core.edgar_identity import InMemorySessionEdgarIdentityStore
 from sec_generative_search.core.exceptions import (
     AuthError,
@@ -318,7 +318,7 @@ async def login(
     response: Response,
     body: LoginRequest,
     store: UserStore | None = Depends(get_user_store),
-    session_store: CredentialStore = Depends(get_session_store),
+    session_store: InMemorySessionCredentialStore = Depends(get_session_store),
     edgar_store: InMemorySessionEdgarIdentityStore = Depends(get_edgar_identity_store),
     username_window: Any = Depends(get_login_username_window),
 ) -> LoginResponse:
@@ -358,13 +358,14 @@ async def login(
             message="Database error during login.",
         ) from exc
 
-    # Rotate any prior session: clear stored credentials AND the EDGAR
-    # identity under the old ``session_id``, then mint a fresh one.
-    # Mirrors the established ``POST /api/session`` rotation contract —
-    # the two stores are keyed identically and MUST be cleared in
-    # lockstep, otherwise a rotated cookie leaves the prior session's
-    # ``(name, email)`` PII resident until its independent TTL sweep.
-    # The delete keys off ``prior``, never the freshly minted id.
+    # Rotate any prior session: clear stored credentials (and with them
+    # any user binding) AND the EDGAR identity under the old
+    # ``session_id``, then mint a fresh one.  Mirrors the established
+    # ``POST /api/session`` rotation contract — the two stores are keyed
+    # identically and MUST be cleared in lockstep, otherwise a rotated
+    # cookie leaves the prior session's ``(name, email)`` PII resident
+    # until its independent TTL sweep.  The delete keys off ``prior``,
+    # never the freshly minted id.
     prior = extract_session_id(request)
     if prior is not None:
         session_store.clear(prior)
@@ -376,14 +377,10 @@ async def login(
 
     # Bind ``session_id → user_id`` so authenticated follow-up routes
     # (password change, vault update) can resolve the user without a
-    # second auth round-trip. The index is a process-local dict; the
-    # next mint that rotates the cookie evicts the prior entry via the
-    # ``prior`` lookup above.
-    index = getattr(request.app.state, "session_user_index", None)
-    if index is not None:
-        if prior is not None:
-            index.pop(prior, None)
-        index[session_id] = payload.user_id
+    # second auth round-trip.  The binding rides the session's store
+    # entry: it shares the cookie's TTL and sweep, and every seam that
+    # clears the session (both routers' rotation + logout) drops it.
+    session_store.bind_user(session_id, payload.user_id)
 
     audit_log(
         "login_success_wire",
@@ -498,14 +495,17 @@ async def complete_enrolment(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_active_user(request: Request, user_store: UserStore) -> tuple[int, str]:
+def _resolve_active_user(
+    request: Request,
+    user_store: UserStore,
+    session_store: InMemorySessionCredentialStore,
+) -> tuple[int, str]:
     """Return ``(user_id, username)`` for the active session.
 
     The route leans on the same ``session_id`` cookie as the existing
-    session-lifecycle routes; the mapping from cookie → user_id lives
-    in ``app.state.session_user_index``. Until the session store grows
-    a typed "logged-in user" field we look up the user by reading that
-    dict. If the resolution fails, we surface a hard 401.
+    session-lifecycle routes; the cookie → user_id binding lives on the
+    session's entry in the in-memory session store (``bind_user`` at
+    login).  An unbound, expired or swept session is a hard 401.
     """
     session_id = extract_session_id(request)
     if session_id is None:
@@ -514,19 +514,18 @@ def _resolve_active_user(request: Request, user_store: UserStore) -> tuple[int, 
             error="session_required",
             message="No active session.",
         )
-    index = getattr(request.app.state, "session_user_index", None)
-    if index is None or session_id not in index:
+    user_id = session_store.user_for(session_id)
+    if user_id is None:
         raise http_error(
             status_code=401,
             error="session_required",
             message="No active session.",
         )
-    user_id = index[session_id]
     record = user_store.get_by_id(user_id)
     if record is None:
         # The row was deleted out from under us.  Drop the stale
-        # session entry and force re-login.
-        index.pop(session_id, None)
+        # binding and force re-login.
+        session_store.unbind_user(session_id)
         raise http_error(
             status_code=401,
             error="session_required",
@@ -545,12 +544,13 @@ async def change_password(
     request: Request,
     body: PasswordChangeRequest,
     store: UserStore | None = Depends(get_user_store),
+    session_store: InMemorySessionCredentialStore = Depends(get_session_store),
 ) -> PasswordChangeResponse:
     """Validate ``auth_proof_old``, then atomically rotate salt + hash + vault."""
     user_store = _require_user_store(store)
     _require_pepper()
 
-    user_id, username = _resolve_active_user(request, user_store)
+    user_id, username = _resolve_active_user(request, user_store, session_store)
 
     proof_old = _b64url_decode_fixed(body.auth_proof_old, _AUTH_PROOF_BYTES, field="auth_proof_old")
     proof_new = _b64url_decode_fixed(body.auth_proof_new, _AUTH_PROOF_BYTES, field="auth_proof_new")
@@ -606,7 +606,7 @@ async def change_password(
 async def sign_out(
     request: Request,
     response: Response,
-    session_store: CredentialStore = Depends(get_session_store),
+    session_store: InMemorySessionCredentialStore = Depends(get_session_store),
     edgar_store: InMemorySessionEdgarIdentityStore = Depends(get_edgar_identity_store),
 ) -> dict[str, bool]:
     """Sign-out: revoke the session in lockstep with the cookie.
@@ -626,11 +626,11 @@ async def sign_out(
     session_id = extract_session_id(request)
     cleared = False
     if session_id is not None:
+        # ``cleared`` reports the user binding; read it before ``clear``
+        # drops the whole entry.
+        cleared = session_store.unbind_user(session_id)
         session_store.clear(session_id)
         edgar_store.delete(session_id)
-        index = getattr(request.app.state, "session_user_index", None)
-        if index is not None:
-            cleared = index.pop(session_id, None) is not None
     _clear_session_cookie(response)
     return {"cleared": cleared}
 
@@ -650,6 +650,7 @@ async def update_vault(
     request: Request,
     body: VaultUpdateRequest,
     store: UserStore | None = Depends(get_user_store),
+    session_store: InMemorySessionCredentialStore = Depends(get_session_store),
 ) -> VaultUpdateResponse:
     """Replace the ciphertext + IV under the active session's user_id.
 
@@ -660,7 +661,7 @@ async def update_vault(
     breaks confidentiality and integrity).
     """
     user_store = _require_user_store(store)
-    user_id, _ = _resolve_active_user(request, user_store)
+    user_id, _ = _resolve_active_user(request, user_store, session_store)
 
     iv = _b64url_decode_fixed(body.vault_iv, _VAULT_IV_BYTES, field="vault_iv")
     ciphertext = _b64url_decode_variable(

@@ -76,7 +76,6 @@ def admin_app(admin_env: None):
     app.state.encrypted_credential_store = None
     app.state.user_store = user_store
     app.state.login_username_window = None
-    app.state.session_user_index = {}
     yield app
     registry.close()
 

@@ -283,6 +283,106 @@ class TestInMemorySessionCredentialStoreGlobalSweep:
         assert "abandoned" not in store._sessions
 
 
+class TestSessionUserBinding:
+    """The user-tier ``session_id → user_id`` binding rides the session entry (F18).
+
+    Before F18 it lived in a process-lifetime dict on ``app.state`` that no
+    sweep reached — an abandoned login stayed bound forever.
+    """
+
+    def test_bind_and_resolve(self) -> None:
+        store = InMemorySessionCredentialStore()
+        assert store.user_for("s") is None
+        store.bind_user("s", 7)
+        assert store.user_for("s") == 7
+        # A binding is not a credential.
+        assert store.list_providers("s") == set()
+        assert store.get("s", "openai") is None
+
+    def test_rebind_replaces(self) -> None:
+        store = InMemorySessionCredentialStore()
+        store.bind_user("s", 7)
+        store.bind_user("s", 8)
+        assert store.user_for("s") == 8
+
+    @pytest.mark.security
+    def test_clear_drops_the_binding_with_the_credentials(self) -> None:
+        """Every rotation / logout seam calls ``clear`` — so it unbinds too."""
+        store = InMemorySessionCredentialStore()
+        store.bind_user("s", 7)
+        store.set("s", "openai", "sk-aaaaaaaaaaaa")
+        assert store.clear("s") == 1  # counts credentials, not the binding
+        assert store.user_for("s") is None
+        assert "s" not in store._sessions
+
+    def test_clear_of_a_binding_only_session_reports_zero(self) -> None:
+        store = InMemorySessionCredentialStore()
+        store.bind_user("s", 7)
+        assert store.clear("s") == 0
+        assert store.user_for("s") is None
+
+    def test_deleting_the_last_credential_keeps_the_binding(self) -> None:
+        store = InMemorySessionCredentialStore()
+        store.bind_user("s", 7)
+        store.set("s", "openai", "sk-aaaaaaaaaaaa")
+        assert store.delete("s", "openai") is True
+        assert store.user_for("s") == 7
+
+    def test_unbind_keeps_credentials_and_reports(self) -> None:
+        store = InMemorySessionCredentialStore()
+        store.bind_user("s", 7)
+        store.set("s", "openai", "sk-aaaaaaaaaaaa")
+        assert store.unbind_user("s") is True
+        assert store.unbind_user("s") is False
+        assert store.user_for("s") is None
+        assert store.get("s", "openai") == "sk-aaaaaaaaaaaa"
+
+    def test_unbind_of_a_binding_only_session_drops_the_entry(self) -> None:
+        store = InMemorySessionCredentialStore()
+        store.bind_user("s", 7)
+        assert store.unbind_user("s") is True
+        assert "s" not in store._sessions
+
+    @pytest.mark.security
+    def test_binding_expires_at_ttl(self) -> None:
+        clock = _FakeClock()
+        store = InMemorySessionCredentialStore(ttl_seconds=10, clock=clock)
+        store.bind_user("s", 7)
+        clock.advance(11.0)
+        assert store.user_for("s") is None
+
+    @pytest.mark.security
+    def test_expired_binding_is_refused_between_sweeps(self) -> None:
+        """Per-key eviction, not only the amortised sweep, retires a binding."""
+        clock = _FakeClock()
+        store = InMemorySessionCredentialStore(ttl_seconds=10, clock=clock)
+        clock.advance(5.0)
+        store.bind_user("s", 7)
+        clock.advance(5.0)
+        store.get("other", "openai")  # sweep runs now; "s" is 5 s old and kept
+        clock.advance(6.0)  # "s" is 11 s old; the next sweep is 4 s away
+        assert store.user_for("s") is None
+
+    def test_resolving_the_binding_slides_the_ttl(self) -> None:
+        clock = _FakeClock()
+        store = InMemorySessionCredentialStore(ttl_seconds=10, clock=clock)
+        store.bind_user("s", 7)
+        clock.advance(8.0)
+        assert store.user_for("s") == 7  # refreshes
+        clock.advance(8.0)
+        assert store.user_for("s") == 7
+
+    @pytest.mark.security
+    def test_abandoned_binding_is_swept_without_being_accessed(self) -> None:
+        """Residency is bounded (at most 2 * TTL) even if the session never returns."""
+        clock = _FakeClock()
+        store = InMemorySessionCredentialStore(ttl_seconds=10, clock=clock)
+        store.bind_user("abandoned", 7)
+        clock.advance(11.0)
+        store.get("someone-else", "openai")  # an unrelated op fires the sweep
+        assert "abandoned" not in store._sessions
+
+
 # ---------------------------------------------------------------------------
 # Resolver chain
 # ---------------------------------------------------------------------------
