@@ -29,6 +29,7 @@
 // collapse two distinct UX flows.
 
 import {
+  memo,
   useCallback,
   useEffect,
   useId,
@@ -52,6 +53,7 @@ import type {
 import { ModelPicker, type ModelPickerValue } from "@/components/model-picker";
 import { formatUsd } from "@/lib/format";
 import { useBatchedStreamText } from "@/lib/use-batched-stream-text";
+import { AnswerBody, SourcePanel } from "./answer-parts";
 import { INITIAL_STATE, reducer, type InFlightState } from "./reducer";
 
 // One committed conversation turn. Mirrors the wire-tier
@@ -525,7 +527,12 @@ export default function ChatPage(): JSX.Element {
   );
 }
 
-function TurnCard({
+// Memoised: a committed turn is immutable (`setTurns([...prev, settled])`
+// keeps every earlier object) and its index only changes on Clear, so while
+// a later turn streams — one page render per animation frame — committed
+// cards skip reconciliation instead of costing O(turns) per frame
+// (OPTIMIZATIONS.md F30).
+const TurnCard = memo(function TurnCard({
   turn,
   index,
 }: {
@@ -596,7 +603,11 @@ function TurnCard({
       </div>
     </li>
   );
-}
+});
+
+// Shared empty list for the planning phase. An inline `[]` would be a new
+// reference on every render and silently defeat `PendingTurn`'s memo.
+const NO_CITATIONS: CitationSchema[] = [];
 
 function PendingTurn({
   state,
@@ -606,17 +617,19 @@ function PendingTurn({
   index: number;
 }): JSX.Element {
   const answer = state.kind === "streaming" ? state.answer : "";
+  // Keyed on the citations array, not `state`: every `STREAM_DELTA` makes a
+  // new `state` object but keeps the `citations` reference, so the map is
+  // rebuilt only when a citation actually arrives.
+  const citations = state.kind === "streaming" ? state.citations : NO_CITATIONS;
   const indexById = useMemo(() => {
     const map = new Map<number, CitationSchema>();
-    if (state.kind === "streaming") {
-      for (const citation of state.citations) {
-        if (citation.display_index > 0) {
-          map.set(citation.display_index, citation);
-        }
+    for (const citation of citations) {
+      if (citation.display_index > 0) {
+        map.set(citation.display_index, citation);
       }
     }
     return map;
-  }, [state]);
+  }, [citations]);
 
   return (
     <li
@@ -686,110 +699,4 @@ function ErrorPanel({
       ) : null}
     </div>
   );
-}
-
-// Inline `[N]` markers turn into clickable chips anchored at the turn-
-// scoped source panel below. Plain-text rendering only — same posture
-// as the Ask page (no Markdown / HTML sink).
-function AnswerBody({
-  answer,
-  citations,
-  turnId,
-}: {
-  answer: string;
-  citations: Map<number, CitationSchema>;
-  turnId: string;
-}): JSX.Element {
-  const segments = useMemo(() => splitAnswerByCitation(answer), [answer]);
-  return (
-    <p className="mt-1 whitespace-pre-wrap text-sm leading-relaxed text-slate-800">
-      {segments.map((segment, idx) => {
-        if (segment.kind === "text") {
-          return <span key={idx}>{segment.text}</span>;
-        }
-        const citation = citations.get(segment.index);
-        const label = `[${segment.index.toString()}]`;
-        const title =
-          citation !== undefined
-            ? `${citation.ticker} ${citation.form_type} ${citation.filing_date}`
-            : "unmatched citation";
-        return (
-          <a
-            key={idx}
-            href={`#citation-${turnId}-${segment.index.toString()}`}
-            title={title}
-            className="mx-0.5 rounded bg-slate-100 px-1 py-0.5 font-mono text-xs text-slate-700 hover:bg-slate-200"
-          >
-            {label}
-          </a>
-        );
-      })}
-    </p>
-  );
-}
-
-function SourcePanel({
-  citations,
-  turnId,
-}: {
-  citations: CitationSchema[];
-  turnId: string;
-}): JSX.Element {
-  return (
-    <details className="mt-3 rounded border border-slate-200 bg-slate-50">
-      <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-slate-700">
-        Sources ({citations.length.toString()})
-      </summary>
-      <ol className="space-y-2 px-3 pb-3">
-        {citations.map((citation, idx) => (
-          <li
-            key={`${citation.chunk_id}-${idx.toString()}`}
-            id={`citation-${turnId}-${citation.display_index.toString()}`}
-            className="rounded border border-slate-200 bg-white p-2 text-xs text-slate-700"
-          >
-            <p className="font-mono">
-              [{citation.display_index.toString()}] {citation.ticker}{" "}
-              {citation.form_type} {citation.filing_date}{" "}
-              <span className="text-slate-500">
-                {citation.accession_number}
-              </span>
-            </p>
-            <p className="mt-1 text-slate-500">{citation.section_path}</p>
-            <p className="mt-1 whitespace-pre-wrap text-slate-800">
-              {citation.text_span}
-            </p>
-          </li>
-        ))}
-      </ol>
-    </details>
-  );
-}
-
-type Segment =
-  | { kind: "text"; text: string }
-  | { kind: "citation"; index: number };
-
-const CITATION_RE = /\[(\d+)\]/g;
-
-function splitAnswerByCitation(answer: string): Segment[] {
-  const out: Segment[] = [];
-  let cursor = 0;
-  CITATION_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = CITATION_RE.exec(answer)) !== null) {
-    if (match.index > cursor) {
-      out.push({ kind: "text", text: answer.slice(cursor, match.index) });
-    }
-    const indexNum = Number.parseInt(match[1] ?? "0", 10);
-    if (Number.isFinite(indexNum) && indexNum > 0) {
-      out.push({ kind: "citation", index: indexNum });
-    } else {
-      out.push({ kind: "text", text: match[0] });
-    }
-    cursor = match.index + match[0].length;
-  }
-  if (cursor < answer.length) {
-    out.push({ kind: "text", text: answer.slice(cursor) });
-  }
-  return out;
 }
