@@ -43,11 +43,11 @@ from sec_generative_search.config.settings import (
     resolve_secret_from_value_or_file,
 )
 from sec_generative_search.core.exceptions import ConfigurationError
-from sec_generative_search.core.resilience import INTERACTIVE_RETRY_POLICY
 from sec_generative_search.providers.base import (
     BaseEmbeddingProvider,
     BaseLLMProvider,
 )
+from sec_generative_search.providers.network_policy import hosted_client_kwargs
 from sec_generative_search.providers.registry import (
     ProviderRegistry,
     ProviderSurface,
@@ -192,7 +192,12 @@ def build_embedder(
             device=settings.device,
             batch_size=settings.batch_size,
         )
-    return provider_cls(api_key, model=settings.model_name)
+    # Hosted embedders: PROVIDER_TIMEOUT + the background retry budget.
+    return provider_cls(
+        api_key,
+        model=settings.model_name,
+        **hosted_client_kwargs(interactive=False),
+    )
 
 
 def build_llm_provider(
@@ -217,9 +222,10 @@ def build_llm_provider(
       selection is per-request via ``GenerationRequest.model``.  The
       factory therefore takes only ``provider_name``.
     - Every LLM provider is request-scoped (one per API request / CLI
-      command), so it is built with
-      :data:`~sec_generative_search.core.resilience.INTERACTIVE_RETRY_POLICY`
-      (one retry) — the caller is waiting, holding a threadpool slot.
+      command), so it is built with the *interactive* budget from
+      :func:`~sec_generative_search.providers.network_policy.hosted_client_kwargs`
+      — ``PROVIDER_TIMEOUT`` and at most one retry — because the caller is
+      waiting, holding a threadpool slot.
         - Almost every LLM provider is hosted and requires a real key; a
             ``None`` resolver result is a configuration error.  The self-hosted
             LLM entry may omit a credential, so the factory tolerates ``None``
@@ -262,4 +268,4 @@ def build_llm_provider(
         # here, never via the per-request resolver chain.
         api_key = _LLM_NO_KEY_SENTINEL
 
-    return entry.provider_cls(api_key, retry_policy=INTERACTIVE_RETRY_POLICY)
+    return entry.provider_cls(api_key, **hosted_client_kwargs(interactive=True))

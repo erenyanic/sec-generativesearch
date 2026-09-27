@@ -520,8 +520,7 @@ class GenerationResult:
 
     Attributes:
         answer: The generated answer text.  May contain inline citation
-            markers (``[1]``) when :attr:`RAGSettings.citation_mode` is
-            ``"inline"``.
+            markers (``[1]``).
         provider: Registered provider key used (e.g. ``"openai"``,
             ``"anthropic"``).  Never contains a key or credential.
         model: Provider-specific model slug used (e.g. ``"gpt-4o"``).

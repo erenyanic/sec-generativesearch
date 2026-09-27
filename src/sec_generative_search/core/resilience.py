@@ -109,11 +109,10 @@ class RetryPolicy:
     """Exponential-backoff retry configuration with full jitter and a deadline.
 
     Construction is cheap; instances are frozen so they can be shared
-    across threads without synchronisation.  The defaults mirror the
-    ``PROVIDER_MAX_RETRIES`` / ``PROVIDER_RETRY_BACKOFF_BASE`` defaults,
-    but those settings are **not** read here — every adapter builds its
-    policy from these defaults (or from :data:`INTERACTIVE_RETRY_POLICY`
-    via the factory).
+    across threads without synchronisation.  This module stays
+    settings-free: ``providers/network_policy.py`` builds the policy each
+    adapter gets from ``PROVIDER_MAX_RETRIES`` /
+    ``PROVIDER_RETRY_BACKOFF_BASE`` (the defaults here mirror theirs).
 
     Attributes:
         max_retries: Number of *retry* attempts after the initial call.
@@ -187,13 +186,14 @@ class RetryPolicy:
         return delay
 
 
-# Retry budget for request-scoped (interactive) LLM calls: one retry, not
+# Retry budget cap for request-scoped (interactive) calls: one retry, not
 # three.  The caller holds one of the API worker's threadpool slots while it
 # waits, and a third or fourth attempt against an upstream that already
 # failed twice rarely lands inside a user's patience while pinning the slot
-# for another SDK timeout.  The factory builds every LLM provider with it
-# (``build_llm_provider`` and the key-validation probe); embedders — built
-# once per process and shared by ingest and search — keep the default.
+# for another SDK timeout.  ``providers/network_policy.py`` applies it to
+# every LLM build and key-validation probe (``PROVIDER_MAX_RETRIES`` can
+# lower it, never raise it); embedders — built once per process and shared
+# by ingest and search — take ``PROVIDER_MAX_RETRIES`` as set.
 INTERACTIVE_RETRY_POLICY = RetryPolicy(max_retries=1)
 
 

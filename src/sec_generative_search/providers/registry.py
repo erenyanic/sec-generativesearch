@@ -48,7 +48,6 @@ from enum import StrEnum
 from typing import Any, ClassVar
 
 from sec_generative_search.core.exceptions import ProviderAuthError
-from sec_generative_search.core.resilience import INTERACTIVE_RETRY_POLICY
 from sec_generative_search.core.types import ProviderCapability
 from sec_generative_search.providers.anthropic import AnthropicProvider
 from sec_generative_search.providers.catalogue import model_catalogue
@@ -67,6 +66,7 @@ from sec_generative_search.providers.mistral import (
     MistralEmbeddingProvider,
     MistralProvider,
 )
+from sec_generative_search.providers.network_policy import hosted_client_kwargs
 from sec_generative_search.providers.openai import (
     OpenAIEmbeddingProvider,
     OpenAIProvider,
@@ -536,16 +536,20 @@ class ProviderRegistry:
         require it at construction) and ignored for LLM / reranker
         providers (where the model is per-request, not per-instance).
         """
+        # A validation probe is interactive (the caller is waiting on
+        # ``POST /api/providers/validate`` or ``sec-rag provider validate``):
+        # PROVIDER_TIMEOUT and the same one-retry cap as ``build_llm_provider``.
         if entry.surface is ProviderSurface.EMBEDDING:
             kwargs: dict[str, Any] = {}
             if model is not None:
                 kwargs["model"] = model
+            if entry.name != "local":
+                # The on-device embedder makes no network call and takes
+                # neither argument.
+                kwargs.update(hosted_client_kwargs(interactive=True))
             return entry.provider_cls(api_key, **kwargs)
         if entry.surface is ProviderSurface.LLM:
-            # A validation probe is interactive (the caller is waiting on
-            # ``POST /api/providers/validate`` or ``sec-rag provider
-            # validate``): same short retry budget as ``build_llm_provider``.
-            return entry.provider_cls(api_key, retry_policy=INTERACTIVE_RETRY_POLICY)
+            return entry.provider_cls(api_key, **hosted_client_kwargs(interactive=True))
         # Reranker providers carry no per-instance model.
         return entry.provider_cls(api_key)
 

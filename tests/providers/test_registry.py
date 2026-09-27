@@ -901,7 +901,26 @@ class TestValidateKeyUsesTheInteractiveBudget:
 
         monkeypatch.setattr(OpenAIProvider, "validate_key", fake)
         assert ProviderRegistry.validate_key("openai", ProviderSurface.LLM, _FAKE_KEY) is True
-        assert built[0]._policy.retry_policy is INTERACTIVE_RETRY_POLICY
+        assert built[0]._policy.retry_policy == INTERACTIVE_RETRY_POLICY
+
+
+class TestLocalEmbedderGetsNoNetworkKnobs:
+    """F35: the on-device embedder takes no ``timeout`` / ``retry_policy``.
+
+    The validation probe hands the hosted-client kwargs to every *hosted*
+    adapter; passing them to the local provider would ``TypeError`` the probe.
+    Constructing it loads no model, so this runs without the extra.
+    """
+
+    def test_local_probe_construction_takes_no_hosted_kwargs(self) -> None:
+        entry = next(
+            e
+            for e in ProviderRegistry._ENTRIES
+            if e.name == "local" and e.surface is ProviderSurface.EMBEDDING
+        )
+        provider = ProviderRegistry._construct(entry, "local", model="google/embeddinggemma-300m")
+        assert type(provider).__name__ == "LocalEmbeddingProvider"
+        assert not hasattr(provider, "_policy")
 
 
 class TestValidateKeyClosesClient:

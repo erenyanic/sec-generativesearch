@@ -73,12 +73,6 @@ DEFAULT_MIN_SIMILARITY = 0.0
 # RAG pipeline constants
 # ---------------------------------------------------------------------------
 
-# Valid answer modes for RAG generation (maps to RAGSettings.default_answer_mode).
-ANSWER_MODES = ("concise", "analytical", "extractive", "comparative")
-
-# Valid citation modes (maps to RAGSettings.citation_mode).
-CITATION_MODES = ("inline", "footnote")
-
 # Default context-window token budget for retrieved chunks.
 DEFAULT_CONTEXT_TOKEN_BUDGET = 6000
 

@@ -37,23 +37,17 @@ class TestLLMSettings:
         s = LLMSettings()
         assert s.default_provider == "openai"
         assert s.default_model is None
-        assert s.temperature == pytest.approx(0.1)
         assert s.max_output_tokens == 2048
-        assert s.streaming is True
 
     def test_env_override(self, clean_env: pytest.MonkeyPatch) -> None:
         clean_env.setenv("LLM_DEFAULT_PROVIDER", "anthropic")
         clean_env.setenv("LLM_DEFAULT_MODEL", "claude-sonnet-4")
-        clean_env.setenv("LLM_TEMPERATURE", "0.7")
         clean_env.setenv("LLM_MAX_OUTPUT_TOKENS", "4096")
-        clean_env.setenv("LLM_STREAMING", "false")
 
         s = LLMSettings()
         assert s.default_provider == "anthropic"
         assert s.default_model == "claude-sonnet-4"
-        assert s.temperature == pytest.approx(0.7)
         assert s.max_output_tokens == 4096
-        assert s.streaming is False
 
 
 # ---------------------------------------------------------------------------
@@ -203,17 +197,62 @@ class TestProviderSettings:
         assert s.retry_backoff_base == pytest.approx(2.0)
         assert s.circuit_breaker_threshold == 5
         assert s.circuit_breaker_reset == 60
-        assert s.cost_tracking_enabled is True
 
     def test_env_override(self, clean_env: pytest.MonkeyPatch) -> None:
         clean_env.setenv("PROVIDER_TIMEOUT", "30")
         clean_env.setenv("PROVIDER_MAX_RETRIES", "5")
-        clean_env.setenv("PROVIDER_COST_TRACKING_ENABLED", "false")
+        clean_env.setenv("PROVIDER_RETRY_BACKOFF_BASE", "1.5")
 
         s = ProviderSettings()
         assert s.timeout == 30
         assert s.max_retries == 5
-        assert s.cost_tracking_enabled is False
+        assert s.retry_backoff_base == pytest.approx(1.5)
+
+    @pytest.mark.parametrize(
+        ("value", "accepted"),
+        [("1", True), ("300", True), ("0", False), ("-5", False), ("301", False)],
+    )
+    def test_timeout_bounds(
+        self, clean_env: pytest.MonkeyPatch, value: str, accepted: bool
+    ) -> None:
+        clean_env.setenv("PROVIDER_TIMEOUT", value)
+        if accepted:
+            assert ProviderSettings().timeout == int(value)
+        else:
+            with pytest.raises(ValidationError, match="PROVIDER_TIMEOUT must be between 1 and 300"):
+                ProviderSettings()
+
+    @pytest.mark.parametrize(
+        ("value", "accepted"), [("0", True), ("10", True), ("-1", False), ("11", False)]
+    )
+    def test_max_retries_bounds(
+        self, clean_env: pytest.MonkeyPatch, value: str, accepted: bool
+    ) -> None:
+        clean_env.setenv("PROVIDER_MAX_RETRIES", value)
+        if accepted:
+            assert ProviderSettings().max_retries == int(value)
+        else:
+            with pytest.raises(ValidationError, match="PROVIDER_MAX_RETRIES must be between"):
+                ProviderSettings()
+
+    @pytest.mark.parametrize("value", ["0.5", "10.5", "nan", "inf", "-2"])
+    def test_backoff_base_bounds(self, clean_env: pytest.MonkeyPatch, value: str) -> None:
+        clean_env.setenv("PROVIDER_RETRY_BACKOFF_BASE", value)
+        with pytest.raises(ValidationError, match="PROVIDER_RETRY_BACKOFF_BASE must be"):
+            ProviderSettings()
+
+    @pytest.mark.parametrize(
+        ("env", "value"),
+        [("PROVIDER_CIRCUIT_BREAKER_THRESHOLD", "0"), ("PROVIDER_CIRCUIT_BREAKER_RESET", "-1")],
+    )
+    def test_breaker_knobs_fail_at_load(
+        self, clean_env: pytest.MonkeyPatch, env: str, value: str
+    ) -> None:
+        """The health registry builds its breaker lazily inside a request's
+        success/failure path — an invalid value must fail the boot instead."""
+        clean_env.setenv(env, value)
+        with pytest.raises(ValidationError, match=env):
+            ProviderSettings()
 
 
 # ---------------------------------------------------------------------------
@@ -225,8 +264,6 @@ class TestRAGSettings:
     def test_defaults(self, clean_env: pytest.MonkeyPatch) -> None:
         s = RAGSettings()
         assert s.context_token_budget == 6000
-        assert s.citation_mode == "inline"
-        assert s.default_answer_mode == "concise"
         assert s.refusal_enabled is True
         assert s.chunk_overlap_tokens == 150
         # Chat history MUST default to off by default.
@@ -235,14 +272,10 @@ class TestRAGSettings:
 
     def test_env_override(self, clean_env: pytest.MonkeyPatch) -> None:
         clean_env.setenv("RAG_CONTEXT_TOKEN_BUDGET", "8000")
-        clean_env.setenv("RAG_CITATION_MODE", "footnote")
-        clean_env.setenv("RAG_DEFAULT_ANSWER_MODE", "analytical")
         clean_env.setenv("RAG_REFUSAL_ENABLED", "false")
 
         s = RAGSettings()
         assert s.context_token_budget == 8000
-        assert s.citation_mode == "footnote"
-        assert s.default_answer_mode == "analytical"
         assert s.refusal_enabled is False
 
 
@@ -513,8 +546,6 @@ class TestSettingsComposition:
         assert s.chunking is not None
         assert s.database is not None
         assert s.search is not None
-        assert s.log_file is not None
-        assert s.hugging_face is not None
         assert s.api is not None
         # New sections
         assert isinstance(s.llm, LLMSettings)
@@ -974,3 +1005,136 @@ class TestCorsWildcardRejection:
         clean_env.setenv("API_CORS_ORIGINS", '["*"]')
         with pytest.raises(ValidationError, match="must not contain"):
             Settings()
+
+
+# ---------------------------------------------------------------------------
+# F35 — dead settings removed; every remaining field has a reader
+# ---------------------------------------------------------------------------
+
+_REMOVED_KNOBS = {
+    "LLM_TEMPERATURE": "0.7",
+    "LLM_STREAMING": "false",
+    "PROVIDER_COST_TRACKING_ENABLED": "false",
+    "RAG_CITATION_MODE": "footnote",
+    "RAG_DEFAULT_ANSWER_MODE": "analytical",
+    "HUGGING_FACE_TOKEN": "hf_not_read_anywhere",  # pragma: allowlist secret
+    "API_HOST": "0.0.0.0",  # noqa: S104 - a value the settings must ignore
+    "API_PORT": "9999",
+}
+
+
+class TestRemovedKnobsAreIgnored:
+    """Deleting a field must not turn an operator's old ``.env`` line into a
+    boot failure: the root model is ``extra="ignore"`` and nested models only
+    read their declared fields.  The value must not land on the model."""
+
+    def test_settings_still_load_with_removed_knobs_set(
+        self, clean_env: pytest.MonkeyPatch
+    ) -> None:
+        for key, value in _REMOVED_KNOBS.items():
+            clean_env.setenv(key, value)
+        s = Settings()
+        dumped = repr(s.model_dump())
+        for value in ("hf_not_read_anywhere", "footnote", "analytical", "9999"):
+            assert value not in dumped
+        for gone in ("log_file", "hugging_face"):
+            assert gone not in Settings.model_fields
+        assert "temperature" not in LLMSettings.model_fields
+        assert "streaming" not in LLMSettings.model_fields
+        assert "cost_tracking_enabled" not in ProviderSettings.model_fields
+        assert {"citation_mode", "default_answer_mode"}.isdisjoint(RAGSettings.model_fields)
+        assert {"host", "port"}.isdisjoint(ApiSettings.model_fields)
+
+
+# Fields read only inside ``settings.py`` itself, or deliberately parked.
+_READER_ALLOW_LIST = {
+    ("database", "encryption_key_file"): "resolved into encryption_key by a validator",
+    ("api", "auth_pepper_file"): "resolved into auth_pepper by a validator",
+    ("local_llm", "allow_non_local"): "read by the loopback host-policy validator",
+    ("embedding", "idle_timeout_minutes"): "parked until the F15 in-flight guard lands",
+}
+
+
+class TestEverySettingHasAReader:
+    """F35 lock: a settings field nothing reads is a decoy knob.
+
+    The 2026-09-16 audit, and two addenda after it, each found fields that
+    were validated and documented but read by nothing
+    (``EMBEDDING_DEVICE``, ``PROVIDER_TIMEOUT``, ``HUGGING_FACE_TOKEN``, …).
+    Every field must be read through a settings object somewhere in ``src/``
+    outside ``config/settings.py``, or be on the reviewed allow-list above.
+    """
+
+    @staticmethod
+    def _source_lines() -> list[str]:
+        root = Path(__file__).resolve().parents[2] / "src" / "sec_generative_search"
+        lines: list[str] = []
+        for path in root.rglob("*.py"):
+            if path.name == "settings.py" and path.parent.name == "config":
+                continue
+            lines.extend(path.read_text(encoding="utf-8").splitlines())
+        return lines
+
+    def test_every_field_is_read(self) -> None:
+        import re
+
+        lines = self._source_lines()
+        unread: list[str] = []
+        for section, info in Settings.model_fields.items():
+            model = info.default_factory
+            assert model is not None
+            for field in model.model_fields:
+                if (section, field) in _READER_ALLOW_LIST:
+                    continue
+                pattern = re.compile(
+                    rf"(\b{section}|_{section}_settings|{section}_settings|\bsettings|\bs|\bcfg)"
+                    rf"\.{field}\b|getattr\([^)]*[\"']{field}[\"']"
+                )
+                if not any(pattern.search(line) for line in lines):
+                    unread.append(f"{section}.{field}")
+        assert unread == [], f"settings fields with no reader in src/: {unread}"
+
+    def test_allow_listed_fields_are_really_consumed_in_settings(self) -> None:
+        text = (
+            Path(__file__).resolve().parents[2] / "src/sec_generative_search/config/settings.py"
+        ).read_text(encoding="utf-8")
+        for (_section, field), _why in _READER_ALLOW_LIST.items():
+            if field == "idle_timeout_minutes":
+                continue  # parked, not consumed — see the reason above
+            assert text.count(f"self.{field}") + text.count(f'"{field}"') >= 1, field
+
+
+# Variables .env.example may advertise that are read outside ``Settings``:
+# ``core/logging.py`` reads LOG_* from os.environ by design, the factory reads
+# HF_TOKEN[_FILE], and edgartools reads its own rate-limit variable.
+_EXTERNAL_ENV_KNOBS = frozenset(
+    {
+        "LOG_LEVEL",
+        "LOG_FORMAT",
+        "LOG_REDACT_QUERIES",
+        "LOG_FILE_PATH",
+        "LOG_FILE_MAX_BYTES",
+        "LOG_FILE_BACKUP_COUNT",
+        "HF_TOKEN",
+        "HF_TOKEN_FILE",
+        "EDGAR_RATE_LIMIT_PER_SEC",
+    }
+)
+
+
+def test_env_example_advertises_only_real_knobs() -> None:
+    """F35: ``.env.example`` listed ``API_INGEST_COOLDOWN_SECONDS`` (never a
+    setting) and ``API_HOST`` / ``API_PORT`` (read by nothing).  Every key it
+    shows, commented or not, must be a settings env var or a named external."""
+    import re
+
+    real: set[str] = set()
+    for info in Settings.model_fields.values():
+        model = info.default_factory
+        assert model is not None
+        prefix = model.model_config.get("env_prefix", "")
+        real.update(f"{prefix}{field}".upper() for field in model.model_fields)
+    text = (Path(__file__).resolve().parents[2] / ".env.example").read_text(encoding="utf-8")
+    advertised = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]+)=", text, re.MULTILINE))
+    assert advertised, "no keys parsed from .env.example"
+    assert sorted(advertised - real - _EXTERNAL_ENV_KNOBS) == []

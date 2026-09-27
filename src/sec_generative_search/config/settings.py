@@ -494,14 +494,15 @@ class LLMSettings(BaseSettings):
 
     These control which model is used and how it generates responses.
     Provider-level network policy (timeouts, retries) lives in
-    ``ProviderSettings``; this class covers model behaviour.
+    ``ProviderSettings``; this class covers model behaviour.  The sampling
+    temperature is not a setting: ``GenerationRequest.temperature`` (0.1)
+    is the single source (an ``LLM_TEMPERATURE`` field existed but nothing
+    read it — OPTIMIZATIONS.md F35).
     """
 
     default_provider: str = "openai"  # provider key registered in ProviderRegistry
     default_model: str | None = None  # None = use the provider's own default
-    temperature: float = 0.1  # low temperature for factual SEC analysis
     max_output_tokens: int = 2048
-    streaming: bool = True  # prefer streaming responses by default
 
     model_config = SettingsConfigDict(env_prefix="LLM_")
 
@@ -600,17 +601,24 @@ class LocalLLMSettings(BaseSettings):
 class ProviderSettings(BaseSettings):
     """Provider-level network and resilience policy.
 
-    Applies to all external LLM/embedding API calls (OpenAI, Anthropic,
-    Gemini, etc.).  Per-provider overrides will be supported in the
-    provider registry; these are the global defaults.
+    Applies to every hosted LLM/embedding SDK client (OpenAI, Anthropic,
+    Gemini, the OpenAI-wire vendors, ``local_llm``).  ``providers/
+    network_policy.py`` turns ``timeout`` / ``max_retries`` /
+    ``retry_backoff_base`` into each client's SDK timeout and
+    :class:`RetryPolicy`; the circuit-breaker knobs feed the passive health
+    registry.  Every knob is bounded at load (fail-closed): a request thread
+    waits up to ``timeout`` per attempt, so these bounds are also the
+    ceiling on how long one call can hold an API worker thread.
     """
 
-    timeout: int = 60  # seconds per API call
-    max_retries: int = 3
-    retry_backoff_base: float = 2.0  # exponential backoff base (seconds)
+    timeout: int = 60  # seconds per SDK attempt (1..300)
+    # Retries for embedders (shared by ingest and search).  Request-scoped
+    # LLM calls and validation probes are capped at one retry
+    # (INTERACTIVE_RETRY_POLICY): this knob can lower that, never raise it.
+    max_retries: int = 3  # 0..10
+    retry_backoff_base: float = 2.0  # exponential backoff base (1.0..10.0)
     circuit_breaker_threshold: int = 5  # consecutive failures before circuit opens
     circuit_breaker_reset: int = 60  # seconds before half-open retry
-    cost_tracking_enabled: bool = True  # track token usage and estimated cost
 
     # --- Opt-in model-catalogue refresh seam ----------------------------
     #
@@ -630,6 +638,66 @@ class ProviderSettings(BaseSettings):
     catalogue_overlay_path: str = "./data/model_catalogue_overlay.json"
 
     model_config = SettingsConfigDict(env_prefix="PROVIDER_")
+
+    @field_validator("timeout")
+    @classmethod
+    def _validate_timeout(cls, value: int) -> int:
+        """1..300 s per SDK attempt — the per-call thread-occupancy ceiling.
+
+        An LLM call may make two attempts under the 90 s retry deadline, so
+        one call can hold an API worker thread for about
+        ``timeout + min(timeout, 90)`` seconds; 300 keeps that under
+        ~6.5 minutes while leaving room for slow self-hosted models.
+        """
+        if not 1 <= value <= 300:
+            raise ValueError(
+                f"PROVIDER_TIMEOUT must be between 1 and 300 seconds; got {value}. "
+                f"It bounds how long one provider call can hold an API worker thread."
+            )
+        return value
+
+    @field_validator("max_retries")
+    @classmethod
+    def _validate_max_retries(cls, value: int) -> int:
+        """0..10 — beyond that the 90 s retry deadline stops retries anyway."""
+        if not 0 <= value <= 10:
+            raise ValueError(f"PROVIDER_MAX_RETRIES must be between 0 and 10; got {value}.")
+        return value
+
+    @field_validator("retry_backoff_base")
+    @classmethod
+    def _validate_backoff_base(cls, value: float) -> float:
+        """1.0..10.0 — below 1 the backoff would shrink per attempt.
+
+        The chained comparison also rejects NaN and ±inf (every comparison
+        with NaN is false), so no separate finiteness check is needed.
+        """
+        if not 1.0 <= value <= 10.0:
+            raise ValueError(
+                f"PROVIDER_RETRY_BACKOFF_BASE must be a number between 1.0 and 10.0; got {value}."
+            )
+        return value
+
+    @field_validator("circuit_breaker_threshold")
+    @classmethod
+    def _validate_breaker_threshold(cls, value: int) -> int:
+        """>= 1, as the breaker itself requires.
+
+        The passive health registry builds its breaker lazily on first use —
+        inside a request's success/failure path — so an invalid value must
+        fail the boot rather than raise from that hot path.
+        """
+        if value < 1:
+            raise ValueError(f"PROVIDER_CIRCUIT_BREAKER_THRESHOLD must be >= 1; got {value}.")
+        return value
+
+    @field_validator("circuit_breaker_reset")
+    @classmethod
+    def _validate_breaker_reset(cls, value: int) -> int:
+        """>= 0, as the breaker itself requires (same lazy-build reason)."""
+        if value < 0:
+            raise ValueError(f"PROVIDER_CIRCUIT_BREAKER_RESET must be >= 0; got {value}.")
+        return value
 
     @field_validator("catalogue_refresh_source")
     @classmethod
@@ -703,8 +771,6 @@ class RAGSettings(BaseSettings):
     """
 
     context_token_budget: int = 6000  # max tokens allocated to retrieved context
-    citation_mode: str = "inline"  # "inline" or "footnote"
-    default_answer_mode: str = "concise"  # "concise", "analytical", "extractive", "comparative"
     refusal_enabled: bool = True  # refuse when context is insufficient
     # Sentence-level overlap between adjacent chunks (≈ 15 % of the
     # 1000-token default chunk size).  Carries the last whole sentence
@@ -791,31 +857,13 @@ class SearchSettings(BaseSettings):
         return value
 
 
-class LoggingSettings(BaseSettings):
-    """Logging configuration for optional file logging."""
-
-    # Optional file logging (in addition to stdout).
-    # Env vars: LOG_FILE_PATH, LOG_FILE_MAX_BYTES, LOG_FILE_BACKUP_COUNT
-    path: str | None = None  # unset = stdout only
-    max_bytes: int = 10_485_760  # 10 MB
-    backup_count: int = 3
-
-    model_config = SettingsConfigDict(env_prefix="LOG_FILE_")
-
-
-class HuggingFaceSettings(BaseSettings):
-    """Hugging Face configuration."""
-
-    token: str | None = None
-
-    model_config = SettingsConfigDict(env_prefix="HUGGING_FACE_")
-
-
 class ApiSettings(BaseSettings):
-    """API server configuration."""
+    """API server configuration.
 
-    host: str = "127.0.0.1"
-    port: int = 8000
+    The bind address and port are uvicorn's (``--host`` / ``--port`` on the
+    command line, as ``Dockerfile.api`` passes them), not settings.
+    """
+
     cors_origins: list[str] = ["http://localhost:3000"]
     key: str | None = None  # API key; None = auth disabled (local dev)
 
@@ -931,6 +979,11 @@ class ApiSettings(BaseSettings):
 class Settings(BaseSettings):
     """Root settings class combining all sections.
 
+    Logging is configured from ``os.environ`` by :mod:`core.logging`
+    (``LOG_LEVEL`` / ``LOG_FORMAT`` / ``LOG_REDACT_QUERIES`` /
+    ``LOG_FILE_*``), deliberately not through this model; the Hugging Face
+    token is read as ``HF_TOKEN[_FILE]`` by the provider factory.
+
     Nested fields use ``Field(default_factory=...)`` rather than a
     cached default instance.  Each ``Settings()`` call rebuilds the
     nested models so they observe the *current* ``os.environ`` —
@@ -948,8 +1001,6 @@ class Settings(BaseSettings):
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     rag: RAGSettings = Field(default_factory=RAGSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
-    log_file: LoggingSettings = Field(default_factory=LoggingSettings)
-    hugging_face: HuggingFaceSettings = Field(default_factory=HuggingFaceSettings)
     api: ApiSettings = Field(default_factory=ApiSettings)
 
     model_config = SettingsConfigDict(

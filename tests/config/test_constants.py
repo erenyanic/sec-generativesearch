@@ -9,9 +9,7 @@ from __future__ import annotations
 import pytest
 
 from sec_generative_search.config.constants import (
-    ANSWER_MODES,
     BASE_FORMS,
-    CITATION_MODES,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_CONTEXT_TOKEN_BUDGET,
     DEFAULT_PROVIDER_MAX_RETRIES,
@@ -63,12 +61,6 @@ class TestParseFormTypes:
 
 
 class TestRAGConstants:
-    def test_answer_modes_content(self) -> None:
-        assert ANSWER_MODES == ("concise", "analytical", "extractive", "comparative")
-
-    def test_citation_modes_content(self) -> None:
-        assert CITATION_MODES == ("inline", "footnote")
-
     def test_context_token_budget_positive(self) -> None:
         assert DEFAULT_CONTEXT_TOKEN_BUDGET > 0
 

@@ -382,7 +382,15 @@ class TestBuildEmbedderForwardsLocalKnobs:
         fake_key = "sk-test-1234ABCD"  # pragma: allowlist secret
         settings = EmbeddingSettings(provider="openai", model_name="text-embedding-3-small")
         build_embedder(settings, api_key_resolver=lambda _name: fake_key)
-        assert calls == [{"api_key": fake_key, "model": "text-embedding-3-small"}]
+        # PROVIDER_TIMEOUT + the background retry budget, never the local knobs.
+        assert calls == [
+            {
+                "api_key": fake_key,
+                "model": "text-embedding-3-small",
+                "timeout": 60.0,
+                "retry_policy": RetryPolicy(),
+            }
+        ]
 
 
 class TestBuildEmbedderExtrasGating:
@@ -580,8 +588,8 @@ class TestInteractiveRetryBudget:
 
     Every LLM provider is built per request (API) or per command (CLI)
     while a caller waits holding a threadpool slot, so the factory must
-    hand each adapter :data:`INTERACTIVE_RETRY_POLICY`.  Real adapters —
-    construction makes no network call.
+    hand each adapter the :data:`INTERACTIVE_RETRY_POLICY` budget.  Real
+    adapters — construction makes no network call.
     """
 
     @pytest.mark.parametrize(
@@ -591,7 +599,7 @@ class TestInteractiveRetryBudget:
     def test_every_llm_provider_is_built_with_the_interactive_policy(self, name: str) -> None:
         provider = build_llm_provider(name, api_key_resolver=lambda _n: "sk-test-1234567890ABCD")
         try:
-            assert provider._policy.retry_policy is INTERACTIVE_RETRY_POLICY
+            assert provider._policy.retry_policy == INTERACTIVE_RETRY_POLICY
             assert provider._policy.retry_policy.max_retries == 1
         finally:
             provider.close()
@@ -606,6 +614,111 @@ class TestInteractiveRetryBudget:
             assert embedder._policy.retry_policy.max_retries == 3
         finally:
             embedder.close()
+
+
+def _recording_llm_entry(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Point ``get_entry`` at a class that records its constructor kwargs."""
+    from sec_generative_search.providers.registry import ProviderEntry
+
+    calls: list[dict[str, Any]] = []
+
+    class _Recorder:
+        def __init__(self, api_key: str, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(
+        ProviderRegistry,
+        "get_entry",
+        lambda _name, _surface: ProviderEntry("openai", ProviderSurface.LLM, _Recorder),
+    )
+    return calls
+
+
+@pytest.mark.security
+class TestProviderNetworkKnobsAreWired:
+    """F35: ``PROVIDER_TIMEOUT`` / ``PROVIDER_MAX_RETRIES`` /
+    ``PROVIDER_RETRY_BACKOFF_BASE`` reach every hosted client.
+
+    They were validated and documented but read by nothing.  Wired, they
+    must never raise the interactive budget: a request thread waits up to
+    ``timeout`` per attempt, so one retry is the F16 ceiling.
+    """
+
+    @staticmethod
+    def _env(monkeypatch: pytest.MonkeyPatch, **values: str) -> None:
+        from sec_generative_search.config.settings import reload_settings
+
+        for key, value in values.items():
+            monkeypatch.setenv(key, value)
+        reload_settings()
+
+    def test_llm_build_takes_the_timeout_and_backoff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._env(monkeypatch, PROVIDER_TIMEOUT="45", PROVIDER_RETRY_BACKOFF_BASE="3.0")
+        calls = _recording_llm_entry(monkeypatch)
+        build_llm_provider("openai", api_key_resolver=lambda _n: "sk-test-1234567890ABCD")
+        assert calls[0]["timeout"] == 45.0
+        assert calls[0]["retry_policy"].backoff_base == 3.0
+        assert calls[0]["retry_policy"].max_retries == 1
+
+    @pytest.mark.parametrize(("configured", "interactive"), [("10", 1), ("1", 1), ("0", 0)])
+    def test_max_retries_can_lower_but_never_raise_the_llm_budget(
+        self, monkeypatch: pytest.MonkeyPatch, configured: str, interactive: int
+    ) -> None:
+        self._env(monkeypatch, PROVIDER_MAX_RETRIES=configured)
+        calls = _recording_llm_entry(monkeypatch)
+        build_llm_provider("openai", api_key_resolver=lambda _n: "sk-test-1234567890ABCD")
+        assert calls[0]["retry_policy"].max_retries == interactive
+
+    @pytest.mark.parametrize(("configured", "interactive"), [("10", 1), ("0", 0)])
+    def test_validation_probe_is_capped_too(
+        self, monkeypatch: pytest.MonkeyPatch, configured: str, interactive: int
+    ) -> None:
+        self._env(monkeypatch, PROVIDER_MAX_RETRIES=configured, PROVIDER_TIMEOUT="20")
+        built: list[OpenAIProvider] = []
+        monkeypatch.setattr(OpenAIProvider, "validate_key", lambda self: built.append(self) or True)
+        assert ProviderRegistry.validate_key("openai", ProviderSurface.LLM, "sk-test-1234ABCD")
+        assert built[0]._policy.retry_policy.max_retries == interactive
+        assert built[0]._client.timeout == 20.0
+
+    def test_embedding_probe_is_capped_and_timed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._env(monkeypatch, PROVIDER_MAX_RETRIES="10", PROVIDER_TIMEOUT="25")
+        built: list[OpenAIEmbeddingProvider] = []
+        monkeypatch.setattr(
+            OpenAIEmbeddingProvider, "validate_key", lambda self: built.append(self) or True
+        )
+        assert ProviderRegistry.validate_key(
+            "openai", ProviderSurface.EMBEDDING, "sk-test-1234ABCD", model="text-embedding-3-small"
+        )
+        assert built[0]._policy.retry_policy.max_retries == 1
+        assert built[0]._client.timeout == 25.0
+
+    def test_embedder_takes_max_retries_as_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._env(
+            monkeypatch,
+            PROVIDER_MAX_RETRIES="5",
+            PROVIDER_TIMEOUT="30",
+            PROVIDER_RETRY_BACKOFF_BASE="1.5",
+        )
+        embedder = build_embedder(
+            EmbeddingSettings(provider="openai", model_name="text-embedding-3-small"),
+            api_key_resolver=lambda _n: "sk-test-1234567890ABCD",
+        )
+        try:
+            assert embedder._policy.retry_policy == RetryPolicy(max_retries=5, backoff_base=1.5)
+            assert embedder._client.timeout == 30.0
+        finally:
+            embedder.close()
+
+    def test_real_adapter_clients_receive_the_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._env(monkeypatch, PROVIDER_TIMEOUT="42")
+        for name in ("openai", "anthropic", "local_llm"):
+            provider = build_llm_provider(name, api_key_resolver=lambda _n: "sk-test-1234ABCD")
+            try:
+                assert provider._client.timeout == 42.0, name
+            finally:
+                provider.close()
 
 
 @pytest.mark.security
