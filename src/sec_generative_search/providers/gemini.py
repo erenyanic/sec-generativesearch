@@ -26,6 +26,7 @@ slightly high — the right direction for a budget guard.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -46,6 +47,7 @@ from sec_generative_search.core.resilience import (
     RetryPolicy,
     normalise_exception,
     resilient_call,
+    retry_after_from_exception,
 )
 from sec_generative_search.core.types import (
     ProviderCapability,
@@ -96,6 +98,15 @@ _AUTH_STATUS_CODES = frozenset({401, 403})
 _RATE_LIMIT_STATUS_CODES = frozenset({429})
 _TIMEOUT_STATUS_CODES = frozenset({408, 504})
 
+# Google APIs signal "retry after N" in the JSON error body rather than a
+# header: a ``google.rpc.RetryInfo`` entry in ``error.details`` whose
+# ``retryDelay`` is a protobuf Duration string (``"37s"``, ``"0.5s"``).
+# The body is untrusted upstream input — only a bounded number of detail
+# entries is scanned and only a strictly shaped duration is accepted.
+_RETRY_INFO_TYPE = "type.googleapis.com/google.rpc.RetryInfo"
+_RETRY_DELAY_RE = re.compile(r"\d{1,9}(?:\.\d{1,9})?s")
+_MAX_ERROR_DETAILS_SCANNED = 16
+
 # Finish reasons that indicate Gemini's safety system suppressed the
 # response.  ``SAFETY``, ``PROHIBITED_CONTENT``, ``BLOCKLIST``, and
 # ``SPII`` all mean "blocked content" from the user's perspective; the
@@ -135,6 +146,7 @@ def _translate_api_error(exc: errors.APIError, *, provider: str) -> ProviderErro
             provider=provider,
             hint="Retry after backoff or request a higher quota from Google AI Studio.",
             details=detail,
+            retry_after=_gemini_retry_after(exc),
         )
     if code in _TIMEOUT_STATUS_CODES:
         return ProviderTimeoutError(
@@ -148,6 +160,31 @@ def _translate_api_error(exc: errors.APIError, *, provider: str) -> ProviderErro
         provider=provider,
         details=detail,
     )
+
+
+def _gemini_retry_after(exc: errors.APIError) -> float | None:
+    """Seconds a Gemini 429 asked the caller to wait, or ``None``.
+
+    A ``Retry-After`` header (the generic path) wins; otherwise the
+    ``google.rpc.RetryInfo`` detail in the error body.  Never raises.
+    """
+    from_header = retry_after_from_exception(exc)
+    if from_header is not None:
+        return from_header
+    body = getattr(exc, "details", None)
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error", body)
+    details = error.get("details") if isinstance(error, dict) else None
+    if not isinstance(details, list):
+        return None
+    for entry in details[:_MAX_ERROR_DETAILS_SCANNED]:
+        if isinstance(entry, dict) and entry.get("@type") == _RETRY_INFO_TYPE:
+            delay = entry.get("retryDelay")
+            if isinstance(delay, str) and _RETRY_DELAY_RE.fullmatch(delay):
+                return float(delay[:-1])
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -43,6 +43,7 @@ from sec_generative_search.config.settings import (
     resolve_secret_from_value_or_file,
 )
 from sec_generative_search.core.exceptions import ConfigurationError
+from sec_generative_search.core.resilience import INTERACTIVE_RETRY_POLICY
 from sec_generative_search.providers.base import (
     BaseEmbeddingProvider,
     BaseLLMProvider,
@@ -215,6 +216,10 @@ def build_llm_provider(
     - LLM providers do not carry a model on the instance — model
       selection is per-request via ``GenerationRequest.model``.  The
       factory therefore takes only ``provider_name``.
+    - Every LLM provider is request-scoped (one per API request / CLI
+      command), so it is built with
+      :data:`~sec_generative_search.core.resilience.INTERACTIVE_RETRY_POLICY`
+      (one retry) — the caller is waiting, holding a threadpool slot.
         - Almost every LLM provider is hosted and requires a real key; a
             ``None`` resolver result is a configuration error.  The self-hosted
             LLM entry may omit a credential, so the factory tolerates ``None``
@@ -257,4 +262,4 @@ def build_llm_provider(
         # here, never via the per-request resolver chain.
         api_key = _LLM_NO_KEY_SENTINEL
 
-    return entry.provider_cls(api_key)
+    return entry.provider_cls(api_key, retry_policy=INTERACTIVE_RETRY_POLICY)

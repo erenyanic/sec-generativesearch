@@ -30,6 +30,7 @@ import pytest
 
 from sec_generative_search.config.settings import EmbeddingSettings
 from sec_generative_search.core.exceptions import ConfigurationError
+from sec_generative_search.core.resilience import INTERACTIVE_RETRY_POLICY, RetryPolicy
 from sec_generative_search.providers.factory import (
     build_embedder,
     build_llm_provider,
@@ -571,6 +572,40 @@ class TestBuildLLMProvider:
 
         build_llm_provider("openai", api_key_resolver=lambda _n: "sk-test-1234ABCD")
         assert calls == [("openai", ProviderSurface.LLM)]
+
+
+@pytest.mark.security
+class TestInteractiveRetryBudget:
+    """F16(d): request-scoped LLM builds get one retry, embedders keep three.
+
+    Every LLM provider is built per request (API) or per command (CLI)
+    while a caller waits holding a threadpool slot, so the factory must
+    hand each adapter :data:`INTERACTIVE_RETRY_POLICY`.  Real adapters —
+    construction makes no network call.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [e.name for e in ProviderRegistry.all_entries(ProviderSurface.LLM)],
+    )
+    def test_every_llm_provider_is_built_with_the_interactive_policy(self, name: str) -> None:
+        provider = build_llm_provider(name, api_key_resolver=lambda _n: "sk-test-1234567890ABCD")
+        try:
+            assert provider._policy.retry_policy is INTERACTIVE_RETRY_POLICY
+            assert provider._policy.retry_policy.max_retries == 1
+        finally:
+            provider.close()
+
+    def test_hosted_embedder_keeps_the_default_budget(self) -> None:
+        embedder = build_embedder(
+            EmbeddingSettings(provider="openai", model_name="text-embedding-3-small"),
+            api_key_resolver=lambda _n: "sk-test-1234567890ABCD",
+        )
+        try:
+            assert embedder._policy.retry_policy == RetryPolicy()
+            assert embedder._policy.retry_policy.max_retries == 3
+        finally:
+            embedder.close()
 
 
 @pytest.mark.security

@@ -48,6 +48,7 @@ from enum import StrEnum
 from typing import Any, ClassVar
 
 from sec_generative_search.core.exceptions import ProviderAuthError
+from sec_generative_search.core.resilience import INTERACTIVE_RETRY_POLICY
 from sec_generative_search.core.types import ProviderCapability
 from sec_generative_search.providers.anthropic import AnthropicProvider
 from sec_generative_search.providers.catalogue import model_catalogue
@@ -540,7 +541,12 @@ class ProviderRegistry:
             if model is not None:
                 kwargs["model"] = model
             return entry.provider_cls(api_key, **kwargs)
-        # LLM and reranker providers carry no per-instance model.
+        if entry.surface is ProviderSurface.LLM:
+            # A validation probe is interactive (the caller is waiting on
+            # ``POST /api/providers/validate`` or ``sec-rag provider
+            # validate``): same short retry budget as ``build_llm_provider``.
+            return entry.provider_cls(api_key, retry_policy=INTERACTIVE_RETRY_POLICY)
+        # Reranker providers carry no per-instance model.
         return entry.provider_cls(api_key)
 
     @classmethod

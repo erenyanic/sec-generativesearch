@@ -31,6 +31,7 @@ from collections.abc import Iterator
 from typing import Any, ClassVar
 from unittest.mock import MagicMock
 
+import httpx
 import numpy as np
 import pytest
 
@@ -530,6 +531,36 @@ class TestErrorMapping:
 # ---------------------------------------------------------------------------
 # Validation and capability matrix
 # ---------------------------------------------------------------------------
+
+
+def _sdk_rate_limit(retry_after: str) -> openai_compat.RateLimitError:
+    """A genuine SDK ``RateLimitError`` carrying a ``Retry-After`` header."""
+    response = httpx.Response(
+        429,
+        headers={"retry-after": retry_after},
+        request=httpx.Request("POST", "https://example.invalid/v1/chat/completions"),
+    )
+    return openai_compat.RateLimitError("rate limited", response=response, body=None)
+
+
+@pytest.mark.security
+class TestRetryAfterFromTheSdk:
+    """F16(b): the real SDK exception's ``Retry-After`` reaches the retry loop."""
+
+    def test_retry_after_is_lifted_onto_the_error(self, llm_provider: _DemoLLM) -> None:
+        llm_provider._fake_client.chat.completions.create.side_effect = _sdk_rate_limit("0")
+        with pytest.raises(ProviderRateLimitError) as info:
+            llm_provider.generate(GenerationRequest(prompt="x", model="demo-chat"))
+        assert info.value.retry_after == 0.0
+        # Honoured (0 s is within the fast policy's 0 s cap) → full budget.
+        assert llm_provider._fake_client.chat.completions.create.call_count == 3
+
+    def test_retry_after_beyond_the_cap_is_not_retried(self, llm_provider: _DemoLLM) -> None:
+        llm_provider._fake_client.chat.completions.create.side_effect = _sdk_rate_limit("120")
+        with pytest.raises(ProviderRateLimitError) as info:
+            llm_provider.generate(GenerationRequest(prompt="x", model="demo-chat"))
+        assert info.value.retry_after == 120.0
+        assert llm_provider._fake_client.chat.completions.create.call_count == 1
 
 
 class TestValidationAndCapabilities:

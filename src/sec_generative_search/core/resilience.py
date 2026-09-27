@@ -8,19 +8,26 @@ into any SDK.
 
 Contents:
 
-- :class:`RetryPolicy` — exponential-backoff retry configuration.
+- :class:`RetryPolicy` — exponential-backoff retry configuration with
+  full jitter and a total retry deadline.
+- :data:`INTERACTIVE_RETRY_POLICY` — the shorter budget for
+  request-scoped LLM calls.
 - :class:`CircuitBreaker` — thread-safe three-state circuit breaker
   (``CLOSED`` → ``OPEN`` → ``HALF_OPEN`` → ``CLOSED``/``OPEN``).
 - :class:`ExceptionMapping` — declarative mapping from SDK-specific
   exception types to :class:`ProviderError` subclasses.
 - :func:`normalise_exception` — consult a mapping and return the
   corresponding :class:`ProviderError` subclass.
+- :func:`retry_after_from_exception` — bounded parse of a provider's
+  ``Retry-After`` from an SDK exception's response headers.
 - :func:`with_timeout` — run a callable with a wall-clock timeout using
   a one-shot thread pool (safety net for SDKs that ignore their own
   timeout arg).
 - :func:`resilient_call` — the top-level composer: optional circuit
-  breaker check, optional timeout, retry with exponential backoff, and
-  exception normalisation, all driven by the policies above.
+  breaker check, optional timeout, retry with jittered exponential
+  backoff (never sooner than a provider's ``Retry-After``, never past the
+  policy deadline), and exception normalisation, all driven by the
+  policies above.
 
 Design notes:
 
@@ -34,6 +41,12 @@ Design notes:
   input that will not change on retry, so retrying wastes quota and
   extends the blast radius of a bad key.  All other
   :class:`ProviderError` subclasses are retried within the policy.
+- Retries hold the caller's thread — on the API that is one of the
+  worker's ~40 threadpool slots — so the budget is bounded three ways:
+  full jitter keeps callers that failed together from retrying together,
+  a ``Retry-After`` above ``max_delay`` ends the loop instead of
+  retrying early, and ``deadline_seconds`` stops starting new attempts
+  once the budget is spent.
 - Timeout is a *safety net*, not the primary control.  Concrete
   providers pass their SDK's own ``timeout=`` argument in addition to
   this.  The Python thread we spawn for :func:`with_timeout` cannot be
@@ -45,10 +58,14 @@ Design notes:
 from __future__ import annotations
 
 import concurrent.futures
+import email.utils
+import math
+import random
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC
 from enum import Enum
 
 from sec_generative_search.core.exceptions import (
@@ -64,12 +81,14 @@ from sec_generative_search.core.logging import get_logger
 logger = get_logger(__name__)
 
 __all__ = [
+    "INTERACTIVE_RETRY_POLICY",
     "CircuitBreaker",
     "CircuitState",
     "ExceptionMapping",
     "RetryPolicy",
     "normalise_exception",
     "resilient_call",
+    "retry_after_from_exception",
     "with_timeout",
 ]
 
@@ -78,30 +97,53 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+# Jitter source.  ``SystemRandom`` draws from the OS, so it is immune to a
+# test's ``random.seed`` and — the property that matters for a retry storm —
+# to the PRNG state a forked worker inherits from its parent: identical
+# state would re-synchronise the very schedules jitter exists to spread.
+_JITTER_RNG = random.SystemRandom()
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
-    """Exponential-backoff retry configuration.
+    """Exponential-backoff retry configuration with full jitter and a deadline.
 
     Construction is cheap; instances are frozen so they can be shared
-    across threads without synchronisation.  Values align with the
-    :class:`ProviderSettings` defaults so the usual instantiation is
-    ``RetryPolicy.from_settings(settings.provider)``.
+    across threads without synchronisation.  The defaults mirror the
+    ``PROVIDER_MAX_RETRIES`` / ``PROVIDER_RETRY_BACKOFF_BASE`` defaults,
+    but those settings are **not** read here — every adapter builds its
+    policy from these defaults (or from :data:`INTERACTIVE_RETRY_POLICY`
+    via the factory).
 
     Attributes:
         max_retries: Number of *retry* attempts after the initial call.
             ``max_retries=3`` means up to four total attempts.
-        backoff_base: Exponential base.  Delay before attempt *n* (1-
-            indexed, retries only) is
+        backoff_base: Exponential base.  The backoff ceiling before
+            retry *n* (1-indexed, retries only) is
             ``min(initial_delay * backoff_base ** (n - 1), max_delay)``.
-        initial_delay: Delay (seconds) before the first retry.
-        max_delay: Upper bound on the computed delay — prevents the
-            schedule from drifting into hour-long waits.
+        initial_delay: Backoff ceiling (seconds) before the first retry.
+        max_delay: Upper bound on the computed backoff — prevents the
+            schedule from drifting into hour-long waits.  Also the longest
+            provider ``Retry-After`` :func:`resilient_call` will wait for;
+            a longer one ends the retry loop instead of retrying early.
+        jitter: Full jitter — each delay is drawn uniformly from
+            ``[0, ceiling]`` so callers that failed together (one upstream
+            429 storm) do not retry together.  ``False`` restores the
+            fixed schedule.
+        deadline_seconds: Total retry budget, measured from the start of
+            the first attempt.  A retry whose backoff would end at or past
+            it is never started; the last error is raised instead.  It
+            cannot interrupt an attempt already in flight (the SDK's own
+            ``timeout`` bounds that), so the worst case is roughly the
+            deadline plus one SDK timeout.  ``0`` disables the budget.
     """
 
     max_retries: int = 3
     backoff_base: float = 2.0
     initial_delay: float = 1.0
     max_delay: float = 30.0
+    jitter: bool = True
+    deadline_seconds: float = 90.0
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:
@@ -112,18 +154,47 @@ class RetryPolicy:
             raise ValueError("initial_delay must be >= 0")
         if self.max_delay < self.initial_delay:
             raise ValueError("max_delay must be >= initial_delay")
+        if not math.isfinite(self.deadline_seconds) or self.deadline_seconds < 0:
+            raise ValueError("deadline_seconds must be finite and >= 0")
 
-    def delay_for_attempt(self, attempt: int) -> float:
-        """Return the backoff delay (seconds) before retry *attempt*.
+    def delay_for_attempt(
+        self,
+        attempt: int,
+        *,
+        retry_after: float | None = None,
+        rng: Callable[[], float] | None = None,
+    ) -> float:
+        """Return the delay (seconds) before retry *attempt*.
 
         ``attempt`` is 1-indexed, counting only retries — attempt 1 is
         the delay before the *first* retry (i.e. after the initial call
         failed).
+
+        With ``jitter`` the capped exponential backoff is scaled by a draw
+        from *rng* (``[0, 1)``; defaults to an OS-backed source).  A
+        provider's *retry_after* is a floor: the delay is never shorter
+        than the server asked for.  Whether a *retry_after* above
+        ``max_delay`` is worth waiting for is the caller's decision —
+        :func:`resilient_call` does not wait for one.
         """
         if attempt < 1:
             raise ValueError("attempt must be >= 1")
-        delay = self.initial_delay * (self.backoff_base ** (attempt - 1))
-        return min(delay, self.max_delay)
+        delay = min(self.initial_delay * (self.backoff_base ** (attempt - 1)), self.max_delay)
+        if self.jitter:
+            delay *= (rng or _JITTER_RNG.random)()
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        return delay
+
+
+# Retry budget for request-scoped (interactive) LLM calls: one retry, not
+# three.  The caller holds one of the API worker's threadpool slots while it
+# waits, and a third or fourth attempt against an upstream that already
+# failed twice rarely lands inside a user's patience while pinning the slot
+# for another SDK timeout.  The factory builds every LLM provider with it
+# (``build_llm_provider`` and the key-validation probe); embedders — built
+# once per process and shared by ingest and search — keep the default.
+INTERACTIVE_RETRY_POLICY = RetryPolicy(max_retries=1)
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +374,7 @@ def normalise_exception(
             provider=provider,
             hint="Retry after the Retry-After interval or lower request volume.",
             details=detail,
+            retry_after=retry_after_from_exception(exc),
         )
     if mapping.timeout and isinstance(exc, mapping.timeout):
         return ProviderTimeoutError(
@@ -337,6 +409,98 @@ def normalise_exception(
         provider=provider,
         details=detail,
     )
+
+
+# ---------------------------------------------------------------------------
+# Retry-After
+# ---------------------------------------------------------------------------
+
+# Longest ``Retry-After`` header value we hand to a parser.  Real values
+# are a few digits or a 29-character IMF-fixdate; anything longer is
+# malformed and ignored.
+_MAX_RETRY_AFTER_CHARS = 64
+
+
+def retry_after_from_exception(
+    exc: BaseException,
+    *,
+    now: Callable[[], float] = time.time,
+) -> float | None:
+    """Return the retry delay (seconds) a provider asked for, or ``None``.
+
+    Duck-typed over ``exc.response.headers`` — the shape the OpenAI,
+    Anthropic and google-genai SDK errors share — so this module stays
+    SDK-free.  ``retry-after-ms`` (OpenAI's precise variant) wins, then
+    ``retry-after`` as delta-seconds, then as an HTTP-date.
+
+    The header is **untrusted upstream input**: an OpenRouter upstream, a
+    non-loopback ``local_llm`` server or an intermediary can send
+    anything.  A value is honoured only when it parses to a finite,
+    non-negative number of seconds (``float`` happily accepts ``nan``,
+    ``inf`` and ``1e309``); a past HTTP-date yields ``0.0``; everything
+    else is ``None``.  No upper bound is applied here —
+    :func:`resilient_call` refuses to wait past ``RetryPolicy.max_delay``.
+    Never raises.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw_ms = headers.get("retry-after-ms")
+        raw = headers.get("retry-after")
+    except Exception:
+        return None
+    millis = _parse_non_negative_seconds(raw_ms)
+    if millis is not None:
+        return millis / 1000.0
+    seconds = _parse_non_negative_seconds(raw)
+    if seconds is not None:
+        return seconds
+    return _parse_http_date_delay(raw, now=now)
+
+
+def _parse_non_negative_seconds(raw: object) -> float | None:
+    """Parse a delta-seconds header value; ``None`` unless finite and ``>= 0``."""
+    if not isinstance(raw, str) or len(raw) > _MAX_RETRY_AFTER_CHARS:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _parse_http_date_delay(raw: object, *, now: Callable[[], float]) -> float | None:
+    """Seconds until an HTTP-date ``Retry-After``; ``0.0`` once it has passed."""
+    if not isinstance(raw, str) or len(raw) > _MAX_RETRY_AFTER_CHARS:
+        return None
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            # An HTTP-date is always GMT; ``-0000`` parses as naive.
+            when = when.replace(tzinfo=UTC)
+        delay = when.timestamp() - now()
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if not math.isfinite(delay):
+        return None
+    return max(0.0, delay)
+
+
+def _usable_retry_after(value: object) -> float | None:
+    """Re-check a ``retry_after`` attribute before it drives a sleep.
+
+    Adapters may construct :class:`ProviderRateLimitError` themselves, so
+    the value reaching :func:`resilient_call` is not guaranteed to have
+    come through :func:`retry_after_from_exception`.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return float(value)
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +566,8 @@ def resilient_call[T](
     provider: str,
     policy: ResilientCallPolicy,
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    rng: Callable[[], float] | None = None,
 ) -> T:
     """Execute *fn* under timeout, retry, circuit-breaker, and mapping policies.
 
@@ -414,14 +580,19 @@ def resilient_call[T](
     3. On success: close the breaker and return the result.
     4. On failure: normalise the exception, mark the breaker.
        *Terminal* errors (auth, content-filter) raise immediately.
-       *Retryable* errors either exhaust the retry budget and raise, or
-       sleep and loop.
+       *Retryable* errors raise when the retry budget is exhausted, when
+       the provider's ``Retry-After`` exceeds ``max_delay``, or when the
+       backoff would end past ``deadline_seconds``; otherwise they sleep
+       (jittered, never shorter than ``Retry-After``) and loop.
 
-    The ``sleep`` parameter is injectable so tests can drive the FSM
-    without real time passing.
+    ``sleep``, ``clock`` (monotonic, for the deadline) and ``rng`` (the
+    jitter draw) are injectable so tests can drive the loop without real
+    time passing.
     """
+    retry = policy.retry_policy
     last_exc: ProviderError | None = None
-    max_attempts = policy.retry_policy.max_retries + 1
+    max_attempts = retry.max_retries + 1
+    started = clock()
     for attempt in range(1, max_attempts + 1):
         if policy.circuit_breaker is not None:
             # Breaker raises a ProviderError when OPEN — propagate
@@ -444,7 +615,17 @@ def resilient_call[T](
             last_exc = normalised
             if attempt >= max_attempts:
                 raise last_exc from raw
-            sleep(policy.retry_policy.delay_for_attempt(attempt))
+            delay = _next_retry_delay(
+                normalised,
+                retry=retry,
+                attempt=attempt,
+                elapsed=clock() - started,
+                rng=rng,
+                provider=provider,
+            )
+            if delay is None:
+                raise last_exc from raw
+            sleep(delay)
             continue
 
         if policy.circuit_breaker is not None:
@@ -455,3 +636,39 @@ def resilient_call[T](
     # line is unreachable.  Present to reassure type checkers.
     assert last_exc is not None  # pragma: no cover
     raise last_exc  # pragma: no cover
+
+
+def _next_retry_delay(
+    error: ProviderError,
+    *,
+    retry: RetryPolicy,
+    attempt: int,
+    elapsed: float,
+    rng: Callable[[], float] | None,
+    provider: str,
+) -> float | None:
+    """Backoff before retry *attempt*, or ``None`` when it must not happen.
+
+    Log lines carry the curated provider slug and numbers only.
+    """
+    retry_after = _usable_retry_after(getattr(error, "retry_after", None))
+    if retry_after is not None and retry_after > retry.max_delay:
+        # Retrying before the server's own deadline is known to fail and
+        # extends the penalty; waiting it out would hold the caller's
+        # thread past the backoff cap.  Surface the error now.
+        logger.info(
+            "Not retrying %s: Retry-After %.1fs exceeds the %.1fs backoff cap",
+            provider,
+            retry_after,
+            retry.max_delay,
+        )
+        return None
+    delay = retry.delay_for_attempt(attempt, retry_after=retry_after, rng=rng)
+    if retry.deadline_seconds > 0 and elapsed + delay >= retry.deadline_seconds:
+        logger.info(
+            "Not retrying %s: the %.0fs retry deadline would pass",
+            provider,
+            retry.deadline_seconds,
+        )
+        return None
+    return delay

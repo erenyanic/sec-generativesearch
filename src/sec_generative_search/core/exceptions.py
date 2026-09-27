@@ -250,7 +250,27 @@ class ProviderRateLimitError(ProviderError):
 
     The caller should respect ``Retry-After`` headers or apply
     exponential backoff before retrying.
+
+    Attributes:
+        retry_after: Seconds the provider asked the caller to wait, parsed
+            from its response (``None`` when it sent none, or sent a value
+            that is not a finite, non-negative number).  Upstream-supplied;
+            :func:`~sec_generative_search.core.resilience.resilient_call`
+            honours it as a floor on the backoff and refuses to wait longer
+            than the policy's ``max_delay``.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str = "",
+        hint: str | None = None,
+        details: str | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message, provider=provider, hint=hint, details=details)
+        self.retry_after = retry_after
 
 
 class ProviderTimeoutError(ProviderError):

@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
 import numpy as np
 import pytest
 
@@ -454,6 +456,84 @@ def test_generate_stream_returns_iterator(monkeypatch: pytest.MonkeyPatch) -> No
 # ---------------------------------------------------------------------------
 # Error translation — APIError classification
 # ---------------------------------------------------------------------------
+
+
+def _retry_info_body(delay: object) -> dict[str, Any]:
+    """A Gemini 429 body carrying a ``google.rpc.RetryInfo`` detail."""
+    return {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.QuotaFailure"},
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": delay},
+            ],
+        }
+    }
+
+
+@pytest.mark.security
+class TestRetryAfter:
+    """F16(b): a Gemini 429's retry delay reaches the retry loop.
+
+    Google APIs carry it as ``google.rpc.RetryInfo`` in the (untrusted)
+    JSON body; a ``Retry-After`` header, when present, wins.
+    """
+
+    @staticmethod
+    def _rate_limit(*, body: object = None, headers: dict[str, str] | None = None) -> Any:
+        exc = _FakeClientError(429)
+        exc.details = body
+        if headers is not None:
+            exc.response = SimpleNamespace(headers=httpx.Headers(headers))
+        return exc
+
+    @pytest.mark.parametrize(("delay", "expected"), [("37s", 37.0), ("0.5s", 0.5)])
+    def test_retry_info_body_is_parsed(self, delay: str, expected: float) -> None:
+        err = gemini_mod._translate_api_error(
+            self._rate_limit(body=_retry_info_body(delay)), provider="gemini"
+        )
+        assert isinstance(err, ProviderRateLimitError)
+        assert err.retry_after == expected
+
+    def test_header_wins_over_body(self) -> None:
+        exc = self._rate_limit(body=_retry_info_body("37s"), headers={"retry-after": "4"})
+        err = gemini_mod._translate_api_error(exc, provider="gemini")
+        assert err.retry_after == 4.0  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(
+        "delay",
+        ["abc", "-1s", "1e9s", "37", "9999999999s", "nans", "infs", 37, None, "37s " * 20],
+    )
+    def test_malformed_retry_delay_is_ignored(self, delay: object) -> None:
+        err = gemini_mod._translate_api_error(
+            self._rate_limit(body=_retry_info_body(delay)), provider="gemini"
+        )
+        assert err.retry_after is None  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(
+        "body",
+        [None, "oops", {"error": "oops"}, {"error": {"details": "oops"}}, [1, 2]],
+    )
+    def test_malformed_body_is_ignored(self, body: object) -> None:
+        err = gemini_mod._translate_api_error(self._rate_limit(body=body), provider="gemini")
+        assert err.retry_after is None  # type: ignore[attr-defined]
+
+    def test_detail_scan_is_bounded(self) -> None:
+        body = _retry_info_body("5s")
+        filler = [{"@type": "type.googleapis.com/google.rpc.Help"}] * 16
+        body["error"]["details"] = filler + body["error"]["details"]
+        err = gemini_mod._translate_api_error(self._rate_limit(body=body), provider="gemini")
+        assert err.retry_after is None  # type: ignore[attr-defined]
+
+    def test_retry_delay_beyond_the_cap_is_not_retried(self, provider: GeminiProvider) -> None:
+        provider._fake_client.models.generate_content.side_effect = self._rate_limit(
+            body=_retry_info_body("56s")
+        )
+        with pytest.raises(ProviderRateLimitError) as info:
+            provider.generate(GenerationRequest(prompt="x", model="gemini-2.5-flash"))
+        assert info.value.retry_after == 56.0
+        assert provider._fake_client.models.generate_content.call_count == 1
 
 
 class TestErrorMapping:

@@ -23,6 +23,7 @@ from collections.abc import Iterator
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from sec_generative_search.core.exceptions import (
@@ -485,6 +486,33 @@ class TestErrorMapping:
         provider._fake_client.messages.create.side_effect = RuntimeError("boom")
         with pytest.raises(ProviderError):
             provider.generate(GenerationRequest(prompt="x", model="claude-haiku-4-5"))
+
+
+@pytest.mark.security
+class TestRetryAfterFromTheSdk:
+    """F16(b): Anthropic's ``Retry-After`` header reaches the retry loop."""
+
+    @staticmethod
+    def _sdk_rate_limit(retry_after: str) -> anthropic_mod.RateLimitError:
+        response = httpx.Response(
+            429,
+            headers={"retry-after": retry_after},
+            request=httpx.Request("POST", "https://example.invalid/v1/messages"),
+        )
+        return anthropic_mod.RateLimitError("rate limited", response=response, body=None)
+
+    def test_retry_after_beyond_the_cap_is_not_retried(self, provider: AnthropicProvider) -> None:
+        provider._fake_client.messages.create.side_effect = self._sdk_rate_limit("45")
+        with pytest.raises(ProviderRateLimitError) as info:
+            provider.generate(GenerationRequest(prompt="x", model="claude-haiku-4-5"))
+        assert info.value.retry_after == 45.0
+        assert provider._fake_client.messages.create.call_count == 1
+
+    def test_zero_retry_after_keeps_the_budget(self, provider: AnthropicProvider) -> None:
+        provider._fake_client.messages.create.side_effect = self._sdk_rate_limit("0")
+        with pytest.raises(ProviderRateLimitError):
+            provider.generate(GenerationRequest(prompt="x", model="claude-haiku-4-5"))
+        assert provider._fake_client.messages.create.call_count == 3
 
 
 class TestValidation:

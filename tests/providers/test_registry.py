@@ -884,6 +884,26 @@ class TestRegistryReturnsRedactedReprs:
 
 
 @pytest.mark.security
+@pytest.mark.security
+class TestValidateKeyUsesTheInteractiveBudget:
+    """F16(d): the key-validation probe is interactive — one retry, not three."""
+
+    def test_llm_probe_is_built_with_the_interactive_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sec_generative_search.core.resilience import INTERACTIVE_RETRY_POLICY
+
+        built: list[OpenAIProvider] = []
+
+        def fake(self: OpenAIProvider) -> bool:
+            built.append(self)
+            return True
+
+        monkeypatch.setattr(OpenAIProvider, "validate_key", fake)
+        assert ProviderRegistry.validate_key("openai", ProviderSurface.LLM, _FAKE_KEY) is True
+        assert built[0]._policy.retry_policy is INTERACTIVE_RETRY_POLICY
+
+
 class TestValidateKeyClosesClient:
     """``validate_key`` closes the provider it constructs on every path.
 
