@@ -6,7 +6,13 @@
 // `form_type` query). Destructive tier: `DELETE /api/filings/{accession}`
 // (admin-gated; needs the admin key the operator submitted at login).
 //
-// We refresh after every deletion so the displayed count stays
+// Paginated (OPTIMIZATIONS.md F17): the backend returns the whole
+// `DB_MAX_FILINGS`-bounded registry when `limit` is omitted (10 000 rows
+// in B/C), so this page always sends `limit` + `offset`. The server
+// resolves sort + page in SQL with a stable tie-breaker, so pages never
+// skip or repeat a row.
+//
+// We refresh after every deletion so the displayed page stays
 // consistent with the registry. Delete is confirmation-gated client-side
 // because a one-click destructive surface is a footgun.
 
@@ -24,9 +30,15 @@ import { Skeleton } from "@/components/skeleton";
 import { ApiError, deleteFiling, listFilings } from "@/lib/api";
 import type { FilingListResponse, FilingSchema } from "@/lib/api-types";
 
+// Rows per page. Each request asks for one extra row so "is there a next
+// page?" is known exactly: the response's `total` counts the rows
+// *returned* (a page size when paginating), never the registry, so it
+// cannot answer that — and must never be shown as the corpus size.
+const FILINGS_PAGE_SIZE = 100;
+
 type LoadState =
   | { kind: "loading" }
-  | { kind: "ready"; data: FilingListResponse }
+  | { kind: "ready"; rows: FilingSchema[]; hasNext: boolean }
   | { kind: "error"; message: string };
 
 interface Filters {
@@ -38,6 +50,8 @@ export default function FilingsPage(): JSX.Element {
   const [filters, setFilters] = useState<Filters>({ ticker: "", form_type: "" });
   const [applied, setApplied] = useState<Filters>({ ticker: "", form_type: "" });
   const [state, setState] = useState<LoadState>({ kind: "loading" });
+  // Zero-based page index into the applied filters' result set.
+  const [page, setPage] = useState(0);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -56,13 +70,25 @@ export default function FilingsPage(): JSX.Element {
     let cancelled = false;
     void (async () => {
       try {
-        const data = await listFilings({
+        const data: FilingListResponse = await listFilings({
           ticker: applied.ticker !== "" ? applied.ticker : undefined,
           form_type: applied.form_type !== "" ? applied.form_type : undefined,
+          limit: FILINGS_PAGE_SIZE + 1,
+          offset: page * FILINGS_PAGE_SIZE,
         });
-        if (!cancelled) {
-          setState({ kind: "ready", data });
+        if (cancelled) {
+          return;
         }
+        if (data.filings.length === 0 && page > 0) {
+          // A delete emptied the last page — step back one page.
+          setPage(page - 1);
+          return;
+        }
+        setState({
+          kind: "ready",
+          rows: data.filings.slice(0, FILINGS_PAGE_SIZE),
+          hasNext: data.filings.length > FILINGS_PAGE_SIZE,
+        });
       } catch (exc) {
         if (cancelled) {
           return;
@@ -75,7 +101,7 @@ export default function FilingsPage(): JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [applied.form_type, applied.ticker, refreshTick]);
+  }, [applied.form_type, applied.ticker, page, refreshTick]);
 
   const handleFilterSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
@@ -84,6 +110,8 @@ export default function FilingsPage(): JSX.Element {
         ticker: filters.ticker.trim().toUpperCase(),
         form_type: filters.form_type.trim().toUpperCase(),
       });
+      // New filters → new result set; start from its first page.
+      setPage(0);
     },
     [filters.form_type, filters.ticker],
   );
@@ -110,9 +138,12 @@ export default function FilingsPage(): JSX.Element {
   }, [deleting, pendingDelete, reload]);
 
   const rows = useMemo<FilingSchema[]>(
-    () => (state.kind === "ready" ? state.data.filings : []),
+    () => (state.kind === "ready" ? state.rows : []),
     [state],
   );
+  const hasNext = state.kind === "ready" && state.hasNext;
+  const firstRow = page * FILINGS_PAGE_SIZE + 1;
+  const lastRow = page * FILINGS_PAGE_SIZE + rows.length;
 
   return (
     <div className="space-y-6">
@@ -192,11 +223,12 @@ export default function FilingsPage(): JSX.Element {
           id="filings-table-heading"
           className="border-b border-slate-200 px-4 py-3 text-sm font-medium text-slate-700"
         >
-          {state.kind === "ready"
-            ? `${state.data.total.toLocaleString()} filing${
-                state.data.total === 1 ? "" : "s"
-              }`
-            : "Filings"}
+          {state.kind !== "ready" || rows.length === 0
+            ? "Filings"
+            : page === 0 && !hasNext
+              ? // The whole result set fits on one page: an exact count.
+                `${rows.length.toLocaleString()} filing${rows.length === 1 ? "" : "s"}`
+              : `Showing ${firstRow.toLocaleString()}–${lastRow.toLocaleString()}`}
         </h2>
         {state.kind === "loading" ? (
           <div className="px-4 py-6">
@@ -274,6 +306,34 @@ export default function FilingsPage(): JSX.Element {
               </tbody>
             </table>
           </div>
+        ) : null}
+        {state.kind === "ready" && (page > 0 || hasNext) ? (
+          <nav
+            aria-label="Filings pages"
+            className="flex items-center justify-between border-t border-slate-200 px-4 py-3 text-sm"
+          >
+            <button
+              type="button"
+              onClick={() => {
+                setPage((n) => Math.max(0, n - 1));
+              }}
+              disabled={page === 0}
+              className="rounded border border-slate-300 px-3 py-1 text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+            >
+              Previous
+            </button>
+            <span className="text-slate-600">Page {(page + 1).toLocaleString()}</span>
+            <button
+              type="button"
+              onClick={() => {
+                setPage((n) => n + 1);
+              }}
+              disabled={!hasNext}
+              className="rounded border border-slate-300 px-3 py-1 text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+            >
+              Next
+            </button>
+          </nav>
         ) : null}
       </section>
 

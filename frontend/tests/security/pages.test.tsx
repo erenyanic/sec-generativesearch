@@ -131,7 +131,9 @@ describe("FilingsPage", () => {
     });
     expect(screen.getByText("0000320193-23-000077")).toBeInTheDocument();
     const [url] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe("/api/admin/filings/");
+    // Always paginated through the proxy — never the unbounded list
+    // (OPTIMIZATIONS.md F17; one extra row detects a next page).
+    expect(url).toBe("/api/admin/filings/?limit=101&offset=0");
   });
 
   it("opens a confirmation dialog before deleting", async () => {
