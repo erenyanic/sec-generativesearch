@@ -85,9 +85,12 @@ jobs:
           key: tiktoken-${{ runner.os }}-cl100k_base-o200k_base-v1
 
       - name: Run tests with coverage
+        # ``-n auto`` spreads the suite over the runner's cores (pytest-xdist,
+        # from the ``test`` extra); pytest-cov combines the workers' data.
+        # Kept out of ``addopts`` so local and ``-m load`` runs stay serial.
         env:
           TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken-cache
-        run: pytest --cov=sec_generative_search --cov-report=term-missing
+        run: pytest -n auto --cov=sec_generative_search --cov-report=term-missing
 
   dependency-scan:
     # Scan installed dependencies for known CVEs.

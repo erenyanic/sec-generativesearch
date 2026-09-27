@@ -316,6 +316,18 @@ def _build_manager(
     return manager, filing_store, registry, fetcher, orchestrator
 
 
+_TERMINAL_STATES = frozenset({TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED})
+
+
+def _join_worker(task_id: str, *, timeout: float) -> None:
+    """Join the task's worker thread (named ``ingest-<id[:8]>``) if it is alive."""
+    for thread in threading.enumerate():
+        if thread.name == f"ingest-{task_id[:8]}":
+            thread.join(timeout)
+            if thread.is_alive():
+                raise AssertionError(f"worker for task {task_id[:8]} did not exit")
+
+
 def _wait_for_state(
     manager: TaskManager,
     task_id: str,
@@ -323,12 +335,23 @@ def _wait_for_state(
     target: TaskState | set[TaskState],
     timeout: float = 3.0,
 ) -> TaskInfo:
-    """Poll until the task reaches the target state or the deadline."""
+    """Poll until the task reaches the target state or the deadline.
+
+    A terminal target also waits for the worker thread to exit.  The worker
+    publishes the terminal state *before* its post-terminal work — history
+    persistence, the terminal event, the post-ingest retention sweep and,
+    in ``finally``, dropping the EDGAR resolver and idle-unload — so a test
+    asserting on any of those right after the state flips races the worker.
+    Serially that window is microseconds; under ``pytest -n auto`` CPU
+    contention it failed ~1 run in 10 (OPTIMIZATIONS.md F31).
+    """
     targets = target if isinstance(target, set) else {target}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         info = manager.get_task(task_id)
         if info is not None and info.state in targets:
+            if targets <= _TERMINAL_STATES:
+                _join_worker(task_id, timeout=max(0.0, deadline - time.monotonic()))
             return info
         time.sleep(0.01)
     raise AssertionError(

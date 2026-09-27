@@ -100,11 +100,13 @@ dev = [
     "pre-commit>=4.3",
 ]
 
-# Testing framework — pytest, coverage, and async test utilities.
+# Testing framework — pytest, coverage, async test utilities, and xdist
+# (CI runs the default suite with ``-n auto``; local runs stay serial).
 test = [
     "pytest>=8.0",
     "pytest-cov>=7.0",
     "pytest-asyncio>=1.0",
+    "pytest-xdist>=3.6",
     "coverage[toml]>=7.10",
 ]
 

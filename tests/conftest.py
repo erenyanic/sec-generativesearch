@@ -13,6 +13,26 @@ from collections.abc import Iterator
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _restore_settings_singleton() -> Iterator[None]:
+    """Put the settings singleton back to the object it was before the test.
+
+    Fixtures that call ``reload_settings()`` in teardown run *before*
+    ``monkeypatch`` restores the environment (teardown is reverse setup
+    order), so the rebuilt singleton can carry a test's patched env — e.g.
+    ``DB_MAX_FILINGS=1`` from ``tests/api/test_task_manager.py`` — into the
+    next test.  Serially the alphabetical file order hid it; under
+    ``pytest -n auto`` a worker ran ``tests/database`` straight after and
+    failed (OPTIMIZATIONS.md F31).  Restoring the pre-test object instead
+    of rebuilding costs nothing per test.
+    """
+    from sec_generative_search.config import settings as settings_module
+
+    before = settings_module._settings_instance
+    yield
+    settings_module._settings_instance = before
+
+
 @pytest.fixture
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[pytest.MonkeyPatch]:
     """Remove all env vars that influence Settings defaults.

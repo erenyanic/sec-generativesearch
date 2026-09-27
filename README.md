@@ -297,6 +297,7 @@ All deployment artefacts live under [`deploy/`](deploy/): the two Dockerfiles, t
 ```bash
 # Backend — default suite (load tests deselected via addopts)
 .venv/bin/python -m pytest
+.venv/bin/python -m pytest -n auto          # same suite across all cores (pytest-xdist; what CI runs)
 
 # Backend — opt-in load / throughput suite
 .venv/bin/python -m pytest -m load
