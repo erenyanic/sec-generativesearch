@@ -747,3 +747,98 @@ class TestSettingsDefaults:
         # And confirm that the explicit override path works.
         out2 = svc.retrieve("x", top_k=2)
         assert len(out2) == 2
+
+
+# ---------------------------------------------------------------------------
+# F14 — a pre-computed query vector (comparative fan-out embeds once)
+# ---------------------------------------------------------------------------
+
+
+class _CountingEmbedder(_FakeEmbedder):
+    def __init__(self, api_key: str) -> None:
+        super().__init__(api_key)
+        self.query_calls = 0
+
+    def embed_query(self, text: str) -> np.ndarray:
+        self.query_calls += 1
+        return super().embed_query(text)
+
+
+class TestPrecomputedQueryEmbedding:
+    def test_supplied_vector_skips_the_embed_step(self) -> None:
+        embedder = _CountingEmbedder("k")
+        chroma = _FakeChroma([_make_search_result(chunk_id="c1")])
+        svc = RetrievalService(embedder, chroma, token_counter=lambda _t: 1)
+        vector = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+
+        hits = svc.retrieve("revenue concentration risk", query_embedding=vector)
+
+        assert embedder.query_calls == 0
+        assert chroma.last_kwargs is not None
+        assert chroma.last_kwargs["query_embeddings"] == [vector.tolist()]
+        assert [h.chunk_id for h in hits] == ["c1"]
+
+    def test_without_a_vector_the_query_is_embedded(self) -> None:
+        embedder = _CountingEmbedder("k")
+        chroma = _FakeChroma([])
+        svc = RetrievalService(embedder, chroma, token_counter=lambda _t: 1)
+        svc.retrieve("revenue concentration risk")
+        assert embedder.query_calls == 1
+        assert chroma.last_kwargs["query_embeddings"] == [[1.0, 1.0, 1.0, 1.0]]
+
+    def test_embed_query_uses_the_service_embedder(self) -> None:
+        embedder = _CountingEmbedder("k")
+        svc = RetrievalService(embedder, _FakeChroma([]), token_counter=lambda _t: 1)
+        vector = svc.embed_query("revenue concentration risk")
+        assert embedder.query_calls == 1
+        assert vector.tolist() == [1.0, 1.0, 1.0, 1.0]
+
+    def test_query_validation_still_runs_with_a_vector(self) -> None:
+        svc = RetrievalService(_FakeEmbedder("k"), _FakeChroma([]), token_counter=lambda _t: 1)
+        with pytest.raises(SearchError):
+            svc.retrieve("   ", query_embedding=np.ones(4, dtype=np.float32))
+
+
+@pytest.mark.security
+class TestEmbedQueryErrorTyping:
+    """``embed_query`` keeps the embed step's error contract (M1, F14).
+
+    The comparative fan-out now embeds before the first ``retrieve``, so a
+    hosted-embedder outage must still surface as the same typed error the
+    route ladder classifies — never re-typed onto the caller-fault
+    ``SearchError`` (which would also push driver text into a body).
+    """
+
+    @pytest.mark.parametrize("query", ["", "   "])
+    def test_empty_query_is_a_search_error(self, query: str) -> None:
+        embedder = _CountingEmbedder("k")
+        svc = RetrievalService(embedder, _FakeChroma([]), token_counter=lambda _t: 1)
+        with pytest.raises(SearchError):
+            svc.embed_query(query)
+        assert embedder.query_calls == 0
+
+    @pytest.mark.parametrize(
+        "original",
+        [
+            ProviderError("embedding upstream down", provider="openai"),
+            DatabaseError("storage fault", details="driver text"),
+            SearchError("already typed"),
+        ],
+    )
+    def test_typed_errors_propagate_unchanged(self, original: Exception) -> None:
+        svc = RetrievalService(
+            _RaisingEmbedder("k", original), _FakeChroma([]), token_counter=lambda _t: 1
+        )
+        with pytest.raises(type(original)) as excinfo:
+            svc.embed_query("revenue risk")
+        assert excinfo.value is original
+
+    def test_untyped_error_is_wrapped(self) -> None:
+        svc = RetrievalService(
+            _RaisingEmbedder("k", RuntimeError("torch exploded")),
+            _FakeChroma([]),
+            token_counter=lambda _t: 1,
+        )
+        with pytest.raises(SearchError) as excinfo:
+            svc.embed_query("revenue risk")
+        assert excinfo.value.message == "Retrieval failed"

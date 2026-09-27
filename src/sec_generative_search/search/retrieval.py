@@ -52,6 +52,8 @@ from sec_generative_search.core.metrics import get_metrics
 from sec_generative_search.core.types import RetrievalResult, SearchResult
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from sec_generative_search.database.client import ChromaDBClient
     from sec_generative_search.providers.base import (
         BaseEmbeddingProvider,
@@ -203,6 +205,7 @@ class RetrievalService:
         max_per_filing: int | None = None,
         rerank_over_fetch_factor: int | None = None,
         context_token_budget: int | None = None,
+        query_embedding: np.ndarray | None = None,
     ) -> list[RetrievalResult]:
         """Retrieve up to ``top_k`` chunks ranked for the given query.
 
@@ -253,6 +256,14 @@ class RetrievalService:
                 ``None`` uses ``settings.search.rerank_over_fetch_factor``.
             context_token_budget: Token budget the returned list must
                 fit under.  Defaults to ``settings.rag.context_token_budget``.
+            query_embedding: The vector for *query*, already produced by
+                :meth:`embed_query` on this service — skips the embed step.
+                For callers that retrieve the same query several times with
+                different filters (the orchestrator's comparative fan-out,
+                F14); still one query, never a list.  It MUST come from this
+                service's own embedder: that is what keeps it in the space
+                of the stamped collection.  The query text is still required
+                (validation, logging, the optional reranker).
 
         Returns:
             List of :class:`RetrievalResult`, ordered by rerank score
@@ -331,6 +342,7 @@ class RetrievalService:
         try:
             raw = self._fetch_candidates(
                 query=query,
+                query_embedding=query_embedding,
                 n_results=fetch_count,
                 ticker=ticker,
                 form_type=form_type,
@@ -369,10 +381,37 @@ class RetrievalService:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def embed_query(self, query: str) -> np.ndarray:
+        """Embed *query* with this service's embedder, for :meth:`retrieve`.
+
+        Lets a caller that retrieves one question under several filters
+        embed it once and pass the vector as ``query_embedding``.  Failure
+        semantics are exactly those of the embed step inside
+        :meth:`retrieve`: an empty query is a :class:`SearchError`; a
+        :class:`ProviderError` (hosted-embedder outage / bad key) and any
+        other typed domain error propagate unchanged; only an untyped
+        failure is wrapped in :class:`SearchError`.  Never logs the query.
+        """
+        if not query or not query.strip():
+            raise SearchError(
+                "Empty retrieval query",
+                details="Cannot retrieve with an empty or whitespace-only query.",
+            )
+        try:
+            return self._embedder.embed_query(query)
+        except (SearchError, DatabaseError, ProviderError):
+            raise
+        except Exception as exc:
+            raise SearchError(
+                "Retrieval failed",
+                details=str(exc),
+            ) from exc
+
     def _fetch_candidates(
         self,
         *,
         query: str,
+        query_embedding: np.ndarray | None,
         n_results: int,
         ticker: str | list[str] | None,
         form_type: str | list[str] | None,
@@ -394,7 +433,11 @@ class RetrievalService:
         into a route body.  Only genuinely untyped failures are wrapped.
         """
         try:
-            vector = self._embedder.embed_query(query)
+            vector = (
+                query_embedding
+                if query_embedding is not None
+                else self._embedder.embed_query(query)
+            )
             # ``embed_query`` returns a 1-D ``np.ndarray``; ChromaDB
             # expects ``list[list[float]]``.
             query_embeddings = [vector.tolist()]

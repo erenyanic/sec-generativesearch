@@ -664,6 +664,12 @@ class RAGOrchestrator:
         # total chunks budget divided by the ticker count, so the
         # final merged context still fits the model.
         per_ticker_budget = max(256, chunks_token_budget // len(plan.tickers))
+        # Every leg retrieves the same ``query_en`` and only the ticker
+        # filter differs, so embed it once (F14) — one torch forward pass or
+        # one billable hosted-embedder call instead of one per ticker.  The
+        # vector comes from the service's own embedder, so it stays in the
+        # stamped collection's space.
+        query_vector = self._retrieval.embed_query(plan.query_en)
         merged: list[RetrievalResult] = []
         seen_ids: set[str] = set()
         for ticker in plan.tickers:
@@ -672,6 +678,7 @@ class RAGOrchestrator:
             results = self._retrieval.retrieve(
                 plan.query_en,
                 context_token_budget=per_ticker_budget,
+                query_embedding=query_vector,
                 **tuning,
                 **per_filters,
             )

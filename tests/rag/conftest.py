@@ -192,6 +192,12 @@ class FakeRetrievalService:
         self._results = results or []
         self._per_call_results = per_call_results
         self.calls: list[dict] = []
+        self.embed_calls: list[str] = []
+
+    def embed_query(self, query: str) -> tuple[str, str]:
+        """Record the call; return an opaque stand-in for the query vector."""
+        self.embed_calls.append(query)
+        return ("fake-vector", query)
 
     def retrieve(self, query: str, **kwargs) -> list[RetrievalResult]:
         self.calls.append({"query": query, **kwargs})

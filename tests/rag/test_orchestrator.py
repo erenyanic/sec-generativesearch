@@ -228,6 +228,67 @@ class TestComparativeFanOut:
         )
         orch.generate(plan)
         assert len(fake_retrieval.calls) == 1
+        # The single-query path embeds inside ``retrieve`` as before.
+        assert fake_retrieval.embed_calls == []
+        assert "query_embedding" not in fake_retrieval.calls[0]
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_fan_out_embeds_the_query_once(self, sample_chunks, fake_llm, streaming) -> None:
+        """F14: three legs, one embed; every leg reuses the same vector."""
+        retrieval = FakeRetrievalService(per_call_results=[[c] for c in sample_chunks[:3]])
+        orch = _build_orchestrator(retrieval=retrieval, llm=fake_llm)
+        plan = QueryPlan(
+            raw_query="Compare AAPL, MSFT and NVDA revenue",
+            query_en="Compare AAPL, MSFT and NVDA revenue",
+            tickers=["AAPL", "MSFT", "NVDA"],
+            suggested_answer_mode=AnswerMode.COMPARATIVE,
+        )
+
+        if streaming:
+            list(orch.generate_stream(plan))
+        else:
+            orch.generate(plan)
+
+        assert retrieval.embed_calls == ["Compare AAPL, MSFT and NVDA revenue"]
+        assert [call["ticker"] for call in retrieval.calls] == ["AAPL", "MSFT", "NVDA"]
+        vectors = [call["query_embedding"] for call in retrieval.calls]
+        assert all(v is vectors[0] for v in vectors)
+        assert vectors[0] == ("fake-vector", "Compare AAPL, MSFT and NVDA revenue")
+        # The query text still travels with every leg.
+        assert all(call["query"] == plan.query_en for call in retrieval.calls)
+
+    @pytest.mark.security
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_embed_failure_propagates_unchanged(self, fake_llm, streaming) -> None:
+        """A hosted-embedder outage in the pre-embed keeps its type (M1 contract).
+
+        The ``/api/rag/*`` ladder classifies the ``ProviderError`` exactly as
+        when the embed ran inside the first ``retrieve``; no leg and no LLM
+        call happen.
+        """
+        from sec_generative_search.core.exceptions import ProviderError
+
+        original = ProviderError("embedding upstream down", provider="openai")
+
+        class _FailingEmbed(FakeRetrievalService):
+            def embed_query(self, query: str) -> tuple[str, str]:
+                raise original
+
+        retrieval = _FailingEmbed()
+        orch = _build_orchestrator(retrieval=retrieval, llm=fake_llm)
+        plan = QueryPlan(
+            raw_query="Compare AAPL and MSFT",
+            tickers=["AAPL", "MSFT"],
+            suggested_answer_mode=AnswerMode.COMPARATIVE,
+        )
+        with pytest.raises(ProviderError) as excinfo:
+            if streaming:
+                list(orch.generate_stream(plan))
+            else:
+                orch.generate(plan)
+        assert excinfo.value is original
+        assert retrieval.calls == []
+        assert fake_llm.last_request is None
 
 
 class TestConversationHistory:
