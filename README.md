@@ -315,7 +315,7 @@ pnpm build
 pnpm audit:ci
 ```
 
-**Backend:** 2855 tests, of which 1085 are security-regression locks (`@pytest.mark.security`). **Frontend:** 299 tests across security and functional trees. A security-tree failure is a release blocker.
+**Backend:** 2860 tests, of which 1090 are security-regression locks (`@pytest.mark.security`). **Frontend:** 299 tests across security and functional trees. A security-tree failure is a release blocker.
 
 ---
 

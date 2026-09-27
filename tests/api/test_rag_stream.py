@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date
@@ -40,6 +41,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 from sec_generative_search.api.app import create_app
 from sec_generative_search.config.settings import reload_settings
@@ -1100,3 +1102,231 @@ class TestRagStreamClientLifecycle:
         )
         assert response.status_code == 400
         assert orch.llm.closed is True
+
+
+# ---------------------------------------------------------------------------
+# F13 — a client disconnect stops generation
+# ---------------------------------------------------------------------------
+
+_TOTAL_DELTAS = 200
+_DISCONNECT_AFTER = 5
+
+
+class _TeardownLog:
+    """Ordered record of teardown steps and the threads they ran on."""
+
+    def __init__(self) -> None:
+        self.steps: list[tuple[str, str]] = []
+
+    def record(self, step: str) -> None:
+        self.steps.append((step, threading.current_thread().name))
+
+
+@dataclass
+class _RecordingLLM:
+    teardown: _TeardownLog
+    provider_name: str = "openai"
+
+    def close(self) -> None:
+        self.teardown.record("llm.close")
+
+
+@dataclass
+class _LongStreamOrch:
+    """Yields 200 deltas, 20 ms apart — a long answer the client abandons."""
+
+    teardown: _TeardownLog
+    retrieval: Any = None
+    llm: Any = None
+    iterations: int = 0
+
+    def generate_stream(self, plan: QueryPlan, **_: Any) -> Iterator[StreamEvent]:
+        import time as _time
+
+        try:
+            for i in range(_TOTAL_DELTAS):
+                self.iterations += 1
+                yield StreamEvent(delta=f"token{i} ")
+                _time.sleep(0.02)
+            yield StreamEvent(final=_default_final_result(citations=[]))
+        finally:
+            self.teardown.record("generator.finally")
+
+
+def _stream_scope(body: bytes, *, spec_version: str) -> dict[str, Any]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": spec_version},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": "/api/rag/stream",
+        "raw_path": b"/api/rag/stream",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+            (b"x-provider-key-openai", b"sk-key-123"),  # pragma: allowlist secret
+        ],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 443),
+    }
+
+
+async def _stream_then_disconnect(app: Any, *, how: str, teardown: _TeardownLog) -> int:
+    """Drive the ASGI app; the client disconnects after a few deltas.
+
+    ``how`` picks where the disconnect lands:
+
+    - ``"listener"`` — ASGI spec 2.3 (what uvicorn advertises): Starlette's
+      disconnect listener cancels the body while it awaits the queue
+      (``CancelledError`` inside the SSE body);
+    - ``"listener_mid_send"`` — same, but the ``send`` of the triggering
+      delta is held open, so the body is paused at a ``yield`` and is left
+      suspended (closed with ``GeneratorExit``);
+    - ``"send_raises"`` — ASGI spec 2.4: no listener; the next ``send``
+      raises ``OSError`` and Starlette raises ``ClientDisconnect``.
+
+    After the request returns, the event loop is kept running until the
+    producer has torn down (or 3 s pass), as it would be under uvicorn.
+    Returning straight away would close the loop and kill the producer on
+    its next ``call_soon_threadsafe`` — masking a missing stop signal.
+    Returns the number of delta frames the client received.
+    """
+    import asyncio
+
+    body = json.dumps({"plan": _sample_plan_payload()}).encode()
+    disconnected = asyncio.Event()
+    request_delivered = False
+    deltas = 0
+
+    async def receive() -> dict[str, Any]:
+        nonlocal request_delivered
+        if not request_delivered:
+            request_delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        nonlocal deltas
+        if message["type"] != "http.response.body":
+            return
+        if how == "send_raises" and deltas >= _DISCONNECT_AFTER:
+            raise OSError("client went away")
+        if b"event: delta" in message.get("body", b""):
+            deltas += 1
+            if deltas == _DISCONNECT_AFTER:
+                disconnected.set()
+                if how == "listener_mid_send":
+                    await asyncio.sleep(0.2)
+
+    scope = _stream_scope(body, spec_version="2.4" if how == "send_raises" else "2.3")
+    try:
+        await asyncio.wait_for(app(scope, receive, send), timeout=5)
+    except ClientDisconnect:
+        assert how == "send_raises"
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 3.0
+    while len(teardown.steps) < 2 and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+    return deltas
+
+
+@pytest.mark.security
+class TestRagStreamClientDisconnect:
+    """F13: an abandoned stream stops generating within one event.
+
+    Without the stop signal the producer ran all 200 deltas into a queue no
+    one read, holding the provider stream (and its billing) open to the end.
+    The teardown keeps the F5(a) contract: generator first, then the client,
+    exactly once, on the producer thread.
+    """
+
+    @pytest.mark.parametrize("how", ["listener", "listener_mid_send", "send_raises"])
+    def test_disconnect_stops_generation_and_tears_down_on_the_producer(
+        self,
+        rag_stream_app_factory,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        how: str,
+    ) -> None:
+        import asyncio
+
+        teardown = _TeardownLog()
+        orch = _LongStreamOrch(teardown=teardown)
+        app, _build, _stub = rag_stream_app_factory()
+        monkeypatch.setattr(
+            "sec_generative_search.api.routes.rag.build_llm_provider",
+            lambda _name, **_kw: _RecordingLLM(teardown=teardown),
+        )
+        monkeypatch.setattr(
+            "sec_generative_search.api.routes.rag.RAGOrchestrator",
+            lambda **_kw: orch,
+        )
+
+        # The handler sits on the package logger itself, so each audit
+        # record is captured exactly once (no root propagation needed).
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            received = asyncio.run(_stream_then_disconnect(app, how=how, teardown=teardown))
+
+        assert received == _DISCONNECT_AFTER
+        # Generation stopped within about one event of the disconnect.
+        assert orch.iterations <= _DISCONNECT_AFTER + 3
+        assert orch.iterations < _TOTAL_DELTAS
+        # Generator torn down first, then the client — once, on the producer.
+        assert teardown.steps == [
+            ("generator.finally", "rag-stream-producer"),
+            ("llm.close", "rag-stream-producer"),
+        ]
+        completed = [
+            r.getMessage() for r in caplog.records if "rag_stream_completed" in r.getMessage()
+        ]
+        assert len(completed) == 1
+        assert "status=client_disconnected" in completed[0]
+
+    def test_a_fully_consumed_stream_is_not_reported_as_disconnected(
+        self,
+        rag_stream_app_factory,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        events = [StreamEvent(delta="x"), StreamEvent(final=_default_final_result(citations=[]))]
+        app, _build, orch = rag_stream_app_factory(events=events)
+        client = TestClient(app, base_url="https://testserver")
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            response = client.post(
+                "/api/rag/stream",
+                json={"plan": _sample_plan_payload()},
+                headers={"X-Provider-Key-openai": "sk-key-123"},  # pragma: allowlist secret
+            )
+            _ = response.text
+        completed = [
+            r.getMessage() for r in caplog.records if "rag_stream_completed" in r.getMessage()
+        ]
+        assert len(completed) == 1
+        assert "status=ok" in completed[0]
+        assert orch.llm.closed is True
+
+    def test_an_in_stream_error_keeps_its_own_status(
+        self,
+        rag_stream_app_factory,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        app, _build, _orch = rag_stream_app_factory(
+            events=[StreamEvent(delta="partial ")],
+            raise_after=ProviderRateLimitError("upstream limited"),
+        )
+        client = TestClient(app, base_url="https://testserver")
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            _ = client.post(
+                "/api/rag/stream",
+                json={"plan": _sample_plan_payload()},
+                headers={"X-Provider-Key-openai": "sk-key-123"},  # pragma: allowlist secret
+            ).text
+        completed = [
+            r.getMessage() for r in caplog.records if "rag_stream_completed" in r.getMessage()
+        ]
+        assert len(completed) == 1
+        assert "status=ProviderRateLimitError" in completed[0]

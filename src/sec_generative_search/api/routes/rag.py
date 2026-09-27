@@ -59,13 +59,14 @@ import asyncio
 import json
 import logging
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, NoReturn
 
 from fastapi import APIRouter, Depends, Request
 from starlette.responses import StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from sec_generative_search.api.dependencies import (
     get_retrieval_service,
@@ -1024,6 +1025,49 @@ def _classify_stream_exception(exc: Exception) -> dict:
     )
 
 
+class _ClosingStreamingResponse(StreamingResponse):
+    """A ``StreamingResponse`` that always closes its SSE body generator.
+
+    On a client disconnect Starlette stops iterating the body, but when the
+    disconnect lands while the body is paused at a ``yield`` (mid-``send``)
+    the generator is left suspended.  Its ``finally`` — which signals the
+    producer thread to stop (F13) and writes the ``rag_stream_completed``
+    audit line — would then run only when the generator is garbage
+    collected, and the exception traceback's reference cycle defers that
+    indefinitely (measured: the producer ran 153 of 200 events after the
+    client had gone).  Closing it here makes that teardown deterministic on
+    every exit path; on a normal exit the generator is already exhausted and
+    ``aclose()`` is a no-op.
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+
+def _close_event_stream(events: Iterator[StreamEvent] | None) -> None:
+    """Close the orchestrator's event generator early; never raises.
+
+    A no-op on ``None`` (the call itself raised) or an exhausted generator.
+    On an abandoned one it raises ``GeneratorExit`` at the paused ``yield``
+    so the orchestrator's and the adapter's ``finally`` / ``with`` blocks run
+    now, on the producer thread, rather than whenever the generator is
+    collected.  A failure is logged by
+    exception type only (it can carry provider text).
+    """
+    close = getattr(events, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception as exc:
+        logger.warning("rag stream: closing the event stream failed: %s", type(exc).__name__)
+
+
 def _run_orchestrator_in_thread(
     orchestrator: RAGOrchestrator,
     *,
@@ -1040,6 +1084,7 @@ def _run_orchestrator_in_thread(
     routing_hints: OpenRouterRoutingHints | None,
     queue: asyncio.Queue,
     loop: asyncio.AbstractEventLoop,
+    stop: threading.Event,
 ) -> None:
     """Drive the synchronous orchestrator generator from a worker thread.
 
@@ -1064,15 +1109,24 @@ def _run_orchestrator_in_thread(
     Client lifetime: the producer thread owns *llm* — the SDK
     client is used only inside ``generate_stream`` — so it is closed in
     the producer's ``finally``, i.e. exactly when the stream is exhausted
-    (or fails), on the same thread that used it.  Closing here rather than
-    in the route handler avoids a race where a client disconnect tears
-    the async consumer down while the producer is mid-iteration and still
-    holding the transport open.
+    (or fails, or is abandoned), on the same thread that used it.  Closing
+    here rather than in the route handler avoids a race where a client
+    disconnect tears the async consumer down while the producer is
+    mid-iteration and still holding the transport open.
+
+    Cancellation (F13): the consumer sets *stop* whenever it exits.  The
+    producer checks it between events; on a set flag it stops iterating,
+    closes the orchestrator generator (so the provider's SDK stream is torn
+    down on this thread) and then the client, so an abandoned stream stops
+    generating — and billing — within one event instead of running the
+    whole completion into a queue no one reads.  Nothing is pushed onto the
+    queue once stopped: the consumer is gone.
     """
 
     def producer() -> None:
+        events: Iterator[StreamEvent] | None = None
         try:
-            for event in orchestrator.generate_stream(
+            events = orchestrator.generate_stream(
                 plan,
                 mode=mode,
                 model=model,
@@ -1083,20 +1137,29 @@ def _run_orchestrator_in_thread(
                 max_per_filing=max_per_filing,
                 rerank_over_fetch_factor=rerank_over_fetch_factor,
                 routing_hints=routing_hints,
-            ):
+            )
+            for event in events:
+                if stop.is_set():
+                    break
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:
-            loop.call_soon_threadsafe(queue.put_nowait, exc)
+            if not stop.is_set():
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
         finally:
-            # Close the client *before* the sentinel so a fully-consumed
-            # stream guarantees teardown has run.  ``close()`` is contractually
-            # quiet, but wrap it anyway: the done-sentinel MUST be pushed even
-            # if a future close() regressed and raised — otherwise the consumer
-            # awaits the queue forever and the stream hangs.
+            # Teardown order: the orchestrator generator first (its
+            # ``finally`` blocks and the adapter's SDK stream close on this
+            # thread), then the client, then the sentinel — so a
+            # fully-consumed stream guarantees teardown has run.  ``close()``
+            # is contractually quiet, but wrap it anyway: the done-sentinel
+            # MUST be pushed even if a future close() regressed and raised —
+            # otherwise the consumer awaits the queue forever and the stream
+            # hangs.  A stopped consumer reads nothing, so it gets no sentinel.
             try:
+                _close_event_stream(events)
                 llm.close()
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, _SSE_DONE_SENTINEL)
+                if not stop.is_set():
+                    loop.call_soon_threadsafe(queue.put_nowait, _SSE_DONE_SENTINEL)
 
     threading.Thread(
         target=producer,
@@ -1207,6 +1270,7 @@ async def stream_answer(
         """Async generator that interleaves orchestrator events + heartbeats."""
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
+        stop = threading.Event()
         client_ip = _client_ip(request)
 
         _run_orchestrator_in_thread(
@@ -1224,12 +1288,20 @@ async def stream_answer(
             routing_hints=routing_hints,
             queue=queue,
             loop=loop,
+            stop=stop,
         )
 
         chunks_streamed = 0
         citations_emitted = 0
         refused = False
         completion_status = "ok"
+        # Set on the two exits where the stream ran to its end (done
+        # sentinel, or an in-stream error event).  Any other exit is the
+        # client going away: a ``CancelledError`` from Starlette's
+        # disconnect listener, or a ``GeneratorExit`` when the paused body
+        # is closed — which of the two depends on where the disconnect
+        # lands, so neither is caught to detect it.
+        finished = False
 
         try:
             while True:
@@ -1243,8 +1315,10 @@ async def stream_answer(
                     continue
 
                 if item is _SSE_DONE_SENTINEL:
+                    finished = True
                     return
                 if isinstance(item, Exception):
+                    finished = True
                     completion_status = type(item).__name__
                     logger.error(
                         "rag stream exception: provider=%s kind=%s",
@@ -1282,14 +1356,12 @@ async def stream_answer(
                         ),
                     )
         finally:
-            # The queue's producer thread is daemon-flagged; if the
-            # client disconnected mid-stream, asyncio cancels this
-            # coroutine which propagates here as a CancelledError. The
-            # producer keeps running until the orchestrator yields its
-            # next event, then quietly exits when ``put_nowait`` lands
-            # in a queue no one is reading. That's an acceptable cost
-            # for not having to plumb a cancellation token through the
-            # sync orchestrator API.
+            # Always signal the producer (harmless once it has finished):
+            # on a disconnect it stops at its next event and tears the
+            # provider stream + client down on its own thread (F13).
+            stop.set()
+            if not finished:
+                completion_status = "client_disconnected"
             audit_log(
                 "rag_stream_completed",
                 client_ip=client_ip,
@@ -1313,7 +1385,7 @@ async def stream_answer(
     #   - ``Connection: keep-alive`` is technically the HTTP/1.1
     #     default but stating it makes the intent explicit for any
     #     intermediary that downgrades.
-    return StreamingResponse(
+    return _ClosingStreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={
