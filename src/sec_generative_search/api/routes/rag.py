@@ -105,11 +105,11 @@ from sec_generative_search.core.types import (
     estimate_cost,
 )
 from sec_generative_search.providers.factory import build_llm_provider
-from sec_generative_search.providers.openrouter import OpenRouterRoutingHints
 from sec_generative_search.providers.registry import (
     ProviderRegistry,
     ProviderSurface,
 )
+from sec_generative_search.providers.routing_hints import OpenRouterRoutingHints
 from sec_generative_search.rag.modes import AnswerMode
 from sec_generative_search.rag.orchestrator import RAGOrchestrator, StreamEvent
 from sec_generative_search.rag.query_understanding import (

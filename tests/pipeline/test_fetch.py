@@ -490,3 +490,26 @@ class TestFetchErrorMessagesCarryNoTicker:
             if {"ticker", "tickers"} & (names | attrs):
                 offenders.append(node.lineno)
         assert offenders == [], f"FetchError messages interpolating a ticker at lines {offenders}"
+
+
+class TestLazyEdgarProxies:
+    """F28: ``edgar`` is imported on the first EDGAR-bound call; the module-level
+    ``Company`` / ``set_identity`` proxies must still reach edgartools."""
+
+    def test_company_proxy_constructs_an_edgartools_company(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import edgar
+
+        built: list[str] = []
+        monkeypatch.setattr(edgar, "Company", lambda ticker: built.append(ticker) or "company")
+        assert fetch_module.Company("AAPL") == "company"
+        assert built == ["AAPL"]
+
+    def test_set_identity_proxy_calls_edgartools(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import edgar
+
+        applied: list[str] = []
+        monkeypatch.setattr(edgar, "set_identity", applied.append)
+        fetch_module.set_identity("Jane Doe jane@example.invalid")
+        assert applied == ["Jane Doe jane@example.invalid"]

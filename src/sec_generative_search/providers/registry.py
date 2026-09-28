@@ -38,45 +38,30 @@ Design notes:
   the ``LocalEmbeddingProvider`` entry currently declares an extra
   (``sentence_transformers``).  Probes are cached on the class so the
   cost is paid once per process.
+
+- **Adapter classes load on demand (F28).**  Each curated entry names its
+  adapter as a ``"module:Class"`` reference and carries its
+  ``default_model``, so listing providers, settings validation and the
+  LLM capability probe never import a vendor SDK (``openai`` /
+  ``anthropic`` / ``google.genai`` cost ~1.75 s and ~100 MB at import).
+  :attr:`ProviderEntry.provider_cls` resolves the class — importing its
+  module, SDK included — only for what genuinely needs it: construction
+  (``validate_key``, the factory) and the embedding dimension table.
 """
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import cache
 from typing import Any, ClassVar
 
 from sec_generative_search.core.exceptions import ProviderAuthError
 from sec_generative_search.core.types import ProviderCapability
-from sec_generative_search.providers.anthropic import AnthropicProvider
 from sec_generative_search.providers.catalogue import model_catalogue
-from sec_generative_search.providers.deepseek import DeepSeekProvider
-from sec_generative_search.providers.gemini import (
-    GeminiEmbeddingProvider,
-    GeminiProvider,
-)
-from sec_generative_search.providers.grok import GrokProvider
-from sec_generative_search.providers.kimi import KimiProvider
-from sec_generative_search.providers.local import LocalEmbeddingProvider
-from sec_generative_search.providers.local_llm import LocalLLMProvider
-from sec_generative_search.providers.mimo import MimoProvider
-from sec_generative_search.providers.minimax import MiniMaxProvider
-from sec_generative_search.providers.mistral import (
-    MistralEmbeddingProvider,
-    MistralProvider,
-)
 from sec_generative_search.providers.network_policy import hosted_client_kwargs
-from sec_generative_search.providers.openai import (
-    OpenAIEmbeddingProvider,
-    OpenAIProvider,
-)
-from sec_generative_search.providers.openrouter import OpenRouterProvider
-from sec_generative_search.providers.qwen import (
-    QwenEmbeddingProvider,
-    QwenProvider,
-)
-from sec_generative_search.providers.zai import ZaiProvider
 
 __all__ = [
     "ProviderEntry",
@@ -112,17 +97,22 @@ class ProviderSurface(StrEnum):
 class ProviderEntry:
     """One curated row in the registry.
 
-    ``provider_cls`` must be the concrete adapter class — the registry
+    ``provider`` names the concrete adapter class — the registry
     deliberately does not accept ABCs, mixins, or factories.
 
     Attributes:
         name: The vendor key, matching ``provider_cls.provider_name``.
             Lower-case by convention (``"openai"``, ``"anthropic"``).
         surface: Which of the three surfaces this entry exposes.
-        provider_cls: The concrete provider class.  Stored as :class:`type`
-            because the registry-level type system intentionally treats
-            LLM / embedding / reranker classes uniformly — callers pick
-            the surface up-front, so we do not need a generic.
+        provider: The concrete provider class, or a ``"module:Class"``
+            reference resolved (and cached) on first use of
+            :attr:`provider_cls` — the curated entries use references so
+            no vendor SDK is imported until a class is really needed.
+        default_model: The adapter's ``default_model``, carried on the
+            entry so listings and the LLM capability probe need not import
+            the adapter.  Must equal the class attribute (locked by
+            ``test_registry.py::TestLazyAdapterClasses``); empty falls back
+            to the class attribute.
         requires_extras: Tuple of importable module names that must be
             available for this entry to be usable.  Empty by default;
             populated for entries gated behind an optional-extras install
@@ -165,12 +155,35 @@ class ProviderEntry:
 
     name: str
     surface: ProviderSurface
-    provider_cls: type
+    provider: type | str
     requires_extras: tuple[str, ...] = ()
     supports_arbitrary_models: bool = False
     supports_upstream_routing: bool = False
     requires_api_key: bool = True
     free_tier: bool = False
+    default_model: str = ""
+
+    @property
+    def provider_cls(self) -> type:
+        """The adapter class, importing its module on first use."""
+        if isinstance(self.provider, str):
+            return _resolve_adapter(self.provider)
+        return self.provider
+
+    @property
+    def default_model_slug(self) -> str:
+        """The default model, without importing the adapter when recorded."""
+        return self.default_model or getattr(self.provider_cls, "default_model", "") or ""
+
+
+@cache
+def _resolve_adapter(reference: str) -> type:
+    """Import ``"module:Class"`` once per process."""
+    module_name, _, class_name = reference.partition(":")
+    return getattr(importlib.import_module(module_name), class_name)
+
+
+_P = "sec_generative_search.providers"
 
 
 # ---------------------------------------------------------------------------
@@ -195,21 +208,63 @@ class ProviderRegistry:
     # rest of the package and is therefore intentionally noisy.
     _ENTRIES: ClassVar[tuple[ProviderEntry, ...]] = (
         # --- LLM surface ---
-        ProviderEntry("openai", ProviderSurface.LLM, OpenAIProvider),
-        ProviderEntry("anthropic", ProviderSurface.LLM, AnthropicProvider),
-        ProviderEntry("gemini", ProviderSurface.LLM, GeminiProvider),
-        ProviderEntry("deepseek", ProviderSurface.LLM, DeepSeekProvider),
-        ProviderEntry("kimi", ProviderSurface.LLM, KimiProvider),
-        ProviderEntry("mistral", ProviderSurface.LLM, MistralProvider),
-        ProviderEntry("qwen", ProviderSurface.LLM, QwenProvider),
-        ProviderEntry("zai", ProviderSurface.LLM, ZaiProvider),
-        ProviderEntry("grok", ProviderSurface.LLM, GrokProvider),
-        ProviderEntry("minimax", ProviderSurface.LLM, MiniMaxProvider),
-        ProviderEntry("mimo", ProviderSurface.LLM, MimoProvider),
+        ProviderEntry(
+            "openai",
+            ProviderSurface.LLM,
+            f"{_P}.openai:OpenAIProvider",
+            default_model="gpt-5.4-mini",
+        ),
+        ProviderEntry(
+            "anthropic",
+            ProviderSurface.LLM,
+            f"{_P}.anthropic:AnthropicProvider",
+            default_model="claude-haiku-4-5",
+        ),
+        ProviderEntry(
+            "gemini",
+            ProviderSurface.LLM,
+            f"{_P}.gemini:GeminiProvider",
+            default_model="gemini-3-flash-preview",
+        ),
+        ProviderEntry(
+            "deepseek",
+            ProviderSurface.LLM,
+            f"{_P}.deepseek:DeepSeekProvider",
+            default_model="deepseek-v4-flash",
+        ),
+        ProviderEntry(
+            "kimi", ProviderSurface.LLM, f"{_P}.kimi:KimiProvider", default_model="kimi-k2.5"
+        ),
+        ProviderEntry(
+            "mistral",
+            ProviderSurface.LLM,
+            f"{_P}.mistral:MistralProvider",
+            default_model="mistral-small-2603",
+        ),
+        ProviderEntry(
+            "qwen", ProviderSurface.LLM, f"{_P}.qwen:QwenProvider", default_model="qwen3.6-plus"
+        ),
+        ProviderEntry("zai", ProviderSurface.LLM, f"{_P}.zai:ZaiProvider", default_model="glm-5"),
+        ProviderEntry(
+            "grok",
+            ProviderSurface.LLM,
+            f"{_P}.grok:GrokProvider",
+            default_model="grok-4-1-fast-non-reasoning",
+        ),
+        ProviderEntry(
+            "minimax",
+            ProviderSurface.LLM,
+            f"{_P}.minimax:MiniMaxProvider",
+            default_model="minimax-m2.7",
+        ),
+        ProviderEntry(
+            "mimo", ProviderSurface.LLM, f"{_P}.mimo:MimoProvider", default_model="mimo-v2.5"
+        ),
         ProviderEntry(
             "openrouter",
             ProviderSurface.LLM,
-            OpenRouterProvider,
+            f"{_P}.openrouter:OpenRouterProvider",
+            default_model="qwen/qwen3.6-plus",
             supports_arbitrary_models=True,
             supports_upstream_routing=True,
         ),
@@ -224,20 +279,42 @@ class ProviderRegistry:
         ProviderEntry(
             "local_llm",
             ProviderSurface.LLM,
-            LocalLLMProvider,
+            f"{_P}.local_llm:LocalLLMProvider",
+            default_model="llama3.2",
             supports_arbitrary_models=True,
             requires_api_key=False,
             free_tier=True,
         ),
         # --- Embedding surface ---
-        ProviderEntry("openai", ProviderSurface.EMBEDDING, OpenAIEmbeddingProvider),
-        ProviderEntry("gemini", ProviderSurface.EMBEDDING, GeminiEmbeddingProvider),
-        ProviderEntry("mistral", ProviderSurface.EMBEDDING, MistralEmbeddingProvider),
-        ProviderEntry("qwen", ProviderSurface.EMBEDDING, QwenEmbeddingProvider),
+        ProviderEntry(
+            "openai",
+            ProviderSurface.EMBEDDING,
+            f"{_P}.openai:OpenAIEmbeddingProvider",
+            default_model="text-embedding-3-small",
+        ),
+        ProviderEntry(
+            "gemini",
+            ProviderSurface.EMBEDDING,
+            f"{_P}.gemini:GeminiEmbeddingProvider",
+            default_model="gemini-embedding-2",
+        ),
+        ProviderEntry(
+            "mistral",
+            ProviderSurface.EMBEDDING,
+            f"{_P}.mistral:MistralEmbeddingProvider",
+            default_model="mistral-embed",
+        ),
+        ProviderEntry(
+            "qwen",
+            ProviderSurface.EMBEDDING,
+            f"{_P}.qwen:QwenEmbeddingProvider",
+            default_model="text-embedding-v4",
+        ),
         ProviderEntry(
             "local",
             ProviderSurface.EMBEDDING,
-            LocalEmbeddingProvider,
+            f"{_P}.local:LocalEmbeddingProvider",
+            default_model="google/embeddinggemma-300m",
             requires_extras=("sentence_transformers",),
         ),
         # --- Reranker surface ---
@@ -339,11 +416,11 @@ class ProviderRegistry:
         :meth:`supports_arbitrary_models` to decide between a dropdown
         and a free-text input in the UI.
         """
-        cls_obj = cls.get_class(name, surface)
+        entry = cls.get_entry(name, surface)
         if surface is ProviderSurface.LLM:
             return model_catalogue().list_llm_models(name)
         if surface is ProviderSurface.EMBEDDING:
-            dimensions = getattr(cls_obj, "MODEL_DIMENSIONS", {})
+            dimensions = getattr(entry.provider_cls, "MODEL_DIMENSIONS", {})
             return list(dimensions.keys())
         # Reranker surface — no model surface yet, return empty.
         return []
@@ -397,10 +474,11 @@ class ProviderRegistry:
         creation).
         """
         entry = cls.get_entry(name, surface)
-        cls_obj = entry.provider_cls
 
         if surface is ProviderSurface.LLM:
-            slug = model or getattr(cls_obj, "default_model", "") or ""
+            # Never imports the adapter (or its SDK): the default model is
+            # on the entry and the capability comes from the catalogue.
+            slug = model or entry.default_model_slug
             cap = model_catalogue().get_llm_capability(name, slug)
             if cap is not None:
                 return cap
@@ -425,8 +503,8 @@ class ProviderRegistry:
             return ProviderCapability(chat=True, streaming=True)
 
         if surface is ProviderSurface.EMBEDDING:
-            slug = model or getattr(cls_obj, "default_model", "") or ""
-            dimensions: dict[str, int] = getattr(cls_obj, "MODEL_DIMENSIONS", {})
+            slug = model or entry.default_model_slug
+            dimensions: dict[str, int] = getattr(entry.provider_cls, "MODEL_DIMENSIONS", {})
             if slug not in dimensions:
                 raise ValueError(
                     f"Unknown embedding model '{slug}' for {name}. "
@@ -448,9 +526,8 @@ class ProviderRegistry:
         unknown slugs (same contract as :meth:`get_capability`).
         """
         entry = cls.get_entry(name, ProviderSurface.EMBEDDING)
-        cls_obj = entry.provider_cls
-        slug = model or getattr(cls_obj, "default_model", "") or ""
-        dimensions: dict[str, int] = getattr(cls_obj, "MODEL_DIMENSIONS", {})
+        slug = model or entry.default_model_slug
+        dimensions: dict[str, int] = getattr(entry.provider_cls, "MODEL_DIMENSIONS", {})
         if slug not in dimensions:
             raise ValueError(
                 f"Unknown embedding model '{slug}' for {name}. "

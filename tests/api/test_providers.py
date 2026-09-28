@@ -70,7 +70,7 @@ def stub_provider(monkeypatch: pytest.MonkeyPatch):
     fake_entry = ProviderEntry(
         name="openai",
         surface=ProviderSurface.LLM,
-        provider_cls=_Factory,
+        provider=_Factory,
     )
 
     def _get_entry(name, surface):

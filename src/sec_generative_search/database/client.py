@@ -31,8 +31,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import chromadb
-
 from sec_generative_search.config.constants import COLLECTION_NAME
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.exceptions import (
@@ -93,6 +91,9 @@ class ChromaDBClient:
         self._stamp = stamp
 
         try:
+            # Lazy (F28): keeps chromadb (~0.6 s) off every database import.
+            import chromadb
+
             self._client = chromadb.PersistentClient(path=self._chroma_path)
             self._collection = self._client.get_or_create_collection(
                 name=COLLECTION_NAME,

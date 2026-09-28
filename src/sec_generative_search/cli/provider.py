@@ -328,7 +328,8 @@ def list_providers(
         if is_json(output_format):
             providers_payload: list[dict[str, Any]] = []
             for entry in entries:
-                default_model = getattr(entry.provider_cls, "default_model", "") or None
+                # The entry records it — never import the adapter (and SDK) here.
+                default_model = entry.default_model_slug or None
                 pricing = _pricing_label(entry.name, entry.surface, default_model)
                 env_var = _ENV_VAR_BY_PROVIDER.get(entry.name)
                 # ``key_resolves`` is a boolean only — never include
@@ -377,7 +378,7 @@ def list_providers(
         table.add_column("Notes", style="dim")
 
         for entry in entries:
-            default_model = getattr(entry.provider_cls, "default_model", "") or "—"
+            default_model = entry.default_model_slug or "—"
             pricing = _pricing_label(
                 entry.name, entry.surface, None if default_model == "—" else default_model
             )

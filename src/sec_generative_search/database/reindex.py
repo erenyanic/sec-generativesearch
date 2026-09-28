@@ -59,8 +59,6 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-import chromadb
-
 from sec_generative_search.config.constants import COLLECTION_NAME
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.exceptions import DatabaseError
@@ -69,6 +67,8 @@ from sec_generative_search.core.types import EmbedderStamp, ReindexReport
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    import chromadb
 
     from sec_generative_search.providers.base import BaseEmbeddingProvider
 
@@ -158,6 +158,9 @@ class ReindexService:
         self._batch_size = batch_size
 
         try:
+            # Lazy (F28): keeps chromadb (~0.6 s) off every database import.
+            import chromadb
+
             self._client = chromadb.PersistentClient(path=self._chroma_path)
         except Exception as exc:
             raise DatabaseError(

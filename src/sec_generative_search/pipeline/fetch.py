@@ -33,14 +33,14 @@ Usage:
         process(filing_id, html)
 """
 
+from __future__ import annotations
+
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any
-
-from edgar import Company, set_identity
+from typing import TYPE_CHECKING, Any
 
 from sec_generative_search.config.constants import BASE_FORMS, SUPPORTED_FORMS
 from sec_generative_search.config.settings import get_settings
@@ -48,7 +48,29 @@ from sec_generative_search.core.exceptions import FetchError
 from sec_generative_search.core.logging import get_logger, redact_for_log
 from sec_generative_search.core.types import FilingIdentifier
 
+if TYPE_CHECKING:
+    from edgar import Company as EdgarCompany
+
 logger = get_logger(__name__)
+
+
+# edgartools is imported on the first EDGAR-bound call, not with this module
+# (F28): ``import edgar`` costs ~0.8 s (its HTML/XBRL stack), and this module
+# is reached by every ``sec_generative_search.pipeline`` import — the API,
+# ``sec-rag --help``, the demo-reset Job.  The proxies keep the edgartools
+# names at module level, which is also the seam the tests patch.
+def Company(ticker: str) -> EdgarCompany:  # noqa: N802 — stands in for the edgartools class
+    """Construct an ``edgar.Company`` (lazy import)."""
+    from edgar import Company as _Company
+
+    return _Company(ticker)
+
+
+def set_identity(identity: str) -> None:
+    """Call ``edgar.set_identity`` (lazy import)."""
+    from edgar import set_identity as _set_identity
+
+    _set_identity(identity)
 
 
 @dataclass
@@ -307,7 +329,7 @@ class FilingFetcher:
 
         return f"{start_str}:{end_str}"
 
-    def _get_company(self, ticker: str) -> Company:
+    def _get_company(self, ticker: str) -> EdgarCompany:
         """
         Get Company object for ticker with error handling.
 
@@ -342,7 +364,7 @@ class FilingFetcher:
 
     def _get_filings(
         self,
-        company: Company,
+        company: EdgarCompany,
         form_type: str,
         year: int | list[int] | range | None = None,
         start_date: str | date | None = None,

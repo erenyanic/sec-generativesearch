@@ -40,7 +40,6 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import chromadb
 import numpy as np
 
 from sec_generative_search.config.constants import COLLECTION_NAME
@@ -302,6 +301,9 @@ class PortableExportService:
     def _read_embedder_stamp(self) -> EmbedderStamp:
         """Read the live ChromaDB collection's stamp via raw client."""
         try:
+            # Lazy (F28): keeps chromadb (~0.6 s) off every database import.
+            import chromadb
+
             client = chromadb.PersistentClient(path=str(self._chroma_path))
             collection = client.get_collection(name=COLLECTION_NAME)
         except Exception as exc:
@@ -377,6 +379,9 @@ class PortableExportService:
             return 0
 
         try:
+            # Lazy (F28): keeps chromadb (~0.6 s) off every database import.
+            import chromadb
+
             client = chromadb.PersistentClient(path=str(self._chroma_path))
             collection = client.get_collection(name=COLLECTION_NAME)
         except Exception as exc:

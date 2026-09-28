@@ -192,7 +192,7 @@ def _patch_validate_registry(monkeypatch: pytest.MonkeyPatch):
     fake_entry = ProviderEntry(
         name="openai",
         surface=ProviderSurface.LLM,
-        provider_cls=_StubValidateProvider,
+        provider=_StubValidateProvider,
     )
 
     def _get_entry(name, surface):

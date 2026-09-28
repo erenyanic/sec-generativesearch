@@ -40,7 +40,7 @@ from sec_generative_search.core.types import (
 if TYPE_CHECKING:
     import numpy as np
 
-    from sec_generative_search.providers.openrouter import OpenRouterRoutingHints
+    from sec_generative_search.providers.routing_hints import OpenRouterRoutingHints
 
 
 __all__ = [

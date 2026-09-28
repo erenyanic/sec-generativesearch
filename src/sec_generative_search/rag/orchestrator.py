@@ -79,9 +79,7 @@ if TYPE_CHECKING:
         BaseLLMProvider,
         GenerationRequest,
     )
-    from sec_generative_search.providers.openrouter import (
-        OpenRouterRoutingHints,
-    )
+    from sec_generative_search.providers.routing_hints import OpenRouterRoutingHints
     from sec_generative_search.search.retrieval import (
         RetrievalService,
         TokenCounter,

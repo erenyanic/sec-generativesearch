@@ -962,3 +962,49 @@ class TestValidateKeyClosesClient:
             ProviderRegistry.validate_key("openai", ProviderSurface.LLM, _FAKE_KEY)
         # The finally closes the client even though the error propagated.
         assert closed == [True]
+
+
+# ---------------------------------------------------------------------------
+# F28 — adapter classes load on demand
+# ---------------------------------------------------------------------------
+
+
+class TestLazyAdapterClasses:
+    """The curated entries name their adapters by reference and record the
+    default model, so listings, settings validation and the LLM capability
+    probe never import a vendor SDK.  The recorded values must not drift
+    from the adapter classes they stand in for."""
+
+    def test_curated_entries_reference_their_adapters_lazily(self) -> None:
+        for entry in ProviderRegistry._ENTRIES:
+            assert isinstance(entry.provider, str), entry.name
+            assert entry.provider.startswith("sec_generative_search.providers."), entry.name
+
+    def test_recorded_default_model_matches_the_adapter(self) -> None:
+        for entry in ProviderRegistry._ENTRIES:
+            cls = entry.provider_cls
+            assert entry.default_model, entry.name
+            assert entry.default_model == cls.default_model, entry.name
+            assert cls.provider_name == entry.name, entry.name
+
+    def test_references_resolve_to_the_expected_surface_base(self) -> None:
+        from sec_generative_search.providers.base import (
+            BaseEmbeddingProvider,
+            BaseLLMProvider,
+        )
+
+        bases = {
+            ProviderSurface.LLM: BaseLLMProvider,
+            ProviderSurface.EMBEDDING: BaseEmbeddingProvider,
+        }
+        for entry in ProviderRegistry._ENTRIES:
+            assert issubclass(entry.provider_cls, bases[entry.surface]), entry.name
+            # Resolution is cached: the same class object every time.
+            assert entry.provider_cls is entry.provider_cls
+
+    def test_a_class_valued_entry_still_works(self) -> None:
+        """Test doubles pass the class itself; the accessor returns it and the
+        default model falls back to the class attribute."""
+        entry = ProviderEntry("openai", ProviderSurface.LLM, OpenAIProvider)
+        assert entry.provider_cls is OpenAIProvider
+        assert entry.default_model_slug == OpenAIProvider.default_model
