@@ -88,10 +88,16 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
+from sec_generative_search.cli._common import (
+    print_cli_error,
+    print_error,
+    resolve_stamp,
+    validate_date,
+)
+from sec_generative_search.cli._errors import classify_provider_error
 from sec_generative_search.cli._json import (
     OutputFormat,
     coerce_output_format,
-    error_envelope,
     is_json,
     print_json,
 )
@@ -100,18 +106,13 @@ from sec_generative_search.core.exceptions import (
     ConfigurationError,
     DatabaseError,
     GenerationError,
-    ProviderAuthError,
-    ProviderConnectionError,
     ProviderError,
-    ProviderRateLimitError,
-    ProviderTimeoutError,
     SearchError,
 )
 from sec_generative_search.core.logging import audit_log
 from sec_generative_search.core.types import (
     Citation,
     ConversationTurn,
-    EmbedderStamp,
     GenerationResult,
     ProviderCapability,
     estimate_cost,
@@ -152,67 +153,23 @@ rag_app = typer.Typer(
 # import from ``api/`` (the two surfaces are deliberately decoupled).
 _ADMIN_USER_ID = "__admin__"
 
-# Shared operator hint for an unreachable provider endpoint
-# (``ProviderConnectionError``).  The dominant trigger on the CLI — the
-# operator-on-host surface — is a self-hosted ``local_llm`` server that is
-# not running or a mis-pointed ``LOCAL_LLM_BASE_URL``.
-_LOCAL_ENDPOINT_HINT = (
-    "Verify the endpoint is running and reachable (for local_llm, that the "
-    "local model server is up, e.g. `ollama serve`, and LOCAL_LLM_BASE_URL is "
-    "correct); retry once it recovers."
-)
-
 
 # ---------------------------------------------------------------------------
 # Rendering helpers
 # ---------------------------------------------------------------------------
 
 
-def _print_error(
-    label: str,
-    message: str,
-    *,
-    details: str | None = None,
-    hint: str | None = None,
+def _print_provider_failure(
+    exc: BaseException,
+    provider_name: str,
+    phase: str,
     output: OutputFormat = OutputFormat.TEXT,
-    error_code: str | None = None,
 ) -> None:
-    """Render an error with optional details and a single hint line.
-
-    When ``output == OutputFormat.JSON`` the document is an
-    :func:`error_envelope` instead of the Rich text.  ``error_code``
-    drives the machine-readable ``error`` slug (mirrors the API
-    envelope discipline).  ``rag chat`` deliberately keeps ``output``
-    defaulted to TEXT — the REPL surface is interactive and does not
-    expose the JSON flag.
-    """
-    if is_json(output):
-        slug = error_code or label.lower().replace(" ", "_")
-        print_json(error_envelope(slug, message, hint=hint, details=details))
-        return
-    console.print(f"[red]{escape(label)}:[/red] {escape(message)}")
-    if details:
-        console.print(f"  [dim]{escape(details)}[/dim]")
-    if hint:
-        console.print(f"  [dim italic]Hint: {escape(hint)}[/dim italic]")
-
-
-def _validate_date(value: str | None, param_name: str) -> str | None:
-    """Validate ``YYYY-MM-DD`` strings at the CLI boundary.
-
-    Same shape as ``cli.search`` / ``cli.ingest``.  Surfacing a
-    :class:`typer.BadParameter` keeps the error consistent with the rest
-    of the CLI.
-    """
-    if value is None:
-        return None
-    try:
-        datetime.strptime(value, "%Y-%m-%d")
-    except ValueError:
-        raise typer.BadParameter(
-            f"Invalid date format for {param_name}: {value!r}. Expected YYYY-MM-DD."
-        ) from None
-    return value
+    """Render a provider / generation failure through the shared CLI ladder."""
+    classified = classify_provider_error(exc, provider_name=provider_name, phase=phase)
+    if classified is None:  # pragma: no cover — callers catch ladder types only
+        raise exc
+    print_cli_error(classified, output=output)
 
 
 def _coerce_mode(value: str | None) -> AnswerMode | None:
@@ -298,36 +255,6 @@ def _build_api_key_resolver(registry: MetadataRegistry):  # type: ignore[no-unty
 # ---------------------------------------------------------------------------
 
 
-def _resolve_stamp(*, output: OutputFormat = OutputFormat.TEXT) -> EmbedderStamp:
-    """Compose the embedder stamp from settings + registry.
-
-    Mirrors :mod:`cli.manage`'s ``_resolve_stamp`` so the failure
-    envelope is uniform across the adapted CLI surface.
-    """
-    settings = get_settings()
-    embedding = settings.embedding
-    try:
-        dim = ProviderRegistry.get_dimension(embedding.provider, embedding.model_name)
-    except (KeyError, ValueError) as exc:
-        _print_error(
-            "Embedder configuration invalid",
-            f"Cannot resolve dimension for {embedding.provider}/{embedding.model_name}.",
-            details=str(exc),
-            hint=(
-                "Check EMBEDDING_PROVIDER and EMBEDDING_MODEL_NAME against "
-                "the registry — defaults live in providers/registry.py."
-            ),
-            output=output,
-            error_code="embedder_configuration_invalid",
-        )
-        raise typer.Exit(code=1) from None
-    return EmbedderStamp(
-        provider=embedding.provider,
-        model=embedding.model_name,
-        dimension=dim,
-    )
-
-
 def _build_retrieval(
     *,
     output: OutputFormat = OutputFormat.TEXT,
@@ -344,7 +271,7 @@ def _build_retrieval(
     try:
         embedder = build_embedder(embedding)
     except ConfigurationError as exc:
-        _print_error(
+        print_error(
             "Embedder construction failed",
             exc.message,
             hint="Set the expected API-key env var for the embedding provider.",
@@ -353,7 +280,7 @@ def _build_retrieval(
         )
         raise typer.Exit(code=1) from None
     except KeyError as exc:
-        _print_error(
+        print_error(
             "Embedder unavailable",
             f"Provider {embedding.provider!r} requires additional packages.",
             details=str(exc),
@@ -366,13 +293,14 @@ def _build_retrieval(
         )
         raise typer.Exit(code=1) from None
 
-    stamp = _resolve_stamp(output=output)
+    embedding = get_settings().embedding
+    stamp = resolve_stamp(embedding.provider, embedding.model_name, output=output)
 
     try:
         chroma = ChromaDBClient(stamp)
         registry = MetadataRegistry()
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Storage initialisation failed",
             exc.message,
             details=exc.details,
@@ -404,7 +332,7 @@ def _build_llm(  # type: ignore[no-untyped-def]
     try:
         return build_llm_provider(provider_name, api_key_resolver=resolver)
     except ConfigurationError as exc:
-        _print_error(
+        print_error(
             "LLM provider key required",
             f"No API key resolved for provider '{provider_name}'.",
             details=exc.message,
@@ -418,7 +346,7 @@ def _build_llm(  # type: ignore[no-untyped-def]
         )
         raise typer.Exit(code=1) from None
     except KeyError as exc:
-        _print_error(
+        print_error(
             "LLM provider unavailable",
             f"Provider {provider_name!r} requires additional packages.",
             details=str(exc),
@@ -731,7 +659,7 @@ def _resolve_routing_hints(
         honours = False
 
     if not honours:
-        _print_error(
+        print_error(
             "Invalid flag combination",
             (
                 f"--openrouter-provider / --openrouter-fallbacks were supplied "
@@ -929,7 +857,7 @@ def query(
     output_format = coerce_output_format(output)
 
     if show_plan and skip_plan:
-        _print_error(
+        print_error(
             "Invalid flag combination",
             "--show-plan and --skip-plan are mutually exclusive.",
             output=output_format,
@@ -938,7 +866,7 @@ def query(
         raise typer.Exit(code=1)
 
     if not question or not question.strip():
-        _print_error(
+        print_error(
             "Invalid question",
             "Question must not be empty.",
             output=output_format,
@@ -946,8 +874,8 @@ def query(
         )
         raise typer.Exit(code=1)
 
-    _validate_date(since, "--since")
-    _validate_date(until, "--until")
+    validate_date(since, "--since")
+    validate_date(until, "--until")
     effective_mode = _coerce_mode(mode)
 
     provider_name, model_name = _resolve_provider_and_model(provider, llm_model)
@@ -960,7 +888,7 @@ def query(
             model=model_name or None,
         )
     except KeyError as exc:
-        _print_error(
+        print_error(
             "Unknown LLM provider",
             f"{provider_name!r} is not a registered LLM provider.",
             details=str(exc),
@@ -970,7 +898,7 @@ def query(
         )
         raise typer.Exit(code=1) from None
     except ValueError as exc:
-        _print_error(
+        print_error(
             "Unknown LLM model",
             f"{model_name!r} is not registered for provider {provider_name!r}.",
             details=str(exc),
@@ -1005,45 +933,8 @@ def query(
                 model=model_name,
                 structured_output_supported=capability.structured_output,
             )
-        except ProviderAuthError:
-            _print_error(
-                "Provider unauthorised",
-                "The upstream provider rejected the supplied API key.",
-                hint=(
-                    "Verify or rotate the provider key for "
-                    f"{provider_name!r}; do not retry until corrected."
-                ),
-                output=output_format,
-                error_code="provider_unauthorized",
-            )
-            raise typer.Exit(code=1) from None
-        except (ProviderRateLimitError, ProviderTimeoutError):
-            _print_error(
-                "Provider unavailable",
-                "The upstream provider is rate-limited or timed out.",
-                hint="Retry after a short backoff; do not rotate the key.",
-                output=output_format,
-                error_code="provider_unavailable",
-            )
-            raise typer.Exit(code=1) from None
-        except ProviderConnectionError:
-            _print_error(
-                "Provider unavailable",
-                "The upstream provider endpoint could not be reached.",
-                hint=_LOCAL_ENDPOINT_HINT,
-                output=output_format,
-                error_code="provider_unavailable",
-            )
-            raise typer.Exit(code=1) from None
         except ProviderError as exc:
-            _print_error(
-                "Provider error",
-                "The upstream provider returned an error during query understanding.",
-                details=type(exc).__name__,
-                hint="Inspect the audit log; do not rotate the key on a non-auth error.",
-                output=output_format,
-                error_code="provider_error",
-            )
+            _print_provider_failure(exc, provider_name, "query understanding", output_format)
             raise typer.Exit(code=1) from None
 
     plan = _apply_overrides(
@@ -1083,58 +974,11 @@ def query(
             prefer_structured_output=capability.structured_output,
             routing_hints=routing_hints,
         )
-    except ProviderAuthError:
-        _print_error(
-            "Provider unauthorised",
-            "The upstream provider rejected the supplied API key during generation.",
-            hint=(
-                "Verify or rotate the provider key for "
-                f"{provider_name!r}; do not retry until corrected."
-            ),
-            output=output_format,
-            error_code="provider_unauthorized",
-        )
-        raise typer.Exit(code=1) from None
-    except (ProviderRateLimitError, ProviderTimeoutError):
-        _print_error(
-            "Provider unavailable",
-            "The upstream provider is rate-limited or timed out.",
-            hint="Retry after a short backoff; do not rotate the key.",
-            output=output_format,
-            error_code="provider_unavailable",
-        )
-        raise typer.Exit(code=1) from None
-    except ProviderConnectionError:
-        _print_error(
-            "Provider unavailable",
-            "The upstream provider endpoint could not be reached.",
-            hint=_LOCAL_ENDPOINT_HINT,
-            output=output_format,
-            error_code="provider_unavailable",
-        )
-        raise typer.Exit(code=1) from None
-    except ProviderError as exc:
-        _print_error(
-            "Provider error",
-            "The upstream provider returned an error during generation.",
-            details=type(exc).__name__,
-            hint="Inspect the audit log; do not rotate the key on a non-auth error.",
-            output=output_format,
-            error_code="provider_error",
-        )
-        raise typer.Exit(code=1) from None
-    except GenerationError as exc:
-        _print_error(
-            "Generation failed",
-            "The orchestrator could not assemble a valid answer.",
-            details=exc.message,
-            hint="Retry the request; if it persists, switch model or provider.",
-            output=output_format,
-            error_code="generation_failed",
-        )
+    except (ProviderError, GenerationError) as exc:
+        _print_provider_failure(exc, provider_name, "generation", output_format)
         raise typer.Exit(code=1) from None
     except SearchError as exc:
-        _print_error(
+        print_error(
             "Retrieval failed",
             exc.message,
             details=exc.details,
@@ -1147,7 +991,7 @@ def query(
         )
         raise typer.Exit(code=1) from None
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Database failure",
             exc.message,
             details=exc.details,
@@ -1222,39 +1066,9 @@ def _classify_stream_error(exc: BaseException, provider_name: str) -> tuple[str,
     and the SSE route emit byte-identical operator-facing shapes for
     the same upstream failure.
     """
-    if isinstance(exc, ProviderAuthError):
-        return (
-            "Provider unauthorised",
-            "The upstream provider rejected the supplied API key.",
-            (
-                "Verify or rotate the provider key for "
-                f"{provider_name!r}; do not retry until corrected."
-            ),
-        )
-    if isinstance(exc, (ProviderRateLimitError, ProviderTimeoutError)):
-        return (
-            "Provider unavailable",
-            "The upstream provider is rate-limited or timed out.",
-            "Retry after a short backoff; do not rotate the key.",
-        )
-    if isinstance(exc, ProviderConnectionError):
-        return (
-            "Provider unavailable",
-            "The upstream provider endpoint could not be reached.",
-            _LOCAL_ENDPOINT_HINT,
-        )
-    if isinstance(exc, ProviderError):
-        return (
-            "Provider error",
-            "The upstream provider returned an error during generation.",
-            "Inspect the audit log; do not rotate the key on a non-auth error.",
-        )
-    if isinstance(exc, GenerationError):
-        return (
-            "Generation failed",
-            "The orchestrator could not assemble a valid answer.",
-            "Retry the question; if the failure persists, switch model or provider.",
-        )
+    classified = classify_provider_error(exc, provider_name=provider_name, phase="generation")
+    if classified is not None:
+        return classified.label, classified.message, classified.hint
     if isinstance(exc, SearchError):
         return (
             "Retrieval failed",
@@ -1401,7 +1215,7 @@ def _run_chat_stream(
 
     if error is not None:
         label, message, hint = _classify_stream_error(error, provider_name)
-        _print_error(label, message, hint=hint)
+        print_error(label, message, hint=hint)
         return None, False
 
     return final, False
@@ -1585,14 +1399,14 @@ def chat(
         sec-rag rag chat --skip-plan
     """
     if show_plan and skip_plan:
-        _print_error(
+        print_error(
             "Invalid flag combination",
             "--show-plan and --skip-plan are mutually exclusive.",
         )
         raise typer.Exit(code=1)
 
-    _validate_date(since, "--since")
-    _validate_date(until, "--until")
+    validate_date(since, "--since")
+    validate_date(until, "--until")
     effective_mode = _coerce_mode(mode)
 
     provider_name, model_name = _resolve_provider_and_model(provider, llm_model)
@@ -1607,7 +1421,7 @@ def chat(
             model=model_name or None,
         )
     except KeyError as exc:
-        _print_error(
+        print_error(
             "Unknown LLM provider",
             f"{provider_name!r} is not a registered LLM provider.",
             details=str(exc),
@@ -1615,7 +1429,7 @@ def chat(
         )
         raise typer.Exit(code=1) from None
     except ValueError as exc:
-        _print_error(
+        print_error(
             "Unknown LLM model",
             f"{model_name!r} is not registered for provider {provider_name!r}.",
             details=str(exc),
@@ -1697,37 +1511,8 @@ def chat(
                     model=model_name,
                     structured_output_supported=capability.structured_output,
                 )
-            except ProviderAuthError:
-                _print_error(
-                    "Provider unauthorised",
-                    "The upstream provider rejected the supplied API key.",
-                    hint=(
-                        "Verify or rotate the provider key for "
-                        f"{provider_name!r}; do not retry until corrected."
-                    ),
-                )
-                continue
-            except (ProviderRateLimitError, ProviderTimeoutError):
-                _print_error(
-                    "Provider unavailable",
-                    "The upstream provider is rate-limited or timed out.",
-                    hint="Retry after a short backoff; do not rotate the key.",
-                )
-                continue
-            except ProviderConnectionError:
-                _print_error(
-                    "Provider unavailable",
-                    "The upstream provider endpoint could not be reached.",
-                    hint=_LOCAL_ENDPOINT_HINT,
-                )
-                continue
             except ProviderError as exc:
-                _print_error(
-                    "Provider error",
-                    "The upstream provider returned an error during query understanding.",
-                    details=type(exc).__name__,
-                    hint="Inspect the audit log; do not rotate the key on a non-auth error.",
-                )
+                _print_provider_failure(exc, provider_name, "query understanding")
                 continue
 
         try:
@@ -1745,7 +1530,7 @@ def chat(
             # in this session, so the operator must Ctrl-C out and
             # re-launch with corrected flags; the diagnostic is the
             # same one ``rag query`` raises.
-            _print_error("Invalid override", str(exc))
+            print_error("Invalid override", str(exc))
             continue
 
         if show_plan:

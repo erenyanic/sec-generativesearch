@@ -16,43 +16,20 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
-from rich.markup import escape
 
+from sec_generative_search.cli._common import print_error, resolve_stamp
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.exceptions import DatabaseError
-from sec_generative_search.core.types import EmbedderStamp
 from sec_generative_search.database import (
     ChromaDBClient,
     FilingStore,
     MetadataRegistry,
 )
-from sec_generative_search.providers.registry import ProviderRegistry
 
 __all__ = ["evict"]
 
 
 console = Console()
-
-
-def _print_error(
-    label: str,
-    message: str,
-    *,
-    details: str | None = None,
-    hint: str | None = None,
-) -> None:
-    """Render an error with optional details and a single hint line.
-
-    All operator-facing strings flow through :func:`rich.markup.escape`
-    so hints carrying literal square brackets (env-var names, profile
-    enum values rendered as ``['local', 'team', 'cloud']``) render
-    verbatim instead of being silently stripped as malformed Rich tags.
-    """
-    console.print(f"[red]{escape(label)}:[/red] {escape(message)}")
-    if details:
-        console.print(f"  [dim]{escape(details)}[/dim]")
-    if hint:
-        console.print(f"  [dim italic]Hint: {escape(hint)}[/dim italic]")
 
 
 def evict(
@@ -108,7 +85,7 @@ def evict(
     cutoff = max_age_days if max_age_days is not None else settings.database.retention_max_age_days
 
     if cutoff <= 0:
-        _print_error(
+        print_error(
             "Eviction disabled",
             f"Cutoff is {cutoff} day(s); nothing to do.",
             hint=(
@@ -123,32 +100,7 @@ def evict(
     # call is needed — eviction only deletes by accession, so we never
     # construct a real embedder.  The registry's get_dimension probe is
     # O(1) and credential-free.
-    try:
-        target_dim = ProviderRegistry.get_dimension(
-            settings.embedding.provider,
-            settings.embedding.model_name,
-        )
-    except (KeyError, ValueError) as exc:
-        _print_error(
-            "Embedder configuration invalid",
-            (
-                f"Cannot resolve dimension for "
-                f"{settings.embedding.provider}/{settings.embedding.model_name}."
-            ),
-            details=str(exc),
-            hint=(
-                "Check EMBEDDING_PROVIDER and EMBEDDING_MODEL_NAME against "
-                "the registry — sec-rag provider list will surface the "
-                "valid combinations once the provider command set lands."
-            ),
-        )
-        raise typer.Exit(code=1) from None
-
-    stamp = EmbedderStamp(
-        provider=settings.embedding.provider,
-        model=settings.embedding.model_name,
-        dimension=target_dim,
-    )
+    stamp = resolve_stamp(settings.embedding.provider, settings.embedding.model_name)
 
     # Confirmation (destructive action).
     console.print(
@@ -177,7 +129,7 @@ def evict(
         store = FilingStore(chroma, registry)
         report = store.evict_expired(cutoff)
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Eviction failed",
             exc.message,
             details=exc.details,

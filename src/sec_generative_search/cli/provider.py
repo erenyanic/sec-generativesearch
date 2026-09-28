@@ -51,10 +51,10 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from sec_generative_search.cli._common import print_cli_error, print_error
+from sec_generative_search.cli._errors import classify_provider_error
 from sec_generative_search.cli._json import (
-    OutputFormat,
     coerce_output_format,
-    error_envelope,
     is_json,
     print_json,
 )
@@ -69,8 +69,6 @@ from sec_generative_search.core.exceptions import (
     ConfigurationError,
     DatabaseError,
     ProviderError,
-    ProviderRateLimitError,
-    ProviderTimeoutError,
 )
 from sec_generative_search.core.security import mask_secret
 from sec_generative_search.database import MetadataRegistry
@@ -115,38 +113,6 @@ _HARD_FAIL_SET_HINT = (
 # ---------------------------------------------------------------------------
 # Rendering helpers (shared with cli.rag / cli.search)
 # ---------------------------------------------------------------------------
-
-
-def _print_error(
-    label: str,
-    message: str,
-    *,
-    details: str | None = None,
-    hint: str | None = None,
-    output: OutputFormat = OutputFormat.TEXT,
-    error_code: str | None = None,
-) -> None:
-    """Render an error with optional details and a single hint line.
-
-    Mirrors the same shape as ``cli.rag._print_error`` so operator
-    output stays uniform across the adapted CLI surface.
-
-    When ``output == OutputFormat.JSON`` the document is an
-    :func:`error_envelope` instead of the Rich text.  ``error_code``
-    is the machine-readable ``error`` slug (mirrors the API envelope
-    discipline; defaults to a slugified ``label``).  ``provider set``
-    deliberately keeps ``output`` defaulted to TEXT because the JSON
-    flag is scoped to the read paths (``list`` / ``validate``).
-    """
-    if is_json(output):
-        slug = error_code or label.lower().replace(" ", "_")
-        print_json(error_envelope(slug, message, hint=hint, details=details))
-        return
-    console.print(f"[red]{escape(label)}:[/red] {escape(message)}")
-    if details:
-        console.print(f"  [dim]{escape(details)}[/dim]")
-    if hint:
-        console.print(f"  [dim italic]Hint: {escape(hint)}[/dim italic]")
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +441,7 @@ def validate(
     try:
         ProviderRegistry.get_capability(provider, surface_enum, model=model)
     except KeyError as exc:
-        _print_error(
+        print_error(
             "Unknown provider",
             f"{provider!r} is not a registered provider on the {surface_enum.value} surface.",
             details=str(exc),
@@ -485,7 +451,7 @@ def validate(
         )
         raise typer.Exit(code=1) from None
     except ValueError as exc:
-        _print_error(
+        print_error(
             "Unknown model",
             f"{model!r} is not registered for provider {provider!r}.",
             details=str(exc),
@@ -501,7 +467,7 @@ def validate(
         api_key = resolver(provider)
         if api_key is None:
             env_var = _ENV_VAR_BY_PROVIDER.get(provider, "<unknown>")
-            _print_error(
+            print_error(
                 "No credential",
                 f"No API key resolves for provider {provider!r}.",
                 hint=(
@@ -515,25 +481,15 @@ def validate(
 
         try:
             ok = validate_credential(provider, surface_enum, api_key, model=model)
-        except (ProviderRateLimitError, ProviderTimeoutError) as exc:
-            _print_error(
-                "Provider unavailable",
-                "The upstream provider is rate-limited or timed out.",
-                details=type(exc).__name__,
-                hint="Retry after a short backoff; do not rotate the key.",
-                output=output_format,
-                error_code="provider_unavailable",
-            )
-            raise typer.Exit(code=2) from None
         except ProviderError as exc:
-            _print_error(
-                "Provider error",
-                "The upstream provider returned an error during validation.",
-                details=type(exc).__name__,
-                hint="Inspect the audit log; do not rotate the key on a non-auth error.",
-                output=output_format,
-                error_code="provider_error",
+            # Like ``POST /api/providers/validate``: an unreachable endpoint
+            # is a generic provider error, not a distinct "unavailable".
+            classified = classify_provider_error(
+                exc, provider_name=provider, phase="validation", connection_is_distinct=False
             )
+            if classified is None:  # pragma: no cover — ProviderError always classifies
+                raise
+            print_cli_error(classified, output=output_format)
             raise typer.Exit(code=2) from None
     finally:
         if registry is not None:
@@ -589,7 +545,7 @@ def _refuse_set_unless_encrypted_ready() -> MetadataRegistry:
     """
     settings = get_settings()
     if not settings.database.persist_provider_credentials:
-        _print_error(
+        print_error(
             "Encrypted credential storage disabled",
             "`provider set` refuses to write a credential without encrypted-at-rest storage.",
             hint=_HARD_FAIL_SET_HINT,
@@ -603,7 +559,7 @@ def _refuse_set_unless_encrypted_ready() -> MetadataRegistry:
     try:
         registry = MetadataRegistry()
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Storage initialisation failed",
             exc.message,
             details=exc.details,
@@ -618,7 +574,7 @@ def _refuse_set_unless_encrypted_ready() -> MetadataRegistry:
         # registry opened without it.  Either way, refuse — writing
         # plaintext is not an acceptable fallback.
         registry.close()
-        _print_error(
+        print_error(
             "Encrypted credential storage unavailable",
             "MetadataRegistry opened without SQLCipher — `provider set` "
             "refuses to write a credential to plaintext SQLite.",
@@ -647,7 +603,7 @@ def _read_api_key_from_stdin(provider: str) -> str:
         prompt_suffix=": ",
     ).strip()
     if not api_key:
-        _print_error(
+        print_error(
             "Empty key rejected",
             "An empty API key is never a valid credential.",
             hint="Re-run the command and paste the actual key.",
@@ -716,7 +672,7 @@ def set_key(
         try:
             ProviderRegistry.get_entry(provider, ProviderSurface.EMBEDDING)
         except KeyError as exc:
-            _print_error(
+            print_error(
                 "Unknown provider",
                 f"{provider!r} is not a registered provider name.",
                 details=str(exc),
@@ -740,7 +696,7 @@ def set_key(
             # Defensive: settings + registry checks above should make
             # this unreachable, but a torn-down config could still land
             # here.  Refuse — never fall back.
-            _print_error(
+            print_error(
                 "Encrypted credential storage unavailable",
                 exc.message,
                 hint=_HARD_FAIL_SET_HINT,
@@ -750,7 +706,7 @@ def set_key(
         try:
             store.set(_ADMIN_USER_ID, provider, api_key)
         except (DatabaseError, ValueError) as exc:
-            _print_error(
+            print_error(
                 "Could not store credential",
                 getattr(exc, "message", str(exc)),
                 hint="Inspect the operator logs for the underlying database error.",
@@ -765,20 +721,25 @@ def set_key(
         if validate_after_set:
             try:
                 ok = validate_credential(provider, surface_enum, api_key)
-            except (ProviderRateLimitError, ProviderTimeoutError) as exc:
-                console.print(
-                    "[yellow]![/yellow] Credential stored but post-write "
-                    f"validation failed transiently: {escape(type(exc).__name__)}.  "
-                    "Retry `sec-rag provider validate` after a short backoff."
-                )
-                return
             except ProviderError as exc:
-                console.print(
-                    "[yellow]![/yellow] Credential stored but post-write "
-                    "validation returned a non-auth provider error: "
-                    f"{escape(type(exc).__name__)}.  "
-                    "Inspect the audit log; do not rotate the key on a non-auth error."
+                # A warning, not an error — the key is already stored.  The
+                # shared ladder decides transient vs non-auth failure.
+                classified = classify_provider_error(
+                    exc, provider_name=provider, phase="validation", connection_is_distinct=False
                 )
+                if classified is not None and classified.error_code == "provider_unavailable":
+                    console.print(
+                        "[yellow]![/yellow] Credential stored but post-write "
+                        f"validation failed transiently: {escape(type(exc).__name__)}.  "
+                        "Retry `sec-rag provider validate` after a short backoff."
+                    )
+                else:
+                    console.print(
+                        "[yellow]![/yellow] Credential stored but post-write "
+                        "validation returned a non-auth provider error: "
+                        f"{escape(type(exc).__name__)}.  "
+                        "Inspect the audit log; do not rotate the key on a non-auth error."
+                    )
                 return
 
             if ok:
@@ -835,7 +796,7 @@ def refresh_catalogue() -> None:
         )
     except CatalogueRefreshError as exc:
         # The message is content-free by construction — never an upstream body.
-        _print_error(
+        print_error(
             "Catalogue refresh failed",
             str(exc),
             hint=(
@@ -848,7 +809,7 @@ def refresh_catalogue() -> None:
     except OSError as exc:
         # Disk failure writing the overlay — render the error *type* only, never
         # ``str(exc)`` (it can carry the configured filesystem path).
-        _print_error(
+        print_error(
             "Catalogue overlay write failed",
             f"Could not write the overlay to disk ({type(exc).__name__}).",
             hint="Verify the overlay path is writable and the volume has free space.",

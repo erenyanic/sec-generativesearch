@@ -51,10 +51,10 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from sec_generative_search.cli._common import print_error, resolve_stamp, validate_date
 from sec_generative_search.cli._json import (
     OutputFormat,
     coerce_output_format,
-    error_envelope,
     is_json,
     print_json,
 )
@@ -65,10 +65,9 @@ from sec_generative_search.core.exceptions import (
     ProviderError,
     SearchError,
 )
-from sec_generative_search.core.types import EmbedderStamp, RetrievalResult
+from sec_generative_search.core.types import RetrievalResult
 from sec_generative_search.database import ChromaDBClient
 from sec_generative_search.providers.factory import build_embedder
-from sec_generative_search.providers.registry import ProviderRegistry
 from sec_generative_search.search import RetrievalService
 from sec_generative_search.search.evaluation import (
     EvaluationReport,
@@ -93,41 +92,6 @@ evaluate_app = typer.Typer(
 # ---------------------------------------------------------------------------
 
 
-def _print_error(
-    label: str,
-    message: str,
-    *,
-    details: str | None = None,
-    hint: str | None = None,
-    output: OutputFormat = OutputFormat.TEXT,
-    error_code: str | None = None,
-) -> None:
-    if is_json(output):
-        slug = error_code or label.lower().replace(" ", "_")
-        print_json(error_envelope(slug, message, hint=hint, details=details))
-        return
-    console.print(f"[red]{escape(label)}:[/red] {escape(message)}")
-    if details:
-        console.print(f"  [dim]{escape(details)}[/dim]")
-    if hint:
-        console.print(f"  [dim italic]Hint: {escape(hint)}[/dim italic]")
-
-
-def _validate_date(value: str | None, param_name: str) -> str | None:
-    """Validate a ``YYYY-MM-DD`` string at the CLI boundary."""
-    if value is None:
-        return None
-    from datetime import datetime
-
-    try:
-        datetime.strptime(value, "%Y-%m-%d")
-    except ValueError:
-        raise typer.BadParameter(
-            f"Invalid date format for {param_name}: {value!r}. Expected YYYY-MM-DD."
-        ) from None
-    return value
-
-
 # ---------------------------------------------------------------------------
 # Service construction (mirrors cli.search._build_service)
 # ---------------------------------------------------------------------------
@@ -144,26 +108,12 @@ def _build_service(*, output: OutputFormat = OutputFormat.TEXT) -> RetrievalServ
     settings = get_settings()
     embedding = settings.embedding
 
-    try:
-        target_dim = ProviderRegistry.get_dimension(embedding.provider, embedding.model_name)
-    except (KeyError, ValueError) as exc:
-        _print_error(
-            "Embedder configuration invalid",
-            f"Cannot resolve dimension for {embedding.provider}/{embedding.model_name}.",
-            details=str(exc),
-            hint=(
-                "Check EMBEDDING_PROVIDER and EMBEDDING_MODEL_NAME against "
-                "the registry — defaults live in providers/registry.py."
-            ),
-            output=output,
-            error_code="embedder_configuration_invalid",
-        )
-        raise typer.Exit(code=1) from None
+    stamp = resolve_stamp(embedding.provider, embedding.model_name, output=output)
 
     try:
         embedder = build_embedder(embedding)
     except ConfigurationError as exc:
-        _print_error(
+        print_error(
             "Embedder construction failed",
             exc.message,
             hint="Set the expected API-key env var for this provider.",
@@ -172,7 +122,7 @@ def _build_service(*, output: OutputFormat = OutputFormat.TEXT) -> RetrievalServ
         )
         raise typer.Exit(code=1) from None
     except KeyError as exc:
-        _print_error(
+        print_error(
             "Embedder unavailable",
             f"Provider {embedding.provider!r} requires additional packages.",
             details=str(exc),
@@ -185,16 +135,10 @@ def _build_service(*, output: OutputFormat = OutputFormat.TEXT) -> RetrievalServ
         )
         raise typer.Exit(code=1) from None
 
-    stamp = EmbedderStamp(
-        provider=embedding.provider,
-        model=embedding.model_name,
-        dimension=target_dim,
-    )
-
     try:
         chroma = ChromaDBClient(stamp)
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Storage initialisation failed",
             exc.message,
             details=exc.details,
@@ -388,12 +332,12 @@ def retrieval(
     """
     output_format = coerce_output_format(output)
 
-    _validate_date(start_date, "--start-date")
-    _validate_date(end_date, "--end-date")
+    validate_date(start_date, "--start-date")
+    validate_date(end_date, "--end-date")
 
     # Validate cases file exists before constructing storage.
     if not cases.exists():
-        _print_error(
+        print_error(
             "Cases file not found",
             f"No file at {cases}.",
             hint=(
@@ -408,7 +352,7 @@ def retrieval(
     try:
         eval_cases = load_cases_from_json(cases)
     except (ValueError, OSError) as exc:
-        _print_error(
+        print_error(
             "Cases file invalid",
             "Could not load evaluation cases.",
             details=str(exc),
@@ -445,7 +389,7 @@ def retrieval(
             with console.status(f"Evaluating {len(eval_cases)} case(s) at top_k={top_k}..."):
                 report = _do_evaluate()
     except SearchError as exc:
-        _print_error(
+        print_error(
             "Search failed",
             exc.message,
             details=exc.details,
@@ -458,7 +402,7 @@ def retrieval(
         )
         raise typer.Exit(code=1) from None
     except ProviderError as exc:
-        _print_error(
+        print_error(
             "Embedding provider failure",
             "The embedding provider failed while processing a query.",
             details=exc.message,
@@ -471,7 +415,7 @@ def retrieval(
         )
         raise typer.Exit(code=1) from None
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Database failure",
             exc.message,
             details=exc.details,

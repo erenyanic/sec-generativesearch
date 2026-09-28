@@ -11,7 +11,6 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
-from rich.markup import escape
 from rich.progress import (
     BarColumn,
     Progress,
@@ -20,6 +19,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from sec_generative_search.cli._common import print_error
 from sec_generative_search.config.settings import EmbeddingSettings
 from sec_generative_search.core.exceptions import ConfigurationError, DatabaseError
 from sec_generative_search.core.types import EmbedderStamp
@@ -31,34 +31,6 @@ __all__ = ["reindex"]
 
 
 console = Console()
-
-
-def _print_error(
-    label: str,
-    message: str,
-    *,
-    details: str | None = None,
-    hint: str | None = None,
-) -> None:
-    """Render an error with optional details and a single hint line.
-
-    Kept local so the module stays self-contained while the rest of the
-    CLI is still on unadapted imports.  The shape matches
-    ``cli/ingest.py::_print_error`` so it can be lifted into a shared helper
-    later if the CLI surface is consolidated.
-
-    ``message`` / ``details`` / ``hint`` are passed through
-    :func:`rich.markup.escape` because they may legitimately contain
-    square brackets (e.g. ``'.[local-embeddings]'`` install hints, stamp
-    tuples rendered as ``(provider, model, dim=4)``) that Rich would
-    otherwise strip as malformed tags.  Only the colour wrappers use
-    live markup.
-    """
-    console.print(f"[red]{escape(label)}:[/red] {escape(message)}")
-    if details:
-        console.print(f"  [dim]{escape(details)}[/dim]")
-    if hint:
-        console.print(f"  [dim italic]Hint: {escape(hint)}[/dim italic]")
 
 
 def _build_embedding_settings(provider: str, model_name: str) -> EmbeddingSettings:
@@ -143,7 +115,7 @@ def reindex(
     try:
         provider_cls = ProviderRegistry.get_class(provider, ProviderSurface.EMBEDDING)
     except KeyError as exc:
-        _print_error(
+        print_error(
             "Unknown embedding provider",
             f"{provider!r} is not a registered embedding provider.",
             details=str(exc),
@@ -157,7 +129,7 @@ def reindex(
     try:
         target_dim = ProviderRegistry.get_dimension(provider, resolved_model)
     except ValueError as exc:
-        _print_error(
+        print_error(
             "Unknown embedding model",
             f"{resolved_model!r} is not registered for provider {provider!r}.",
             details=str(exc),
@@ -171,7 +143,7 @@ def reindex(
         settings = _build_embedding_settings(provider, resolved_model)
         embedder = build_embedder(settings)
     except ConfigurationError as exc:
-        _print_error(
+        print_error(
             "Embedder construction failed",
             exc.message,
             hint="Set the expected API-key env var for this provider.",
@@ -182,7 +154,7 @@ def reindex(
         # factory when a provider requiring an optional extra is picked
         # without the extra installed (e.g. ``local`` without
         # ``[local-embeddings]``).
-        _print_error(
+        print_error(
             "Embedder unavailable",
             f"Provider {provider!r} requires additional packages.",
             details=str(exc),
@@ -261,7 +233,7 @@ def reindex(
             # All refuse-early messages already carry operator-actionable
             # text; we re-render rather than re-wording, so a future
             # service-level change in hint is visible without edits here.
-            _print_error(
+            print_error(
                 "Reindex failed",
                 exc.message,
                 details=exc.details,

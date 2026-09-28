@@ -39,7 +39,6 @@ calls :func:`logger.info` / :func:`audit_log` directly with the query.
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Annotated, Any
 
 import typer
@@ -48,10 +47,10 @@ from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
 
+from sec_generative_search.cli._common import print_error, resolve_stamp, validate_date
 from sec_generative_search.cli._json import (
     OutputFormat,
     coerce_output_format,
-    error_envelope,
     is_json,
     print_json,
 )
@@ -62,10 +61,9 @@ from sec_generative_search.core.exceptions import (
     ProviderError,
     SearchError,
 )
-from sec_generative_search.core.types import EmbedderStamp, RetrievalResult
+from sec_generative_search.core.types import RetrievalResult
 from sec_generative_search.database import ChromaDBClient
 from sec_generative_search.providers.factory import build_embedder
-from sec_generative_search.providers.registry import ProviderRegistry
 from sec_generative_search.search import RetrievalService
 
 __all__ = ["search"]
@@ -85,42 +83,6 @@ _SECTION_PATH_LIMIT = 500
 # ---------------------------------------------------------------------------
 
 
-def _print_error(
-    label: str,
-    message: str,
-    *,
-    details: str | None = None,
-    hint: str | None = None,
-    output: OutputFormat = OutputFormat.TEXT,
-    error_code: str | None = None,
-) -> None:
-    """Render an error with optional details and a single hint line.
-
-    Shape matches the helper in :mod:`cli.ingest` / :mod:`cli.manage`
-    so a future consolidation can lift it verbatim.  Every
-    operator-facing string passes through :func:`rich.markup.escape` so
-    accession numbers / install hints with literal square brackets
-    render verbatim instead of being silently stripped by Rich's markup
-    parser.
-
-    When ``output == OutputFormat.JSON`` an :func:`error_envelope`
-    document is emitted instead of the Rich text; ``error_code``
-    supplies the machine-readable ``error`` slug (mirrors the API
-    envelope's discipline).  The raw query is NEVER part of any
-    envelope — the caller is responsible for keeping it out of
-    ``message`` / ``details`` / ``hint``.
-    """
-    if is_json(output):
-        slug = error_code or label.lower().replace(" ", "_")
-        print_json(error_envelope(slug, message, hint=hint, details=details))
-        return
-    console.print(f"[red]{escape(label)}:[/red] {escape(message)}")
-    if details:
-        console.print(f"  [dim]{escape(details)}[/dim]")
-    if hint:
-        console.print(f"  [dim italic]Hint: {escape(hint)}[/dim italic]")
-
-
 def _similarity_text(similarity: float) -> Text:
     """Colour-coded similarity percentage.
 
@@ -135,25 +97,6 @@ def _similarity_text(similarity: float) -> Text:
     if similarity >= 0.25:
         return Text(pct, style="yellow")
     return Text(pct, style="dim")
-
-
-def _validate_date(value: str | None, param_name: str) -> str | None:
-    """Validate ``YYYY-MM-DD`` strings at the CLI boundary.
-
-    :class:`RetrievalService` will also reject malformed dates, but
-    failing here surfaces a :class:`typer.BadParameter` so the error
-    renders consistently with the rest of the CLI.  This is the same
-    pattern :mod:`cli.ingest` uses for its date flags.
-    """
-    if value is None:
-        return None
-    try:
-        datetime.strptime(value, "%Y-%m-%d")
-    except ValueError:
-        raise typer.BadParameter(
-            f"Invalid date format for {param_name}: {value!r}. Expected YYYY-MM-DD."
-        ) from None
-    return value
 
 
 # ---------------------------------------------------------------------------
@@ -205,26 +148,12 @@ def _build_service(*, output: OutputFormat = OutputFormat.TEXT) -> RetrievalServ
     settings = get_settings()
     embedding = settings.embedding
 
-    try:
-        target_dim = ProviderRegistry.get_dimension(embedding.provider, embedding.model_name)
-    except (KeyError, ValueError) as exc:
-        _print_error(
-            "Embedder configuration invalid",
-            f"Cannot resolve dimension for {embedding.provider}/{embedding.model_name}.",
-            details=str(exc),
-            hint=(
-                "Check EMBEDDING_PROVIDER and EMBEDDING_MODEL_NAME against "
-                "the registry — defaults live in providers/registry.py."
-            ),
-            output=output,
-            error_code="embedder_configuration_invalid",
-        )
-        raise typer.Exit(code=1) from None
+    stamp = resolve_stamp(embedding.provider, embedding.model_name, output=output)
 
     try:
         embedder = build_embedder(embedding)
     except ConfigurationError as exc:
-        _print_error(
+        print_error(
             "Embedder construction failed",
             exc.message,
             hint="Set the expected API-key env var for this provider.",
@@ -233,7 +162,7 @@ def _build_service(*, output: OutputFormat = OutputFormat.TEXT) -> RetrievalServ
         )
         raise typer.Exit(code=1) from None
     except KeyError as exc:
-        _print_error(
+        print_error(
             "Embedder unavailable",
             f"Provider {embedding.provider!r} requires additional packages.",
             details=str(exc),
@@ -246,16 +175,10 @@ def _build_service(*, output: OutputFormat = OutputFormat.TEXT) -> RetrievalServ
         )
         raise typer.Exit(code=1) from None
 
-    stamp = EmbedderStamp(
-        provider=embedding.provider,
-        model=embedding.model_name,
-        dimension=target_dim,
-    )
-
     try:
         chroma = ChromaDBClient(stamp)
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Storage initialisation failed",
             exc.message,
             details=exc.details,
@@ -430,7 +353,7 @@ def search(
     # storage — the service would raise SearchError anyway, but failing
     # here saves an embedder build for a known-bad invocation.
     if not query or not query.strip():
-        _print_error(
+        print_error(
             "Invalid query",
             "Query must not be empty.",
             output=output_format,
@@ -438,8 +361,8 @@ def search(
         )
         raise typer.Exit(code=1)
 
-    _validate_date(start_date, "--start-date")
-    _validate_date(end_date, "--end-date")
+    validate_date(start_date, "--start-date")
+    validate_date(end_date, "--end-date")
 
     # Normalise filters to uppercase to match the metadata stored on
     # the ChromaDB collection (tickers and form types are uppercased at
@@ -474,7 +397,7 @@ def search(
             with console.status("Searching..."):
                 results = _run_retrieve()
     except SearchError as exc:
-        _print_error(
+        print_error(
             "Search failed",
             exc.message,
             details=exc.details,
@@ -492,7 +415,7 @@ def search(
         # fine, the embedder upstream is not.  Mirror the
         # ``/api/search`` mapping (502 there) with a single
         # operator-facing line here.
-        _print_error(
+        print_error(
             "Embedding provider failure",
             "The embedding provider failed while processing the query.",
             details=exc.message,
@@ -505,7 +428,7 @@ def search(
         )
         raise typer.Exit(code=1) from None
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Database failure",
             exc.message,
             details=exc.details,

@@ -37,23 +37,21 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from sec_generative_search.cli._common import print_error, resolve_stamp
 from sec_generative_search.cli._json import (
     OutputFormat,
     coerce_output_format,
-    error_envelope,
     is_json,
     print_json,
 )
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.exceptions import DatabaseError
-from sec_generative_search.core.types import EmbedderStamp
 from sec_generative_search.database import (
     ChromaDBClient,
     FilingRecord,
     FilingStore,
     MetadataRegistry,
 )
-from sec_generative_search.providers.registry import ProviderRegistry
 
 __all__ = ["manage_app"]
 
@@ -70,41 +68,6 @@ manage_app = typer.Typer(
 # ---------------------------------------------------------------------------
 # Rendering helpers
 # ---------------------------------------------------------------------------
-
-
-def _print_error(
-    label: str,
-    message: str,
-    *,
-    details: str | None = None,
-    hint: str | None = None,
-    output: OutputFormat = OutputFormat.TEXT,
-    error_code: str | None = None,
-) -> None:
-    """Render an error with optional details and a single hint line.
-
-    Mirrors the helper shape in :mod:`cli.evict` / :mod:`cli.ingest` —
-    every operator-facing string passes through :func:`rich.markup.escape`
-    so accession numbers / install hints with literal square brackets
-    render verbatim.
-
-    When ``output == OutputFormat.JSON`` the document is an
-    :func:`error_envelope` instead of the Rich text; ``error_code``
-    drives the machine-readable ``error`` slug.  Mutating-command
-    failures (``remove`` / ``clear``) deliberately keep ``output``
-    defaulted to TEXT because those commands do not expose
-    ``--output json`` — the JSON flag is exposed only on the read
-    paths (``status`` / ``list``).
-    """
-    if is_json(output):
-        slug = error_code or label.lower().replace(" ", "_")
-        print_json(error_envelope(slug, message, hint=hint, details=details))
-        return
-    console.print(f"[red]{escape(label)}:[/red] {escape(message)}")
-    if details:
-        console.print(f"  [dim]{escape(details)}[/dim]")
-    if hint:
-        console.print(f"  [dim italic]Hint: {escape(hint)}[/dim italic]")
 
 
 def _record_to_dict(record: FilingRecord) -> dict[str, Any]:
@@ -129,39 +92,6 @@ def _record_to_dict(record: FilingRecord) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_stamp(*, output: OutputFormat = OutputFormat.TEXT) -> EmbedderStamp:
-    """Compose the embedder stamp from settings + registry.
-
-    No factory call — :class:`ChromaDBClient` only needs the stamp to
-    seal the collection, and ``manage`` performs no embedding work.
-    This mirrors :mod:`cli.evict`'s posture: opening the collection is
-    a stamp-verification step, never a credential-gated path.
-    """
-    settings = get_settings()
-    embedding = settings.embedding
-    try:
-        dim = ProviderRegistry.get_dimension(embedding.provider, embedding.model_name)
-    except (KeyError, ValueError) as exc:
-        _print_error(
-            "Embedder configuration invalid",
-            f"Cannot resolve dimension for {embedding.provider}/{embedding.model_name}.",
-            details=str(exc),
-            hint=(
-                "Check EMBEDDING_PROVIDER and EMBEDDING_MODEL_NAME against "
-                "the registry — defaults live in providers/registry.py."
-            ),
-            output=output,
-            error_code="embedder_configuration_invalid",
-        )
-        raise typer.Exit(code=1) from None
-
-    return EmbedderStamp(
-        provider=embedding.provider,
-        model=embedding.model_name,
-        dimension=dim,
-    )
-
-
 def _open_registry_only(*, output: OutputFormat = OutputFormat.TEXT) -> MetadataRegistry:
     """Open the metadata registry for read-only queries.
 
@@ -175,7 +105,7 @@ def _open_registry_only(*, output: OutputFormat = OutputFormat.TEXT) -> Metadata
     try:
         return MetadataRegistry()
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Registry initialisation failed",
             exc.message,
             details=exc.details,
@@ -197,12 +127,13 @@ def _open_store(
     Failures surface as a single operator-facing envelope — the caller
     never sees a stack trace.
     """
-    stamp = _resolve_stamp(output=output)
+    embedding = get_settings().embedding
+    stamp = resolve_stamp(embedding.provider, embedding.model_name, output=output)
     try:
         chroma = ChromaDBClient(stamp)
         registry = MetadataRegistry()
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Storage initialisation failed",
             exc.message,
             details=exc.details,
@@ -257,7 +188,7 @@ def status(
         stats = registry.get_statistics()
         chunk_count = chroma.collection_count()
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Status query failed",
             exc.message,
             details=exc.details,
@@ -368,7 +299,7 @@ def list_filings(
             form_type=form.upper() if form else None,
         )
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "List failed",
             exc.message,
             details=exc.details,
@@ -489,14 +420,14 @@ def remove(
     has_filters = ticker is not None or form is not None
 
     if accession_number is None and not has_filters:
-        _print_error(
+        print_error(
             "Missing target",
             "Provide an accession number or use --ticker/--form to select filings.",
         )
         raise typer.Exit(code=1)
 
     if accession_number is not None and has_filters:
-        _print_error(
+        print_error(
             "Invalid flag combination",
             "Cannot combine an accession number with --ticker/--form filters.",
         )
@@ -509,11 +440,11 @@ def remove(
         try:
             filing = registry.get_filing(accession_number)
         except DatabaseError as exc:
-            _print_error("Lookup failed", exc.message, details=exc.details)
+            print_error("Lookup failed", exc.message, details=exc.details)
             raise typer.Exit(code=1) from None
 
         if filing is None:
-            _print_error(
+            print_error(
                 "Filing not found",
                 escape(accession_number),
                 hint="Run 'sec-rag manage list' to see available accession numbers.",
@@ -531,7 +462,7 @@ def remove(
         try:
             store.delete_filing(filing.accession_number)
         except DatabaseError as exc:
-            _print_error(
+            print_error(
                 "Removal failed",
                 exc.message,
                 details=exc.details,
@@ -553,7 +484,7 @@ def remove(
             form_type=form.upper() if form else None,
         )
     except DatabaseError as exc:
-        _print_error("Lookup failed", exc.message, details=exc.details)
+        print_error("Lookup failed", exc.message, details=exc.details)
         raise typer.Exit(code=1) from None
 
     if not filings:
@@ -598,7 +529,7 @@ def remove(
     try:
         rows_removed = store.delete_filings_batch([f.accession_number for f in filings])
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Removal failed",
             exc.message,
             details=exc.details,
@@ -650,7 +581,7 @@ def clear(
     try:
         filings = registry.list_filings()
     except DatabaseError as exc:
-        _print_error("Lookup failed", exc.message, details=exc.details)
+        print_error("Lookup failed", exc.message, details=exc.details)
         raise typer.Exit(code=1) from None
 
     if not filings:
@@ -676,7 +607,7 @@ def clear(
     try:
         chunks_removed, filings_removed = store.clear_all()
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Clear failed",
             exc.message,
             details=exc.details,

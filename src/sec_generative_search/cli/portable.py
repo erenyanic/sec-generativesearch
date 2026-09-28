@@ -31,12 +31,12 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from sec_generative_search.cli._common import print_error, resolve_stamp
 from sec_generative_search.config.settings import EmbeddingSettings, get_settings
 from sec_generative_search.core.exceptions import (
     ConfigurationError,
     DatabaseError,
 )
-from sec_generative_search.core.types import EmbedderStamp
 from sec_generative_search.database import (
     ChromaDBClient,
     FilingStore,
@@ -45,27 +45,11 @@ from sec_generative_search.database import (
     PortableImportService,
 )
 from sec_generative_search.providers.factory import build_embedder
-from sec_generative_search.providers.registry import ProviderRegistry
 
 __all__ = ["export", "import_"]
 
 
 console = Console()
-
-
-def _print_error(
-    label: str,
-    message: str,
-    *,
-    details: str | None = None,
-    hint: str | None = None,
-) -> None:
-    """Render an error with optional details and a single hint line."""
-    console.print(f"[red]{escape(label)}:[/red] {escape(message)}")
-    if details:
-        console.print(f"  [dim]{escape(details)}[/dim]")
-    if hint:
-        console.print(f"  [dim italic]Hint: {escape(hint)}[/dim italic]")
 
 
 def _build_import_embedding_settings(provider: str, model_name: str) -> EmbeddingSettings:
@@ -186,7 +170,7 @@ def export(
             )
         except DatabaseError as exc:
             progress.stop()
-            _print_error("Export failed", exc.message, details=exc.details)
+            print_error("Export failed", exc.message, details=exc.details)
             raise typer.Exit(code=1) from None
         except KeyboardInterrupt:
             progress.stop()
@@ -269,26 +253,7 @@ def import_(
     model_name = settings.embedding.model_name
 
     # Resolve the host stamp via the registry — O(1), credential-free.
-    try:
-        target_dim = ProviderRegistry.get_dimension(provider_name, model_name)
-    except (KeyError, ValueError) as exc:
-        _print_error(
-            "Embedder configuration invalid",
-            f"Cannot resolve dimension for {provider_name}/{model_name}.",
-            details=str(exc),
-            hint=(
-                "Check EMBEDDING_PROVIDER and EMBEDDING_MODEL_NAME against "
-                "the registry — sec-rag provider list will surface the "
-                "valid combinations once the provider command set lands."
-            ),
-        )
-        raise typer.Exit(code=1) from None
-
-    target_stamp = EmbedderStamp(
-        provider=provider_name,
-        model=model_name,
-        dimension=target_dim,
-    )
+    target_stamp = resolve_stamp(provider_name, model_name)
 
     # Build the embedder through the factory seam.  Hosted providers
     # need their local-only knobs pinned to defaults to avoid tripping
@@ -297,14 +262,14 @@ def import_(
         embedding_settings = _build_import_embedding_settings(provider_name, model_name)
         embedder = build_embedder(embedding_settings)
     except ConfigurationError as exc:
-        _print_error(
+        print_error(
             "Embedder construction failed",
             exc.message,
             hint="Set the expected API-key env var for this provider.",
         )
         raise typer.Exit(code=1) from None
     except KeyError as exc:
-        _print_error(
+        print_error(
             "Embedder unavailable",
             f"Provider {provider_name!r} requires additional packages.",
             details=str(exc),
@@ -319,7 +284,7 @@ def import_(
         "\n[bold yellow]Import portable export[/bold yellow]\n"
         f"  Input: [cyan]{escape(input_path)}[/cyan]\n"
         f"  Re-embedding under: [cyan]{provider_name}[/cyan] / "
-        f"[green]{model_name}[/green] (dim={target_dim})\n"
+        f"[green]{model_name}[/green] (dim={target_stamp.dimension})\n"
         "  [dim italic]Duplicate accessions on the host are skipped, not "
         "overwritten.[/dim italic]\n"
     )
@@ -339,7 +304,7 @@ def import_(
         registry = MetadataRegistry()
         store = FilingStore(chroma, registry)
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Storage open failed",
             exc.message,
             details=exc.details,
@@ -381,7 +346,7 @@ def import_(
             )
         except DatabaseError as exc:
             progress.stop()
-            _print_error("Import failed", exc.message, details=exc.details)
+            print_error("Import failed", exc.message, details=exc.details)
             raise typer.Exit(code=1) from None
         except KeyboardInterrupt:
             progress.stop()

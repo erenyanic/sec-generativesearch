@@ -29,7 +29,6 @@ hints) survive Rich's markup parser.
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Annotated
 
 import typer
@@ -43,6 +42,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from sec_generative_search.cli._common import print_error, resolve_stamp, validate_date
 from sec_generative_search.config.constants import DEFAULT_FORM_TYPES, parse_form_types
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.exceptions import (
@@ -52,7 +52,7 @@ from sec_generative_search.core.exceptions import (
     FilingLimitExceededError,
     SECGenerativeSearchError,
 )
-from sec_generative_search.core.types import EmbedderStamp, FilingIdentifier
+from sec_generative_search.core.types import FilingIdentifier
 from sec_generative_search.database import (
     ChromaDBClient,
     FilingStore,
@@ -66,7 +66,6 @@ from sec_generative_search.pipeline import (
 )
 from sec_generative_search.pipeline.prefetch import OneAheadFetches
 from sec_generative_search.providers.factory import build_embedder
-from sec_generative_search.providers.registry import ProviderRegistry
 
 __all__ = ["ingest_app"]
 
@@ -88,27 +87,6 @@ _STEPS = ("Fetching", "Parsing", "Chunking", "Embedding", "Storing")
 # ---------------------------------------------------------------------------
 
 
-def _print_error(
-    label: str,
-    message: str,
-    *,
-    details: str | None = None,
-    hint: str | None = None,
-) -> None:
-    """Render an error with optional details and a single hint line.
-
-    All operator-facing strings flow through :func:`rich.markup.escape`
-    so hints / accession numbers / install snippets carrying literal
-    square brackets render verbatim instead of being silently stripped
-    by Rich's markup parser.
-    """
-    console.print(f"[red]{escape(label)}:[/red] {escape(message)}")
-    if details:
-        console.print(f"  [dim]{escape(details)}[/dim]")
-    if hint:
-        console.print(f"  [dim italic]Hint: {escape(hint)}[/dim italic]")
-
-
 def _make_progress() -> Progress:
     """Build a Rich :class:`Progress` instance with ingest-specific columns."""
     return Progress(
@@ -119,24 +97,6 @@ def _make_progress() -> Progress:
         TimeElapsedColumn(),
         console=console,
     )
-
-
-def _validate_date(value: str | None, param_name: str) -> str | None:
-    """Validate ``YYYY-MM-DD`` strings at the CLI boundary.
-
-    Same shape Typer would reject internally if it knew about ISO
-    dates; surfacing a :class:`typer.BadParameter` here means the
-    error renders consistently with the rest of the CLI.
-    """
-    if value is None:
-        return None
-    try:
-        datetime.strptime(value, "%Y-%m-%d")
-    except ValueError:
-        raise typer.BadParameter(
-            f"Invalid date format for {param_name}: {value!r}. Expected YYYY-MM-DD."
-        ) from None
-    return value
 
 
 # ---------------------------------------------------------------------------
@@ -161,31 +121,19 @@ def _build_pipeline() -> tuple[FilingFetcher, PipelineOrchestrator, MetadataRegi
     settings = get_settings()
     embedding = settings.embedding
 
-    try:
-        target_dim = ProviderRegistry.get_dimension(embedding.provider, embedding.model_name)
-    except (KeyError, ValueError) as exc:
-        _print_error(
-            "Embedder configuration invalid",
-            f"Cannot resolve dimension for {embedding.provider}/{embedding.model_name}.",
-            details=str(exc),
-            hint=(
-                "Check EMBEDDING_PROVIDER and EMBEDDING_MODEL_NAME against "
-                "the registry — defaults live in providers/registry.py."
-            ),
-        )
-        raise typer.Exit(code=1) from None
+    stamp = resolve_stamp(embedding.provider, embedding.model_name)
 
     try:
         embedder = build_embedder(embedding)
     except ConfigurationError as exc:
-        _print_error(
+        print_error(
             "Embedder construction failed",
             exc.message,
             hint="Set the expected API-key env var for this provider.",
         )
         raise typer.Exit(code=1) from None
     except KeyError as exc:
-        _print_error(
+        print_error(
             "Embedder unavailable",
             f"Provider {embedding.provider!r} requires additional packages.",
             details=str(exc),
@@ -196,17 +144,11 @@ def _build_pipeline() -> tuple[FilingFetcher, PipelineOrchestrator, MetadataRegi
         )
         raise typer.Exit(code=1) from None
 
-    stamp = EmbedderStamp(
-        provider=embedding.provider,
-        model=embedding.model_name,
-        dimension=target_dim,
-    )
-
     try:
         chroma = ChromaDBClient(stamp)
         registry = MetadataRegistry()
     except DatabaseError as exc:
-        _print_error(
+        print_error(
             "Storage initialisation failed",
             exc.message,
             details=exc.details,
@@ -297,7 +239,7 @@ def _ingest_one_form(
         )
     except FetchError as exc:
         progress.stop()
-        _print_error(
+        print_error(
             f"Fetch failed for {ticker} {form_type}",
             exc.message,
             details=exc.details,
@@ -408,7 +350,7 @@ def _ingest_listed_form(
                 )
             else:
                 progress.stop()
-                _print_error(
+                print_error(
                     f"Fetch failed for {ticker} {form_type}",
                     exc.message,
                     details=exc.details,
@@ -448,7 +390,7 @@ def _ingest_listed_form(
                 )
             else:
                 progress.stop()
-                _print_error(
+                print_error(
                     "Processing failed",
                     exc.message,
                     details=exc.details,
@@ -472,7 +414,7 @@ def _ingest_listed_form(
                 )
             else:
                 progress.stop()
-                _print_error(
+                print_error(
                     "Storage failed",
                     exc.message,
                     hint="Check disk space and that the data directory is writable.",
@@ -545,7 +487,7 @@ def _ingest_across_forms(
             end_date=end_date,
         )
     except FetchError as exc:
-        _print_error(
+        print_error(
             f"Listing failed for {ticker}",
             exc.message,
             details=exc.details,
@@ -787,7 +729,7 @@ def add(
     ticker = ticker.upper()
 
     if total is not None and number is not None:
-        _print_error(
+        print_error(
             "Invalid flag combination",
             "--total and --number are mutually exclusive.",
         )
@@ -796,11 +738,11 @@ def add(
     try:
         form_types = parse_form_types(form)
     except ValueError as exc:
-        _print_error("Invalid form type", str(exc))
+        print_error("Invalid form type", str(exc))
         raise typer.Exit(code=1) from None
 
-    _validate_date(start_date, "--start-date")
-    _validate_date(end_date, "--end-date")
+    validate_date(start_date, "--start-date")
+    validate_date(end_date, "--end-date")
 
     fetcher, orchestrator, registry, store = _build_pipeline()
 
@@ -839,7 +781,7 @@ def add(
             try:
                 registry.check_filing_limit()
             except FilingLimitExceededError as exc:
-                _print_error(
+                print_error(
                     "Filing limit reached",
                     exc.message,
                     hint=(
@@ -970,7 +912,7 @@ def batch(
     tickers = [t.upper() for t in tickers]
 
     if total is not None and number is not None:
-        _print_error(
+        print_error(
             "Invalid flag combination",
             "--total and --number are mutually exclusive.",
         )
@@ -979,11 +921,11 @@ def batch(
     try:
         form_types = parse_form_types(form)
     except ValueError as exc:
-        _print_error("Invalid form type", str(exc))
+        print_error("Invalid form type", str(exc))
         raise typer.Exit(code=1) from None
 
-    _validate_date(start_date, "--start-date")
-    _validate_date(end_date, "--end-date")
+    validate_date(start_date, "--start-date")
+    validate_date(end_date, "--end-date")
 
     fetcher, orchestrator, registry, store = _build_pipeline()
 
@@ -1033,7 +975,7 @@ def batch(
                 try:
                     registry.check_filing_limit()
                 except FilingLimitExceededError as exc:
-                    _print_error(
+                    print_error(
                         "Filing limit reached",
                         exc.message,
                         hint=(

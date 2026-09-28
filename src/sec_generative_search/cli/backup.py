@@ -29,59 +29,18 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from sec_generative_search.cli._common import print_error, resolve_stamp
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.exceptions import (
     DatabaseError,
     EmbeddingCollectionMismatchError,
 )
-from sec_generative_search.core.types import EmbedderStamp
 from sec_generative_search.database import BackupService
-from sec_generative_search.providers.registry import ProviderRegistry
 
 __all__ = ["backup", "restore"]
 
 
 console = Console()
-
-
-def _print_error(
-    label: str,
-    message: str,
-    *,
-    details: str | None = None,
-    hint: str | None = None,
-) -> None:
-    """Render an error with optional details and a single hint line.
-
-    Mirrors :mod:`cli.reindex` / :mod:`cli.evict` — every operator-
-    facing string flows through :func:`rich.markup.escape` so square
-    brackets in hints (env-var names, stamp tuples) render verbatim
-    instead of being silently stripped as malformed Rich tags.
-    """
-    console.print(f"[red]{escape(label)}:[/red] {escape(message)}")
-    if details:
-        console.print(f"  [dim]{escape(details)}[/dim]")
-    if hint:
-        console.print(f"  [dim italic]Hint: {escape(hint)}[/dim italic]")
-
-
-def _resolve_host_stamp() -> EmbedderStamp:
-    """Build the host's expected stamp from settings + registry probe.
-
-    The registry's ``get_dimension`` is O(1), credential-free, and
-    matches the pattern used by :mod:`cli.evict`.  We never construct
-    an embedder here — backup / restore is pure storage-layer work.
-    """
-    settings = get_settings()
-    target_dim = ProviderRegistry.get_dimension(
-        settings.embedding.provider,
-        settings.embedding.model_name,
-    )
-    return EmbedderStamp(
-        provider=settings.embedding.provider,
-        model=settings.embedding.model_name,
-        dimension=target_dim,
-    )
 
 
 def backup(
@@ -178,7 +137,7 @@ def backup(
             )
         except DatabaseError as exc:
             progress.stop()
-            _print_error(
+            print_error(
                 "Backup failed",
                 exc.message,
                 details=exc.details,
@@ -244,20 +203,9 @@ def restore(
 
         sec-rag manage restore -i backup.tar.gz -y
     """
-    try:
-        expected_stamp = _resolve_host_stamp()
-    except (KeyError, ValueError) as exc:
-        _print_error(
-            "Embedder configuration invalid",
-            "Cannot resolve the host's expected embedder stamp.",
-            details=str(exc),
-            hint=(
-                "Check EMBEDDING_PROVIDER and EMBEDDING_MODEL_NAME against "
-                "the registry — sec-rag provider list will surface the "
-                "valid combinations once the provider command set lands."
-            ),
-        )
-        raise typer.Exit(code=1) from None
+    # The host's expected stamp — registry probe only, no embedder built.
+    embedding = get_settings().embedding
+    expected_stamp = resolve_stamp(embedding.provider, embedding.model_name)
 
     console.print(
         "\n[bold yellow]Restore storage layer[/bold yellow]\n"
@@ -307,7 +255,7 @@ def restore(
             )
         except EmbeddingCollectionMismatchError as exc:
             progress.stop()
-            _print_error(
+            print_error(
                 "Restore refused — embedder stamp mismatch",
                 exc.message,
                 details=(
@@ -321,7 +269,7 @@ def restore(
             raise typer.Exit(code=1) from None
         except DatabaseError as exc:
             progress.stop()
-            _print_error(
+            print_error(
                 "Restore failed",
                 exc.message,
                 details=exc.details,
