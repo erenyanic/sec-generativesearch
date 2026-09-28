@@ -36,7 +36,7 @@ Security contract (shared by both routes):
             is a read-only side effect on the upstream LLM (no server-state
             mutation) and every authenticated tenant must be able to run it.
         - Rate-limited under the ``rag`` category by
-            :class:`RateLimitMiddleware._classify_path`.
+            :class:`RateLimitMiddleware` (``ROUTE_POLICIES``).
         - LLM construction goes through
             :func:`request_scoped_resolver` → :func:`build_llm_provider`; a
             missing key is reported as 400 ``provider_key_required`` so the

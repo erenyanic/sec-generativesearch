@@ -712,9 +712,10 @@ class SearchHit(_BaseModel):
           want to see it; it is NOT a credential and reveals nothing
           about the underlying corpus shape that ``content`` does not
           already.
-        - ``truncated`` is reserved for future mid-chunk clipping; the
-          current packer is drop-tail and never sets the flag, but the
-          field is on the wire so a future change does not break clients.
+        - ``RetrievalResult.truncated`` is deliberately **not** lifted:
+          the packer is drop-tail and never sets it, so it was a constant
+          ``false`` on every hit (F36).  Add it back — a widening, so a
+          reviewed rule-L change — only with a mid-chunk clipping strategy.
     """
 
     chunk_id: str | None
@@ -728,7 +729,6 @@ class SearchHit(_BaseModel):
     similarity: float
     rerank_score: float | None = None
     token_count: int = 0
-    truncated: bool = False
     section_boundaries: list[str] = Field(default_factory=list)
 
 

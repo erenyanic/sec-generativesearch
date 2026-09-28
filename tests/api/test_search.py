@@ -245,7 +245,6 @@ class TestSearchDelegation:
             "similarity",
             "rerank_score",
             "token_count",
-            "truncated",
             "section_boundaries",
         }
         assert hit["rerank_score"] == 0.91
@@ -527,9 +526,12 @@ class TestSearchAuthGate:
 @pytest.mark.security
 class TestSearchRateLimitClassification:
     def test_search_path_classifies_as_search(self) -> None:
-        from sec_generative_search.api.middleware import _classify_path
+        from sec_generative_search.api.middleware import _rate_category_for_scope
 
-        assert _classify_path("/api/search", "POST") == "search"
+        assert (
+            _rate_category_for_scope({"type": "http", "path": "/api/search", "method": "POST"})
+            == "search"
+        )
 
     def test_search_respects_per_ip_window(self, search_app_factory) -> None:
         # Tight per-IP limit — fourth request inside the same minute

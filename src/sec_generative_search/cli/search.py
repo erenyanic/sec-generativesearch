@@ -183,7 +183,6 @@ def _hit_to_dict(result: RetrievalResult) -> dict[str, Any]:
         "similarity": result.similarity,
         "rerank_score": result.rerank_score,
         "token_count": result.token_count,
-        "truncated": result.truncated,
         "section_boundaries": list(result.section_boundaries),
     }
 

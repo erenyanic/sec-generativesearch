@@ -799,9 +799,12 @@ class TestRagStreamAuthGate:
 @pytest.mark.security
 class TestRagStreamRateLimitClassification:
     def test_stream_path_classifies_as_rag(self) -> None:
-        from sec_generative_search.api.middleware import _classify_path
+        from sec_generative_search.api.middleware import _rate_category_for_scope
 
-        assert _classify_path("/api/rag/stream", "POST") == "rag"
+        assert (
+            _rate_category_for_scope({"type": "http", "path": "/api/rag/stream", "method": "POST"})
+            == "rag"
+        )
 
 
 # ---------------------------------------------------------------------------

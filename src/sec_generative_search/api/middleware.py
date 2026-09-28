@@ -494,32 +494,17 @@ class _SlidingWindow:
             del self._requests[k]
 
 
-def _classify_path(path: str, method: str) -> str | None:
-    """Map a request path/method to a rate-limit category.
-
-    Thin shim over :func:`~sec_generative_search.api.policies.resolve_policy`
-    preserved for the existing tests that import it directly.  The
-    return semantics mirror the original classifier:
+def _rate_category_for_scope(scope: Scope) -> str | None:
+    """Map a request to its rate-limit category through the policy cache.
 
     - ``None`` — the route is exempt from the rate limiter (e.g.
-      ``/api/health``) **or** the path falls outside ``/api/`` and so
-      should not be rate-limited at all (Swagger / Redoc / static).
-    - any non-``None`` string — the rate-limit bucket name.
-    """
-    # Non-``/api/`` paths (Swagger, Redoc, openapi.json, static) skip
-    # the rate limiter entirely — they are unauthenticated read
-    # surfaces gated by ``API_KEY`` presence in the FastAPI factory.
-    if not path.startswith("/api/") and path != "/api":
-        return None
-    return resolve_policy(path, method).rate_category
+      ``/api/health``) **or** the path falls outside ``/api/`` (Swagger /
+      Redoc / static — unauthenticated read surfaces gated by ``API_KEY``
+      presence in the FastAPI factory).
+    - any other string — the rate-limit bucket name.
 
-
-def _rate_category_for_scope(scope: Scope) -> str | None:
-    """Scope-level twin of :func:`_classify_path` using the policy cache.
-
-    Same semantics as ``_classify_path`` (``None`` = exempt / non-``/api/``)
-    but resolves the category through :func:`_resolve_policy_cached` so the
-    single per-request table scan is shared with the content-size limiter.
+    Resolves through :func:`_resolve_policy_cached`, so the single
+    per-request table scan is shared with the content-size limiter.
     Non-``/api/`` paths short-circuit *without* touching the cache — the
     content-size limiter resolves its own policy for those.
     """

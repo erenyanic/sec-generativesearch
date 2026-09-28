@@ -383,7 +383,6 @@ class TestSearchJson:
             "similarity",
             "rerank_score",
             "token_count",
-            "truncated",
             "section_boundaries",
         }
         assert set(payload["hits"][0].keys()) == expected_keys

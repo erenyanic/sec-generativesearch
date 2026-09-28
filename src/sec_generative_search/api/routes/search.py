@@ -76,7 +76,6 @@ def _hit_from_result(result: RetrievalResult) -> SearchHit:
         similarity=result.similarity,
         rerank_score=result.rerank_score,
         token_count=result.token_count,
-        truncated=result.truncated,
         section_boundaries=list(result.section_boundaries),
     )
 

@@ -2,7 +2,7 @@
 
 Single source of truth consulted by both
 :class:`~sec_generative_search.api.middleware.RateLimitMiddleware`
-(via the legacy ``_classify_path`` shim) and
+(via ``_rate_category_for_scope``) and
 :class:`~sec_generative_search.api.middleware.ContentSizeLimitMiddleware`
 (per-route body cap).
 

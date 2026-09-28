@@ -4,8 +4,8 @@ Covers:
 
 - :func:`resolve_policy` returns the right rate category and body
   cap for every shipped route.
-- The table preserves the legacy ``_classify_path`` mapping (the
-  shim is the bridge for existing tests).
+- The rate limiter's scope-level classifier (``_rate_category_for_scope``)
+  keeps the category mapping every route test relies on.
 - Every rate category named in the table has a backing
   ``ApiSettings.rate_limit_*`` knob — drift between the table and
   settings would silently disable a bucket.
@@ -98,7 +98,7 @@ class TestPathBoundary:
     def test_non_api_path_falls_back_to_default(self) -> None:
         # /docs, /redoc, /openapi.json all inherit the default. The
         # rate-limit middleware separately exempts non-/api/ paths
-        # via the _classify_path shim.
+        # in ``_rate_category_for_scope``.
         assert resolve_policy("/docs", "GET") == DEFAULT_POLICY
         assert resolve_policy("/openapi.json", "GET") == DEFAULT_POLICY
 
@@ -198,6 +198,8 @@ class TestClassifyPathShim:
         ],
     )
     def test_legacy_contract(self, path: str, method: str, expected: str | None) -> None:
-        from sec_generative_search.api.middleware import _classify_path
+        from sec_generative_search.api.middleware import _rate_category_for_scope
 
-        assert _classify_path(path, method) == expected
+        assert (
+            _rate_category_for_scope({"type": "http", "path": path, "method": method}) == expected
+        )

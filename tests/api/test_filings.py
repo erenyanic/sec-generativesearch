@@ -742,24 +742,42 @@ class TestFilingsRateLimitClassification:
     """
 
     def test_post_delete_by_ids_classifies_as_delete(self) -> None:
-        from sec_generative_search.api.middleware import _classify_path
+        from sec_generative_search.api.middleware import _rate_category_for_scope
 
-        assert _classify_path("/api/filings/delete-by-ids", "POST") == "delete"
+        assert (
+            _rate_category_for_scope(
+                {"type": "http", "path": "/api/filings/delete-by-ids", "method": "POST"}
+            )
+            == "delete"
+        )
 
     def test_post_bulk_delete_classifies_as_delete(self) -> None:
-        from sec_generative_search.api.middleware import _classify_path
+        from sec_generative_search.api.middleware import _rate_category_for_scope
 
-        assert _classify_path("/api/filings/bulk-delete", "POST") == "delete"
+        assert (
+            _rate_category_for_scope(
+                {"type": "http", "path": "/api/filings/bulk-delete", "method": "POST"}
+            )
+            == "delete"
+        )
 
     def test_get_listing_classifies_as_general(self) -> None:
-        from sec_generative_search.api.middleware import _classify_path
+        from sec_generative_search.api.middleware import _rate_category_for_scope
 
-        assert _classify_path("/api/filings/", "GET") == "general"
+        assert (
+            _rate_category_for_scope({"type": "http", "path": "/api/filings/", "method": "GET"})
+            == "general"
+        )
 
     def test_delete_route_classifies_as_delete(self) -> None:
-        from sec_generative_search.api.middleware import _classify_path
+        from sec_generative_search.api.middleware import _rate_category_for_scope
 
-        assert _classify_path("/api/filings/0000320193-23-000077", "DELETE") == "delete"
+        assert (
+            _rate_category_for_scope(
+                {"type": "http", "path": "/api/filings/0000320193-23-000077", "method": "DELETE"}
+            )
+            == "delete"
+        )
 
     def test_destructive_post_respects_delete_rate_limit(self, filings_app_factory) -> None:
         records = [_record(accession="0000000001-23-000001")]

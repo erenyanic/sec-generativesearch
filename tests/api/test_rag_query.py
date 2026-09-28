@@ -870,9 +870,12 @@ class TestRagQueryAuthGate:
 @pytest.mark.security
 class TestRagQueryRateLimitClassification:
     def test_query_path_classifies_as_rag(self) -> None:
-        from sec_generative_search.api.middleware import _classify_path
+        from sec_generative_search.api.middleware import _rate_category_for_scope
 
-        assert _classify_path("/api/rag/query", "POST") == "rag"
+        assert (
+            _rate_category_for_scope({"type": "http", "path": "/api/rag/query", "method": "POST"})
+            == "rag"
+        )
 
     def test_query_respects_per_ip_window(self, rag_query_app_factory) -> None:
         app, _build, _orch = rag_query_app_factory(

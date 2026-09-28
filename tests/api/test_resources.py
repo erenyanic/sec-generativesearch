@@ -394,11 +394,16 @@ class TestResourcesPrivacy:
 @pytest.mark.security
 class TestResourcesRateLimitClassification:
     def test_path_classifies_as_general(self) -> None:
-        from sec_generative_search.api.middleware import _classify_path
+        from sec_generative_search.api.middleware import _rate_category_for_scope
 
         # The route shares the ``general`` rate bucket with ``/api/status``
         # — same operator-facing read tier, same envelope.
-        assert _classify_path("/api/resources/gpu", "GET") == "general"
+        assert (
+            _rate_category_for_scope(
+                {"type": "http", "path": "/api/resources/gpu", "method": "GET"}
+            )
+            == "general"
+        )
 
     def test_policy_caps_body_at_1kib(self) -> None:
         from sec_generative_search.api.policies import resolve_policy
