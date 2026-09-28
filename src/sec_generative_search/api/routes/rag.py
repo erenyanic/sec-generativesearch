@@ -62,13 +62,14 @@ import threading
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, NoReturn, Protocol
 
 from fastapi import APIRouter, Depends, Request
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from sec_generative_search.api.dependencies import (
+    client_ip,
     get_retrieval_service,
     request_scoped_resolver,
     verify_api_key,
@@ -149,12 +150,19 @@ logger = get_logger(__name__)
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 
 
-def _client_ip(request: Request) -> str:
-    """Best-effort client IP for audit-log lines."""
-    return request.client.host if request.client else "unknown"
+class _ProviderChoice(Protocol):
+    """The two request fields :func:`_resolve_provider_and_model` reads.
+
+    ``RagPlanRequest`` and ``RagQueryRequest`` both satisfy it
+    structurally, so one helper serves ``/plan``, ``/query`` and
+    ``/stream`` (F33 collapsed two identical copies).
+    """
+
+    provider: str | None
+    model: str | None
 
 
-def _resolve_provider_and_model(body: RagPlanRequest) -> tuple[str, str]:
+def _resolve_provider_and_model(body: _ProviderChoice) -> tuple[str, str]:
     """Pick the provider / model for this call.
 
     Body fields override settings; settings defaults apply when both are
@@ -467,7 +475,7 @@ def plan_query(
         # ``redact_for_log`` only at debug level (inside ``understand_query``).
         audit_log(
             "rag_plan",
-            client_ip=_client_ip(request),
+            client_ip=client_ip(request),
             endpoint="POST /api/rag/plan",
             detail=(
                 f"provider={provider_name} model={model or '<provider default>'} "
@@ -770,19 +778,6 @@ def _build_llm_for_request(
         ) from None
 
 
-def _resolve_provider_and_model_query(body: RagQueryRequest) -> tuple[str, str]:
-    """Pick provider / model for the generation route.
-
-    Distinct from :func:`_resolve_provider_and_model` only in the body
-    type it accepts — a single helper would pull both schemas into the
-    same callsite and obscure which route is being served.
-    """
-    settings = get_settings()
-    provider = body.provider or settings.llm.default_provider
-    model = body.model or (settings.llm.default_model or "")
-    return provider, model
-
-
 @router.post(
     "/query",
     response_model=RagQueryResponse,
@@ -831,7 +826,7 @@ def generate_answer(
           query-understanding to get there, doubling the LLM round-trip
           on the user-facing path.
     """
-    provider_name, model = _resolve_provider_and_model_query(body)
+    provider_name, model = _resolve_provider_and_model(body)
 
     # Reject unknown providers up front with a 400 — same contract as
     # the plan route.  The capability probe is O(1) and credential-free.
@@ -901,7 +896,7 @@ def generate_answer(
 
         audit_log(
             "rag_query",
-            client_ip=_client_ip(request),
+            client_ip=client_ip(request),
             endpoint="POST /api/rag/query",
             detail=(
                 f"provider={provider_name} model={model or '<provider default>'} "
@@ -1207,7 +1202,7 @@ async def stream_answer(
     and the blocking orchestrator already runs off-loop in
     :func:`_run_orchestrator_in_thread`.
     """
-    provider_name, model = _resolve_provider_and_model_query(body)
+    provider_name, model = _resolve_provider_and_model(body)
 
     # Pre-stream validation — these MUST raise HTTP errors (not SSE
     # error events) because the SSE response is not yet open.  A
@@ -1252,7 +1247,7 @@ async def stream_answer(
 
         audit_log(
             "rag_stream",
-            client_ip=_client_ip(request),
+            client_ip=client_ip(request),
             endpoint="POST /api/rag/stream",
             detail=(
                 f"provider={provider_name} model={model or '<provider default>'} "
@@ -1271,7 +1266,7 @@ async def stream_answer(
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
         stop = threading.Event()
-        client_ip = _client_ip(request)
+        peer_ip = client_ip(request)
 
         _run_orchestrator_in_thread(
             orchestrator,
@@ -1364,7 +1359,7 @@ async def stream_answer(
                 completion_status = "client_disconnected"
             audit_log(
                 "rag_stream_completed",
-                client_ip=client_ip,
+                client_ip=peer_ip,
                 endpoint="POST /api/rag/stream",
                 detail=(
                     f"provider={provider_name} model={model or '<provider default>'} "

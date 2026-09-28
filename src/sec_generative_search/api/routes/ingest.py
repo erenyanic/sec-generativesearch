@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Depends, Path, Request
 
 from sec_generative_search.api.dependencies import (
+    client_ip,
     extract_session_id,
     get_edgar_identity,
     get_task_manager,
@@ -90,11 +91,6 @@ _TASK_ID_PATH_PATTERN = r"^[0-9a-f]{32}$"
 
 # Read-tier router: every ingest endpoint is gated by ``verify_api_key`` only.
 router = APIRouter(dependencies=[Depends(verify_api_key)])
-
-
-def _client_ip(request: Request) -> str:
-    """Best-effort client IP for audit-log lines."""
-    return request.client.host if request.client else "unknown"
 
 
 def _enforce_request_caps(body: IngestRequest) -> None:
@@ -183,7 +179,7 @@ def _create_task(
     audit_log(
         "ingest_task_created",
         detail=(
-            f"client_ip={_client_ip(request)} "
+            f"client_ip={client_ip(request)} "
             f"task_id_tail={mask_secret(task_id)} "
             f"tickers={len(body.tickers)} "
             f"form_types={list(body.form_types)} "
@@ -387,7 +383,7 @@ async def cancel_task(
     audit_log(
         "ingest_task_cancelled",
         detail=(
-            f"client_ip={_client_ip(request)} "
+            f"client_ip={client_ip(request)} "
             f"task_id_tail={mask_secret(task_id)} "
             f"state_before={info.state.value}"
         ),

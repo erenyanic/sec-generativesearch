@@ -719,3 +719,64 @@ class TestEdgarIdentityLockstep:
 
         body = auth_client.delete("/api/auth/session").json()
         assert set(body) == {"cleared"}
+
+
+# ---------------------------------------------------------------------------
+# F33 — one set of session-cookie attributes across both routers
+# ---------------------------------------------------------------------------
+
+
+def _cookie_attributes(set_cookie: str) -> dict[str, str]:
+    """``Set-Cookie`` attributes minus the ``name=value`` pair, normalised."""
+    parts = [p.strip() for p in set_cookie.split(";")]
+    attrs: dict[str, str] = {}
+    for part in parts[1:]:
+        key, _, value = part.partition("=")
+        attrs[key.strip().lower()] = value.strip().lower()
+    attrs.pop("expires", None)  # a wall-clock date, not an attribute choice
+    return attrs
+
+
+@pytest.mark.security
+class TestSessionCookieAttributesMatchAcrossRouters:
+    """``session.py`` (API-key sessions) and ``auth.py`` (user login) both mint
+    and clear the same cookie.  They used to carry separate copies of the
+    cookie helpers "so they could not diverge" — two copies are how they
+    would.  The helpers are shared now; this pins the observable result."""
+
+    def test_minted_cookies_carry_identical_attributes(
+        self, auth_app, auth_client: TestClient
+    ) -> None:
+        via_session = auth_client.post("/api/session")
+        _enrol_user(auth_app, auth_proof=b"p" * 32)
+        via_login = auth_client.post(
+            "/api/auth/login",
+            json={"username": "alice", "auth_proof": _b64(b"p" * 32)},
+        )
+        assert via_session.status_code == 201 and via_login.status_code == 200
+
+        session_attrs = _cookie_attributes(via_session.headers["set-cookie"])
+        login_attrs = _cookie_attributes(via_login.headers["set-cookie"])
+        assert session_attrs == login_attrs
+        assert {"httponly", "secure", "path", "samesite", "max-age"} <= set(session_attrs)
+        assert session_attrs["samesite"] == "strict"
+        assert session_attrs["path"] == "/"
+
+    def test_cleared_cookies_carry_identical_attributes(
+        self, auth_app, auth_client: TestClient
+    ) -> None:
+        auth_client.post("/api/session")
+        via_logout = auth_client.post("/api/session/logout")
+        _login_as_alice(auth_app, auth_client)
+        via_sign_out = auth_client.delete("/api/auth/session")
+        assert via_logout.status_code == 200 and via_sign_out.status_code == 200
+
+        logout_attrs = _cookie_attributes(via_logout.headers["set-cookie"])
+        sign_out_attrs = _cookie_attributes(via_sign_out.headers["set-cookie"])
+        assert logout_attrs == sign_out_attrs
+        assert logout_attrs["max-age"] == "0"
+        # A clearing cookie must match the set cookie's attributes, or a
+        # browser may keep the original.
+        assert {"httponly", "secure"} <= set(logout_attrs)
+        assert logout_attrs["samesite"] == "strict"
+        assert logout_attrs["path"] == "/"

@@ -30,8 +30,9 @@ from fastapi import APIRouter, Depends, Path, Request
 from sec_generative_search.api.dependencies import (
     admin_route_dependencies,
     get_user_store,
+    require_user_store,
 )
-from sec_generative_search.api.errors import http_error
+from sec_generative_search.api.errors import database_error, http_error
 from sec_generative_search.api.schemas import (
     AdminUserCreateRequest,
     AdminUserCreateResponse,
@@ -63,20 +64,6 @@ logger = get_logger(__name__)
 router = APIRouter(dependencies=admin_route_dependencies())
 
 
-def _require_user_store(store: UserStore | None) -> UserStore:
-    if store is None:
-        raise http_error(
-            status_code=503,
-            error="user_tier_disabled",
-            message="User-tier authentication is not available on this deployment.",
-            hint=(
-                "Configure SQLCipher (DB_ENCRYPTION_KEY) and the auth "
-                "pepper (API_AUTH_PEPPER) and restart the API."
-            ),
-        )
-    return store
-
-
 @router.post(
     "/users",
     response_model=AdminUserCreateResponse,
@@ -96,7 +83,7 @@ async def create_user(
     an enrolled user, the route refuses with ``409 username_exists`` —
     the admin must DELETE the existing user first.
     """
-    user_store = _require_user_store(store)
+    user_store = require_user_store(store)
     pepper = get_settings().api.auth_pepper
 
     if user_store.get_by_username(body.username) is not None:
@@ -154,15 +141,11 @@ async def delete_user(
     salt + KEK, so the old ciphertext was already unreadable even if
     an attacker had it).
     """
-    user_store = _require_user_store(store)
+    user_store = require_user_store(store)
     try:
         deleted = user_store.delete_user(user_id)
     except DatabaseError as exc:
-        raise http_error(
-            status_code=500,
-            error="database_error",
-            message="Database error during user delete.",
-        ) from exc
+        raise database_error() from exc
     if not deleted:
         raise http_error(
             status_code=404,
@@ -186,7 +169,7 @@ async def unlock_user(
     Idempotent — a never-locked user returns ``unlocked=True``
     regardless. A non-existent user returns 404.
     """
-    user_store = _require_user_store(store)
+    user_store = require_user_store(store)
     if user_store.get_by_id(user_id) is None:
         raise http_error(
             status_code=404,
@@ -196,9 +179,5 @@ async def unlock_user(
     try:
         cleared = user_store.unlock(user_id)
     except DatabaseError as exc:
-        raise http_error(
-            status_code=500,
-            error="database_error",
-            message="Database error during user unlock.",
-        ) from exc
+        raise database_error() from exc
     return AdminUserUnlockResponse(unlocked=cleared, user_id=user_id)

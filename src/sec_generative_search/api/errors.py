@@ -51,6 +51,7 @@ from sec_generative_search.core.logging import get_logger
 
 __all__ = [
     "ErrorEnvelope",
+    "database_error",
     "envelope",
     "http_error",
     "install_error_handlers",
@@ -109,6 +110,21 @@ def http_error(
         status_code=status_code,
         detail=envelope(error=error, message=message, details=details, hint=hint),
         headers=headers,
+    )
+
+
+def database_error() -> HTTPException:
+    """The one ``500 database_error`` envelope for a storage failure.
+
+    Fixed text: never echo ``DatabaseError.details`` (SQLite / ChromaDB
+    driver strings carry file paths and SQL fragments) — the caller logs
+    it.  Shared by every route so the wording cannot drift (F33).
+    """
+    return http_error(
+        status_code=500,
+        error="database_error",
+        message="Database operation failed. Check server logs.",
+        hint="Check that the data directory is accessible and the database is intact.",
     )
 
 

@@ -19,10 +19,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request
 
 from sec_generative_search.api.dependencies import (
+    client_ip,
     get_retrieval_service,
     verify_api_key,
 )
-from sec_generative_search.api.errors import http_error
+from sec_generative_search.api.errors import database_error, http_error
 from sec_generative_search.api.schemas import (
     SearchHit,
     SearchRequest,
@@ -44,17 +45,6 @@ logger = get_logger(__name__)
 
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
-
-
-def _client_ip(request: Request) -> str:
-    """Best-effort client IP for audit-log lines.
-
-    ``request.client`` is ``None`` for ASGI scopes lacking a peer
-    address (older test clients, certain proxies).  Returning
-    ``"unknown"`` keeps the audit-line shape stable so downstream
-    parsers do not need to handle a missing field.
-    """
-    return request.client.host if request.client else "unknown"
 
 
 def _hit_from_result(result: RetrievalResult) -> SearchHit:
@@ -156,16 +146,11 @@ def search_filings(
     except DatabaseError as exc:
         # Storage-layer failure — same redaction pattern as filings.
         logger.error("search database failure: %s", exc.details)
-        raise http_error(
-            status_code=500,
-            error="database_error",
-            message="Database operation failed. Check server logs.",
-            hint="Check that the data directory is readable and the database is intact.",
-        ) from exc
+        raise database_error() from exc
 
     audit_log(
         "search_executed",
-        client_ip=_client_ip(request),
+        client_ip=client_ip(request),
         endpoint="POST /api/search",
         detail=(
             f"hits={len(results)} top_k={body.top_k or 'default'} "

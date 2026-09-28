@@ -93,6 +93,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from sec_generative_search.api.dependencies import (
     SESSION_COOKIE_NAME,
+    client_ip,
     is_valid_session_id_shape,
 )
 from sec_generative_search.api.tasks import TaskInfo, TaskManager, TaskState, new_message_queue
@@ -196,7 +197,7 @@ async def ingest_progress(websocket: WebSocket, task_id: str) -> None:
 
     audit_log(
         "ws_ingest_connected",
-        client_ip=_client_ip(websocket),
+        client_ip=client_ip(websocket),
         endpoint=f"WS /ws/ingest/{mask_secret(task_id)}",
         detail=f"task_id_tail={mask_secret(task_id)} state={info.state.value}",
     )
@@ -223,7 +224,7 @@ async def ingest_progress(websocket: WebSocket, task_id: str) -> None:
     finally:
         audit_log(
             "ws_ingest_disconnected",
-            client_ip=_client_ip(websocket),
+            client_ip=client_ip(websocket),
             endpoint=f"WS /ws/ingest/{mask_secret(task_id)}",
             detail=f"task_id_tail={mask_secret(task_id)} completion={completion}",
         )
@@ -463,11 +464,6 @@ async def _stream_loop(websocket: WebSocket, info: TaskInfo) -> None:
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
-
-
-def _client_ip(websocket: WebSocket) -> str:
-    """Best-effort client IP, used only on audit-log lines."""
-    return websocket.client.host if websocket.client else "unknown"
 
 
 async def _send_safe(websocket: WebSocket, payload: dict) -> None:

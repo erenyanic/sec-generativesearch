@@ -27,12 +27,14 @@ from __future__ import annotations
 
 import hmac
 import re
+import secrets
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
-from fastapi import Depends, Request, Security
+from fastapi import Depends, Request, Response, Security
 from fastapi.params import Depends as DependsParam
 from fastapi.security import APIKeyHeader
+from starlette.requests import HTTPConnection
 
 from sec_generative_search.api.errors import http_error
 from sec_generative_search.config.settings import get_settings
@@ -61,6 +63,7 @@ if TYPE_CHECKING:
         FilingStore,
         MetadataRegistry,
     )
+    from sec_generative_search.database.users import UserStore
     from sec_generative_search.providers.base import BaseEmbeddingProvider
     from sec_generative_search.search import RetrievalService
 
@@ -70,7 +73,10 @@ __all__ = [
     "EDGAR_NAME_HEADER",
     "PROVIDER_KEY_HEADER_PREFIX",
     "SESSION_COOKIE_NAME",
+    "SESSION_ID_BYTES",
     "admin_route_dependencies",
+    "clear_session_cookie",
+    "client_ip",
     "extract_edgar_headers",
     "extract_session_id",
     "get_chroma",
@@ -89,8 +95,11 @@ __all__ = [
     "header_resolver",
     "is_admin_request",
     "is_valid_session_id_shape",
+    "mint_session_id",
     "parse_provider_key_headers",
     "request_scoped_resolver",
+    "require_user_store",
+    "set_session_cookie",
     "verify_admin_key",
     "verify_api_key",
 ]
@@ -101,6 +110,92 @@ logger = get_logger(__name__)
 
 # Cookie name for the server-minted ``session_id``.
 SESSION_COOKIE_NAME = "sec_rag_session"
+
+# ``secrets.token_urlsafe`` byte count for a server-minted ``session_id``:
+# 43 URL-safe characters, 256 bits of entropy — the shape
+# ``extract_session_id`` accepts.  This is the floor; never weaken it.
+SESSION_ID_BYTES = 32
+
+
+# ---------------------------------------------------------------------------
+# Shared route helpers (F33) — one copy each, so the session-cookie
+# attributes, the audit-line client IP and the user-tier 503 cannot drift
+# between the routers that use them.
+# ---------------------------------------------------------------------------
+
+
+def mint_session_id() -> str:
+    """Generate a fresh server-minted ``session_id``."""
+    return secrets.token_urlsafe(SESSION_ID_BYTES)
+
+
+def set_session_cookie(response: Response, session_id: str, *, max_age: int) -> None:
+    """Apply the session cookie with its unconditional security attributes.
+
+    ``Secure`` and ``HttpOnly`` are unconditional.  ``SameSite=Strict``
+    is the strongest mode FastAPI/Starlette expose — same-site form
+    submissions and cross-origin XHR cannot send the cookie at all,
+    which is exactly what we want for credentialed routes.  Both
+    ``session.py`` (API-key sessions) and ``auth.py`` (user login) call
+    this — never re-fork it.
+    """
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        max_age=max_age,
+        path="/",
+        httponly=True,
+        secure=True,
+        samesite="strict",
+    )
+
+
+def clear_session_cookie(response: Response) -> None:
+    """Issue an immediate-expiry ``Set-Cookie`` mirroring :func:`set_session_cookie`.
+
+    ``delete_cookie`` needs the path (and, for browsers to match, the same
+    attributes) the cookie was set with.
+    """
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="strict",
+    )
+
+
+def client_ip(connection: HTTPConnection) -> str:
+    """Best-effort peer address for audit-log lines (HTTP or WebSocket).
+
+    ``connection.client`` is ``None`` for ASGI scopes lacking a peer
+    address (older test clients, certain proxies); ``"unknown"`` keeps the
+    audit-line shape stable.  It is ``scope["client"]`` — the value
+    uvicorn's ``ProxyHeadersMiddleware`` sets from a *trusted*
+    ``X-Forwarded-For`` only (DEPLOYMENT §4.20.1), the same key the rate
+    limiter uses.
+    """
+    return connection.client.host if connection.client else "unknown"
+
+
+def require_user_store(store: UserStore | None) -> UserStore:
+    """Refuse user-tier routes when the user tier is disabled.
+
+    A deployment without SQLCipher or without the pepper has ``None`` on
+    ``app.state.user_store``; surface a 503 so the SPA shows a coherent
+    "feature not available" message rather than a 500 trace.
+    """
+    if store is None:
+        raise http_error(
+            status_code=503,
+            error="user_tier_disabled",
+            message="User-tier authentication is not available on this deployment.",
+            hint=(
+                "Configure SQLCipher (DB_ENCRYPTION_KEY) and the auth "
+                "pepper (API_AUTH_PEPPER) and restart the API."
+            ),
+        )
+    return store
 
 
 # Until multi-user auth lands, the only writer/reader of the encrypted
@@ -144,10 +239,10 @@ async def verify_api_key(
     if expected is None:
         return
     if not _secrets_match(api_key, expected):
-        client_ip = request.client.host if request.client else "unknown"
+        peer = client_ip(request)
         audit_log(
             "api_key_denied",
-            detail=(f"client_ip={client_ip} endpoint={request.method} {request.url.path}"),
+            detail=(f"client_ip={peer} endpoint={request.method} {request.url.path}"),
         )
         raise http_error(
             status_code=401,
@@ -177,10 +272,10 @@ async def verify_admin_key(
     if expected is None:
         return
     if not _secrets_match(admin_key, expected):
-        client_ip = request.client.host if request.client else "unknown"
+        peer = client_ip(request)
         audit_log(
             "admin_denied",
-            detail=(f"client_ip={client_ip} endpoint={request.method} {request.url.path}"),
+            detail=(f"client_ip={peer} endpoint={request.method} {request.url.path}"),
         )
         raise http_error(
             status_code=403,

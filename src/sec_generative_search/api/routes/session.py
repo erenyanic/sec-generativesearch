@@ -28,15 +28,17 @@ for the cookie's ``session_id`` and expires the cookie immediately.
 
 from __future__ import annotations
 
-import secrets
-
 from fastapi import APIRouter, Depends, Request, Response
 
 from sec_generative_search.api.dependencies import (
     SESSION_COOKIE_NAME,
+    clear_session_cookie,
+    client_ip,
     extract_session_id,
     get_edgar_identity_store,
     get_session_store,
+    mint_session_id,
+    set_session_cookie,
 )
 from sec_generative_search.api.errors import http_error
 from sec_generative_search.api.schemas import (
@@ -64,57 +66,10 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 
-# ``secrets.token_urlsafe(32)`` produces a 43-char base64-url string
-# carrying 256 bits of entropy. This is the floor — never weaken.
-_SESSION_ID_BYTES = 32
-
-
-# Default browser-cookie sliding TTL. Mirrors the in-memory store's
-# default so the cookie never outlives the server-side entry it points at.
-_DEFAULT_COOKIE_MAX_AGE = 60 * 60  # one hour
-
-
-def _mint_session_id() -> str:
-    """Generate a fresh server-minted ``session_id``.
-
-    Wrapped in a function so tests can monkeypatch it deterministically
-    without touching every ``secrets.token_urlsafe`` call site.
-    """
-    return secrets.token_urlsafe(_SESSION_ID_BYTES)
-
-
-def _set_session_cookie(response: Response, session_id: str, *, max_age: int) -> None:
-    """Apply the cookie attributes required for session security.
-
-    ``Secure`` and ``HttpOnly`` are unconditional.  ``SameSite=Strict``
-    is the strongest mode FastAPI/Starlette expose — same-site form
-    submissions and cross-origin XHR cannot send the cookie at all,
-    which is exactly what we want for credentialed routes.
-    """
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_id,
-        max_age=max_age,
-        path="/",
-        httponly=True,
-        secure=True,
-        samesite="strict",
-    )
-
-
-def _clear_session_cookie(response: Response) -> None:
-    """Issue an immediate-expiry ``Set-Cookie`` for the session cookie.
-
-    ``delete_cookie`` requires the same path the cookie was set with;
-    we mirror :func:`_set_session_cookie` exactly.
-    """
-    response.delete_cookie(
-        key=SESSION_COOKIE_NAME,
-        path="/",
-        secure=True,
-        httponly=True,
-        samesite="strict",
-    )
+# Module-level seam the tests patch.  The implementation (and the 32-byte
+# / 256-bit ``secrets.token_urlsafe`` floor — never weaken) is shared with
+# ``auth.py`` in ``api/dependencies.py``.
+_mint_session_id = mint_session_id
 
 
 @router.post(
@@ -161,7 +116,7 @@ async def mint_session(
         "session_mint",
         detail=(
             f"session_id_tail={mask_secret(session_id)} "
-            f"client_ip={request.client.host if request.client else 'unknown'} "
+            f"client_ip={client_ip(request)} "
             f"rotated={'yes' if prior is not None else 'no'}"
         ),
     )
@@ -169,7 +124,7 @@ async def mint_session(
     # Sliding TTL — the in-memory store evicts on idle; the cookie
     # ``Max-Age`` matches the operator-configurable session TTL.
     ttl_seconds = get_settings().api.session_ttl_seconds
-    _set_session_cookie(response, session_id, max_age=ttl_seconds)
+    set_session_cookie(response, session_id, max_age=ttl_seconds)
 
     return SessionResponse(
         issued=True,
@@ -209,7 +164,7 @@ async def logout_session(
             ),
         )
 
-    _clear_session_cookie(response)
+    clear_session_cookie(response)
     return SessionLogoutResponse(
         cleared_credentials=cleared,
         cleared_edgar_identity=edgar_cleared,

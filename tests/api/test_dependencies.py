@@ -6,6 +6,9 @@ provider-key header parsing, and resolver-chain precedence.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 from fastapi import FastAPI, Request
 
@@ -229,3 +232,72 @@ class TestRequestScopedResolverChain:
         )
         resolver = request_scoped_resolver(admin)
         assert resolver("openai") == "sk-encrypted-admin"  # pragma: allowlist secret
+
+
+# ---------------------------------------------------------------------------
+# F33 — shared route helpers have exactly one home
+# ---------------------------------------------------------------------------
+
+
+class TestClientIp:
+    def test_missing_peer_reads_unknown(self) -> None:
+        from types import SimpleNamespace
+
+        from sec_generative_search.api.dependencies import client_ip
+
+        assert client_ip(SimpleNamespace(client=None)) == "unknown"  # type: ignore[arg-type]
+        peer = SimpleNamespace(client=SimpleNamespace(host="203.0.113.7"))
+        assert client_ip(peer) == "203.0.113.7"  # type: ignore[arg-type]
+
+
+@pytest.mark.security
+class TestSharedRouteHelpersAreNotReForked:
+    """Five copies of the audit-line client IP (plus three inline), two of
+    the session-cookie helpers and nine ``500 database_error`` envelopes
+    (four different wordings) were consolidated.  A re-fork is how cookie attributes or the
+    audit key silently diverge between routers — keep one copy each."""
+
+    @staticmethod
+    def _api_modules() -> list[tuple[str, ast.AST]]:
+        import sec_generative_search.api as api_pkg
+
+        root = Path(api_pkg.__file__).parent
+        return [
+            (str(path.relative_to(root)), ast.parse(path.read_text(encoding="utf-8")))
+            for path in sorted(root.rglob("*.py"))
+        ]
+
+    def test_session_cookie_is_written_only_by_the_shared_helpers(self) -> None:
+        offenders = [
+            f"{name}:{node.lineno}"
+            for name, tree in self._api_modules()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr in {"set_cookie", "delete_cookie"}
+            and name != "dependencies.py"
+        ]
+        assert offenders == []
+
+    def test_peer_address_is_read_only_by_client_ip(self) -> None:
+        offenders = [
+            f"{name}:{node.lineno}"
+            for name, tree in self._api_modules()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr == "host"
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "client"
+            and name != "dependencies.py"
+        ]
+        assert offenders == []
+
+    def test_database_error_envelope_is_built_only_in_errors(self) -> None:
+        offenders = [
+            f"{name}:{node.lineno}"
+            for name, tree in self._api_modules()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and node.value == "database_error"
+            and name != "errors.py"
+        ]
+        assert offenders == []

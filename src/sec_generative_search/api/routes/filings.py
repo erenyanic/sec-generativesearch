@@ -52,11 +52,12 @@ from fastapi import APIRouter, Depends, Path, Query, Request
 
 from sec_generative_search.api.dependencies import (
     admin_route_dependencies,
+    client_ip,
     get_filing_store,
     get_registry,
     verify_api_key,
 )
-from sec_generative_search.api.errors import http_error
+from sec_generative_search.api.errors import database_error, http_error
 from sec_generative_search.api.schemas import (
     BulkDeleteRequest,
     BulkDeleteResponse,
@@ -109,33 +110,6 @@ def _record_to_schema(record: FilingRecord) -> FilingSchema:
         accession_number=record.accession_number,
         chunk_count=record.chunk_count,
         ingested_at=record.ingested_at,
-    )
-
-
-def _client_ip(request: Request) -> str:
-    """Best-effort client IP for audit-log lines.
-
-    ``request.client`` is ``None`` for ASGI scopes lacking a peer
-    address (older test clients, certain proxies).  Returning ``"unknown"``
-    keeps the audit-line shape stable so downstream parsers do not need
-    to handle a missing field.
-    """
-    return request.client.host if request.client else "unknown"
-
-
-def _database_error(exc: DatabaseError) -> Exception:
-    """Wrap a raw :class:`DatabaseError` in the API's structured envelope.
-
-    The driver-level ``details`` field is intentionally NOT echoed back
-    to the client — SQLite / ChromaDB error strings routinely include
-    file paths and SQL fragments unsuitable for a public response.  The
-    exception is logged in full at the call site.
-    """
-    return http_error(
-        status_code=500,
-        error="database_error",
-        message="Database operation failed. Check server logs.",
-        hint="Check that the data directory is writable and the database is intact.",
     )
 
 
@@ -217,7 +191,7 @@ def list_filings(
         )
     except DatabaseError as exc:
         logger.error("list_filings failed: %s", exc.details)
-        raise _database_error(exc) from exc
+        raise database_error() from exc
 
     schemas = [_record_to_schema(r) for r in records]
     return FilingListResponse(filings=schemas, total=len(schemas))
@@ -248,7 +222,7 @@ def get_filing(
         record = registry.get_filing(accession)
     except DatabaseError as exc:
         logger.error("get_filing(%s) failed: %s", accession, exc.details)
-        raise _database_error(exc) from exc
+        raise database_error() from exc
 
     if record is None:
         raise http_error(
@@ -293,7 +267,7 @@ def delete_filing(
         record = registry.get_filing(accession)
     except DatabaseError as exc:
         logger.error("delete_filing get(%s) failed: %s", accession, exc.details)
-        raise _database_error(exc) from exc
+        raise database_error() from exc
 
     if record is None:
         raise http_error(
@@ -307,11 +281,11 @@ def delete_filing(
         store.delete_filing(accession)
     except DatabaseError as exc:
         logger.error("delete_filing(%s) failed: %s", accession, exc.details)
-        raise _database_error(exc) from exc
+        raise database_error() from exc
 
     audit_log(
         "delete_filing",
-        client_ip=_client_ip(request),
+        client_ip=client_ip(request),
         endpoint="DELETE /api/filings/{accession}",
         detail=(
             f"accession={accession} ticker={redact_for_log(record.ticker)} "
@@ -348,7 +322,7 @@ def delete_by_ids(
         found = registry.get_filings_by_accessions(body.accession_numbers)
     except DatabaseError as exc:
         logger.error("delete_by_ids lookup failed: %s", exc.details)
-        raise _database_error(exc) from exc
+        raise database_error() from exc
 
     found_accessions = {r.accession_number for r in found}
     not_found = [a for a in body.accession_numbers if a not in found_accessions]
@@ -367,11 +341,11 @@ def delete_by_ids(
         store.delete_filings_batch(accessions)
     except DatabaseError as exc:
         logger.error("delete_by_ids batch failed: %s", exc.details)
-        raise _database_error(exc) from exc
+        raise database_error() from exc
 
     audit_log(
         "delete_filings_batch",
-        client_ip=_client_ip(request),
+        client_ip=client_ip(request),
         endpoint="POST /api/filings/delete-by-ids",
         detail=(f"deleted={len(found)} chunks={chunks_total} not_found={len(not_found)}"),
     )
@@ -419,7 +393,7 @@ def bulk_delete(
         )
     except DatabaseError as exc:
         logger.error("bulk_delete list failed: %s", exc.details)
-        raise _database_error(exc) from exc
+        raise database_error() from exc
 
     if not filings:
         return BulkDeleteResponse(
@@ -435,13 +409,13 @@ def bulk_delete(
         store.delete_filings_batch(accessions)
     except DatabaseError as exc:
         logger.error("bulk_delete batch failed: %s", exc.details)
-        raise _database_error(exc) from exc
+        raise database_error() from exc
 
     tickers_affected = sorted({f.ticker for f in filings})
 
     audit_log(
         "bulk_delete",
-        client_ip=_client_ip(request),
+        client_ip=client_ip(request),
         endpoint="POST /api/filings/bulk-delete",
         detail=(f"filings={len(filings)} chunks={chunks_total} tickers={len(tickers_affected)}"),
     )
@@ -498,11 +472,11 @@ def clear_all(
         chunks_deleted, filings_deleted = store.clear_all()
     except DatabaseError as exc:
         logger.error("clear_all failed: %s", exc.details)
-        raise _database_error(exc) from exc
+        raise database_error() from exc
 
     audit_log(
         "clear_all",
-        client_ip=_client_ip(request),
+        client_ip=client_ip(request),
         endpoint="DELETE /api/filings/?confirm=true",
         detail=f"filings={filings_deleted} chunks={chunks_deleted}",
     )

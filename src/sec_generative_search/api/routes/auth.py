@@ -35,21 +35,24 @@ Wire contract:
 from __future__ import annotations
 
 import base64
-import secrets
 from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
 
 from sec_generative_search.api.dependencies import (
-    SESSION_COOKIE_NAME,
+    clear_session_cookie,
+    client_ip,
     extract_session_id,
     get_edgar_identity_store,
     get_login_username_window,
     get_session_store,
     get_user_store,
+    mint_session_id,
+    require_user_store,
+    set_session_cookie,
 )
-from sec_generative_search.api.errors import http_error
+from sec_generative_search.api.errors import database_error, http_error
 from sec_generative_search.api.schemas import (
     EnrolmentCompleteRequest,
     EnrolmentCompleteResponse,
@@ -147,26 +150,6 @@ def _b64url_decode_variable(value: str, *, field: str, max_bytes: int) -> bytes:
     return decoded
 
 
-def _require_user_store(store: UserStore | None) -> UserStore:
-    """Refuse user-tier routes when the user tier is disabled.
-
-    A deployment without SQLCipher or without the pepper has a ``None``
-    on ``app.state.user_store``; surface a 503 so the SPA shows a
-    coherent "feature not available" message rather than a 500 trace.
-    """
-    if store is None:
-        raise http_error(
-            status_code=503,
-            error="user_tier_disabled",
-            message=("User-tier authentication is not available on this deployment."),
-            hint=(
-                "Configure SQLCipher (DB_ENCRYPTION_KEY) and the auth "
-                "pepper (API_AUTH_PEPPER) and restart the API."
-            ),
-        )
-    return store
-
-
 def _require_pepper() -> str:
     """Resolve the pepper or refuse with the same 503 shape."""
     pepper = get_settings().api.auth_pepper
@@ -178,38 +161,6 @@ def _require_pepper() -> str:
             hint="Configure API_AUTH_PEPPER (or API_AUTH_PEPPER_FILE) and restart the API.",
         )
     return pepper
-
-
-# Session-cookie helpers mirror ``api/routes/session.py``.  The constants
-# are duplicated rather than imported so a future refactor that splits
-# session lifecycle from authentication cannot accidentally diverge the
-# attributes between the two seams.
-
-
-def _mint_session_id() -> str:
-    return secrets.token_urlsafe(32)
-
-
-def _set_session_cookie(response: Response, session_id: str, *, max_age: int) -> None:
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_id,
-        max_age=max_age,
-        path="/",
-        httponly=True,
-        secure=True,
-        samesite="strict",
-    )
-
-
-def _clear_session_cookie(response: Response) -> None:
-    response.delete_cookie(
-        key=SESSION_COOKIE_NAME,
-        path="/",
-        secure=True,
-        httponly=True,
-        samesite="strict",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +191,7 @@ async def login_params(
     ``Cache-Control: no-store`` so the response is never cached
     upstream (a cached real salt would be a privacy regression).
     """
-    user_store = _require_user_store(store)
+    user_store = require_user_store(store)
     pepper = _require_pepper()
 
     # Username shape check is enforced at the query-string boundary by
@@ -329,7 +280,7 @@ async def login(
     ``login_refused`` envelope. The audit log carries enough detail to
     distinguish them; the response does not.
     """
-    user_store = _require_user_store(store)
+    user_store = require_user_store(store)
     _require_pepper()  # Surface 503 before doing work if pepper missing.
 
     _enforce_per_username_gate(request, username_window, body.username)
@@ -341,10 +292,7 @@ async def login(
     except AuthError:
         audit_log(
             "login_refused",
-            detail=(
-                f"username_tail={mask_secret(body.username)} "
-                f"client_ip={request.client.host if request.client else 'unknown'}"
-            ),
+            detail=(f"username_tail={mask_secret(body.username)} client_ip={client_ip(request)}"),
         )
         raise http_error(
             status_code=401,
@@ -352,11 +300,7 @@ async def login(
             message="Login refused.",
         ) from None
     except DatabaseError as exc:
-        raise http_error(
-            status_code=500,
-            error="database_error",
-            message="Database error during login.",
-        ) from exc
+        raise database_error() from exc
 
     # Rotate any prior session: clear stored credentials (and with them
     # any user binding) AND the EDGAR identity under the old
@@ -371,9 +315,9 @@ async def login(
         session_store.clear(prior)
         edgar_store.delete(prior)
 
-    session_id = _mint_session_id()
+    session_id = mint_session_id()
     ttl_seconds = get_settings().api.session_ttl_seconds
-    _set_session_cookie(response, session_id, max_age=ttl_seconds)
+    set_session_cookie(response, session_id, max_age=ttl_seconds)
 
     # Bind ``session_id → user_id`` so authenticated follow-up routes
     # (password change, vault update) can resolve the user without a
@@ -421,7 +365,7 @@ async def complete_enrolment(
     a replayed token after the first successful login surfaces as
     ``409 enrolment_already_completed``.
     """
-    user_store = _require_user_store(store)
+    user_store = require_user_store(store)
     pepper = _require_pepper()
 
     try:
@@ -477,11 +421,7 @@ async def complete_enrolment(
             enrolment_nonce=token_payload.nonce,
         )
     except DatabaseError as exc:
-        raise http_error(
-            status_code=500,
-            error="database_error",
-            message="Database error during enrolment.",
-        ) from exc
+        raise database_error() from exc
 
     return EnrolmentCompleteResponse(
         enrolled=True,
@@ -547,7 +487,7 @@ async def change_password(
     session_store: InMemorySessionCredentialStore = Depends(get_session_store),
 ) -> PasswordChangeResponse:
     """Validate ``auth_proof_old``, then atomically rotate salt + hash + vault."""
-    user_store = _require_user_store(store)
+    user_store = require_user_store(store)
     _require_pepper()
 
     user_id, username = _resolve_active_user(request, user_store, session_store)
@@ -584,11 +524,7 @@ async def change_password(
             pbkdf2_iterations=body.pbkdf2_iterations,
         )
     except DatabaseError as exc:
-        raise http_error(
-            status_code=500,
-            error="database_error",
-            message="Database error during password change.",
-        ) from exc
+        raise database_error() from exc
 
     return PasswordChangeResponse(rotated=rotated)
 
@@ -631,7 +567,7 @@ async def sign_out(
         cleared = session_store.unbind_user(session_id)
         session_store.clear(session_id)
         edgar_store.delete(session_id)
-    _clear_session_cookie(response)
+    clear_session_cookie(response)
     return {"cleared": cleared}
 
 
@@ -660,7 +596,7 @@ async def update_vault(
     bearing for AES-GCM security — IV reuse against the same key
     breaks confidentiality and integrity).
     """
-    user_store = _require_user_store(store)
+    user_store = require_user_store(store)
     user_id, _ = _resolve_active_user(request, user_store, session_store)
 
     iv = _b64url_decode_fixed(body.vault_iv, _VAULT_IV_BYTES, field="vault_iv")
@@ -675,11 +611,7 @@ async def update_vault(
             vault_iv=iv,
         )
     except DatabaseError as exc:
-        raise http_error(
-            status_code=500,
-            error="database_error",
-            message="Database error during vault update.",
-        ) from exc
+        raise database_error() from exc
 
     return VaultUpdateResponse(updated=updated)
 
