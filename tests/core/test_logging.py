@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import json
 import logging
 from pathlib import Path
@@ -20,6 +21,7 @@ from sec_generative_search.core.logging import (
     audit_log,
     configure_logging,
     get_logger,
+    redact_all_for_log,
     redact_for_log,
     suppress_third_party_loggers,
 )
@@ -336,6 +338,9 @@ class TestAccessionRedactionFilter:
         record = _make_record("accession=%s", _ACCESSION)
         AccessionRedactionFilter().filter(record)
         assert record.getMessage() == f"accession={_ACCESSION}"
+        # Untouched: ``caplog``-style consumers still see the original args.
+        assert record.msg == "accession=%s"
+        assert record.args == (_ACCESSION,)
 
     def test_flag_is_read_per_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Caching the flag at construction time would make the control
@@ -389,6 +394,40 @@ class TestAccessionRedactionFilter:
         first = record.getMessage()
         log_filter.filter(record)
         assert record.getMessage() == first
+
+    def test_record_without_an_accession_is_rendered_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F20: with the flag on, the filter keeps its render, so two handlers
+        (console + file) no longer ``%``-render the record four times."""
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        renders = 0
+
+        class _CountingArg:
+            def __str__(self) -> str:
+                nonlocal renders
+                renders += 1
+                return "10-K"
+
+        logger = logging.getLogger("sec_generative_search.test.render_once")
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+        streams = [io.StringIO(), io.StringIO()]
+        handlers = []
+        for stream in streams:
+            handler = logging.StreamHandler(stream)
+            handler.addFilter(AccessionRedactionFilter())
+            logger.addHandler(handler)
+            handlers.append(handler)
+        try:
+            logger.info("ingested form=%s", _CountingArg())
+        finally:
+            for handler in handlers:
+                logger.removeHandler(handler)
+
+        assert renders == 1
+        assert [stream.getvalue() for stream in streams] == ["ingested form=10-K\n"] * 2
 
     def test_scrubs_the_exception_traceback(
         self,
@@ -544,3 +583,38 @@ class TestTickerCallSiteHygiene:
         cleared = ast.parse('logger.info("fetched %s", redact_for_log(filing_id.ticker))')
         cleared_call = cleared.body[0].value  # type: ignore[attr-defined]
         assert _unredacted_ticker_carriers(cleared_call.args[1]) == []
+
+
+@pytest.mark.security
+class TestRedactAllForLog:
+    """Ticker lists are redacted per symbol (stable per-symbol digests)."""
+
+    def test_each_value_is_redacted_when_the_flag_is_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "true")
+        rendered = redact_all_for_log(["AAPL", "MSFT"])
+        assert rendered == f"{redact_for_log('AAPL')}, {redact_for_log('MSFT')}"
+        assert "AAPL" not in rendered and "MSFT" not in rendered
+
+    def test_values_pass_through_when_the_flag_is_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LOG_REDACT_QUERIES", raising=False)
+        assert redact_all_for_log(["AAPL", "MSFT"]) == "AAPL, MSFT"
+        assert redact_all_for_log([]) == "none"
+
+    def test_flag_is_read_once_per_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """F20: one environment read per call, not one per value."""
+        import sec_generative_search.core.logging as logging_module
+
+        reads = 0
+
+        def _counting_flag() -> bool:
+            nonlocal reads
+            reads += 1
+            return True
+
+        monkeypatch.setattr(logging_module, "_redaction_enabled", _counting_flag)
+        redact_all_for_log(["AAPL", "MSFT", "NVDA"])
+        assert reads == 1

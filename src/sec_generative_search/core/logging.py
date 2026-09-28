@@ -120,6 +120,9 @@ class AccessionRedactionFilter(logging.Filter):
     * Most sites log ``logger.info("... %s", accession)``, so the value
       lives in ``record.args``, never in ``record.msg``.  The filter
       therefore rewrites the **rendered** message and clears ``args``.
+      It does that for *every* record while the flag is on, scrubbed or
+      not: the record is then rendered once, instead of once per filter
+      pass and once per formatter (four ``%``-renders with two handlers).
     * It attaches to each *handler* (not the logger), matching
       :class:`CorrelationIdFilter` — the package logger sets
       ``propagate = False``, so a logger-level filter would miss
@@ -144,8 +147,11 @@ class AccessionRedactionFilter(logging.Filter):
                 return True
             message = record.getMessage()
             if ACCESSION_RE.search(message):
-                record.msg = ACCESSION_RE.sub(_redact_accession_match, message)
-                record.args = ()
+                message = ACCESSION_RE.sub(_redact_accession_match, message)
+            # Keep the rendered text so the next handler's pass and every
+            # formatter reuse it rather than re-interpolating ``args``.
+            record.msg = message
+            record.args = ()
             if record.exc_info or record.exc_text:
                 exc_text = record.exc_text or logging.Formatter().formatException(
                     record.exc_info  # type: ignore[arg-type]
@@ -402,7 +408,11 @@ def redact_all_for_log(values: Iterable[str]) -> str:
     per-symbol correlation hashes) without carrying the symbols
     themselves.  Returns ``"none"`` for an empty collection.
     """
-    rendered = ", ".join(redact_for_log(value) for value in values)
+    # One flag read per call, not one per value.
+    if _redaction_enabled():
+        rendered = ", ".join(_digest(value) for value in values)
+    else:
+        rendered = ", ".join(values)
     return rendered or "none"
 
 
