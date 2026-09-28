@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from datetime import date
 from typing import Any
@@ -177,9 +179,23 @@ class _StubFetcher:
     content_map: dict[str, str] = field(default_factory=dict)
     identity_calls: list[tuple[str | None, str | None]] = field(default_factory=list)
     raise_on_fetch: dict[str, Exception] = field(default_factory=dict)
+    # ``company_cache()`` scope bookkeeping (F22): entries + whether a
+    # listing call happened inside a scope.
+    cache_scopes_entered: int = 0
+    in_cache_scope: bool = False
+    listed_outside_scope: int = 0
 
     def apply_identity(self, name: str | None = None, email: str | None = None) -> None:
         self.identity_calls.append((name, email))
+
+    @contextmanager
+    def company_cache(self) -> Iterator[None]:
+        self.cache_scopes_entered += 1
+        self.in_cache_scope = True
+        try:
+            yield
+        finally:
+            self.in_cache_scope = False
 
     def list_available(
         self,
@@ -191,6 +207,8 @@ class _StubFetcher:
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> list[FilingInfo]:
+        if not self.in_cache_scope:
+            self.listed_outside_scope += 1
         return list(self.work_lists.get((ticker, form_type), []))
 
     def list_available_across_forms(
@@ -1175,6 +1193,31 @@ class TestEdgarIdentityResolver:
 # ---------------------------------------------------------------------------
 # Fetcher errors
 # ---------------------------------------------------------------------------
+
+
+class TestWorkListCompanyCache:
+    """F22: each build lists inside one ``company_cache()`` scope, so a
+    ticker's submissions index is loaded once per build, never per form —
+    and a fresh scope per task, so no ``Company`` outlives its task."""
+
+    def test_every_listing_runs_inside_one_scope_per_task(self) -> None:
+        fetcher = _StubFetcher(
+            work_lists={
+                ("AAPL", "10-K"): [],
+                ("AAPL", "10-Q"): [],
+                ("MSFT", "10-K"): [],
+            }
+        )
+        manager, _, _, _, _ = _build_manager(fetcher=fetcher)
+
+        first = manager.create_task(tickers=["AAPL", "MSFT"], form_types=["10-K", "10-Q"])
+        _wait_for_state(manager, first, target=TaskState.COMPLETED)
+        second = manager.create_task(tickers=["AAPL"], form_types=["10-K"])
+        _wait_for_state(manager, second, target=TaskState.COMPLETED)
+
+        assert fetcher.listed_outside_scope == 0
+        assert fetcher.cache_scopes_entered == 2
+        assert fetcher.in_cache_scope is False
 
 
 class TestFetcherErrors:

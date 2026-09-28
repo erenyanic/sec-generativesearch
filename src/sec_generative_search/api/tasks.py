@@ -1260,7 +1260,15 @@ class TaskManager:
         ticker x form failure should not nuke the whole batch. The
         per-filing fetch errors inside :meth:`_execute` get the same
         treatment.
+
+        The whole build runs inside ``company_cache()`` so each ticker's
+        submissions index is loaded once, not once per form type (F22);
+        the cache ends with the build, so it never outlives the task.
         """
+        with self._fetcher.company_cache():
+            return self._build_work_list_cached(info)
+
+    def _build_work_list_cached(self, info: TaskInfo) -> list[FilingInfo]:
         work: list[FilingInfo] = []
 
         for ticker in info.tickers:

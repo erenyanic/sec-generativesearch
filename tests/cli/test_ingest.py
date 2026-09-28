@@ -22,6 +22,8 @@ Goals:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date
 from typing import Any, ClassVar
 
@@ -109,21 +111,44 @@ class _FakeFetcher:
         self.fetch_raises: BaseException | None = None
         self.list_raises: BaseException | None = None
         self.fetch_content_raises: BaseException | None = None
+        # ``company_cache()`` bookkeeping (F22): which tickers were fetched
+        # inside which scope.
+        self.cache_scopes: list[list[str]] = []
+        self.fetched_outside_scope: list[str] = []
+        self._scope: list[str] | None = None
         _FakeFetcher.instances.append(self)
 
+    @contextmanager
+    def company_cache(self) -> Iterator[None]:
+        self._scope = []
+        self.cache_scopes.append(self._scope)
+        try:
+            yield
+        finally:
+            self._scope = None
+
+    def _record_scope(self, ticker: str) -> None:
+        if self._scope is None:
+            self.fetched_outside_scope.append(ticker)
+        else:
+            self._scope.append(ticker)
+
     def fetch_latest(self, ticker: str, form_type: str):
+        self._record_scope(ticker)
         self.fetch_latest_calls.append((ticker, form_type))
         if self.fetch_latest_raises is not None:
             raise self.fetch_latest_raises
         return self.queued_filings[0]
 
     def fetch_one(self, ticker: str, form_type: str, **kwargs: Any):
+        self._record_scope(ticker)
         self.fetch_one_calls.append((ticker, form_type, kwargs))
         if self.fetch_latest_raises is not None:
             raise self.fetch_latest_raises
         return self.queued_filings[0]
 
     def fetch(self, ticker: str, form_type: str, **kwargs: Any):
+        self._record_scope(ticker)
         self.fetch_calls.append((ticker, form_type, kwargs))
         if self.fetch_raises is not None:
             raise self.fetch_raises
@@ -606,6 +631,56 @@ class TestAddEdgeCases:
         result = runner.invoke(app, ["ingest", "add", "AAPL", "-f", "10-K"])
         assert result.exit_code == 1
         assert "Filing limit reached" in result.output
+
+
+class TestCompanyCacheScope:
+    """F22: all of a ticker's forms are listed inside one ``company_cache()``
+    scope — one edgartools ``Company`` per ticker, never one per form."""
+
+    def test_add_lists_every_form_in_one_scope(
+        self,
+        runner: CliRunner,
+        app: typer.Typer,
+        patched_pipeline: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        filing_id = _make_filing_id(ticker="AAPL", form_type="10-K")
+        original_init = _FakeFetcher.__init__
+
+        def _seeded_init(self: _FakeFetcher) -> None:
+            original_init(self)
+            self.queued_filings = [(filing_id, "<html>body</html>")]
+
+        monkeypatch.setattr(_FakeFetcher, "__init__", _seeded_init)
+        result = runner.invoke(app, ["ingest", "add", "AAPL", "-f", "10-K,10-Q,8-K"])
+        assert result.exit_code == 0, result.output
+
+        fetcher = _FakeFetcher.instances[-1]
+        assert fetcher.cache_scopes == [["AAPL", "AAPL", "AAPL"]]
+        assert fetcher.fetched_outside_scope == []
+
+    def test_batch_opens_one_scope_per_ticker(
+        self,
+        runner: CliRunner,
+        app: typer.Typer,
+        patched_pipeline: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        filing_id = _make_filing_id(ticker="AAPL", form_type="10-K")
+        original_init = _FakeFetcher.__init__
+
+        def _seeded_init(self: _FakeFetcher) -> None:
+            original_init(self)
+            self.queued_filings = [(filing_id, "<html>body</html>")]
+
+        monkeypatch.setattr(_FakeFetcher, "__init__", _seeded_init)
+        result = runner.invoke(app, ["ingest", "batch", "AAPL", "MSFT", "-f", "10-K,10-Q"])
+        assert result.exit_code == 0, result.output
+
+        fetcher = _FakeFetcher.instances[-1]
+        # Per ticker, so one ticker's index is never held across the batch.
+        assert fetcher.cache_scopes == [["AAPL", "AAPL"], ["MSFT", "MSFT"]]
+        assert fetcher.fetched_outside_scope == []
 
 
 # ---------------------------------------------------------------------------

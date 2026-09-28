@@ -33,7 +33,9 @@ Usage:
         process(filing_id, html)
 """
 
+import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
@@ -121,8 +123,36 @@ class FilingFetcher:
         """Initialise the fetcher and configure EDGAR identity (if available)."""
         self.settings = get_settings()
         self.max_filings = self.settings.database.max_filings
+        # Per-thread ``Company`` cache, live only inside ``company_cache()``.
+        self._company_scope = threading.local()
 
         self._configure_identity()
+
+    @contextmanager
+    def company_cache(self) -> Iterator[None]:
+        """Reuse one edgartools ``Company`` per ticker inside the block.
+
+        ``Company.data`` — the parsed submissions index, hundreds of KB
+        of JSON turned into Arrow tables for a large filer — is cached
+        per *instance*, so listing three form types through three fresh
+        ``Company`` objects loads and parses it three times (edgartools'
+        own HTTP cache only saves the network round-trip, and only for
+        30 s).  Inside this block the first lookup of a ticker is reused.
+
+        Scope it to one work-list build: the cache dies with the block, so
+        a ``Company`` never outlives the task that loaded it or carries a
+        stale index into a later one.  Thread-local, so two concurrent
+        builds never share an entry; a nested block reuses the outer
+        cache.
+        """
+        if getattr(self._company_scope, "companies", None) is not None:
+            yield
+            return
+        self._company_scope.companies = {}
+        try:
+            yield
+        finally:
+            self._company_scope.companies = None
 
     def apply_identity(self, name: str | None = None, email: str | None = None) -> None:
         """Apply the effective EDGAR identity for the current operation.
@@ -289,14 +319,23 @@ class FilingFetcher:
 
         Raises:
             FetchError: If ticker is invalid
+
+        Inside :meth:`company_cache` the instance is reused per ticker.
         """
+        key = ticker.upper()
+        companies = getattr(self._company_scope, "companies", None)
+        if companies is not None and key in companies:
+            return companies[key]
         try:
-            return Company(ticker.upper())
+            company = Company(key)
         except Exception as e:
             raise FetchError(
                 f"Invalid ticker symbol: {ticker}",
                 details=str(e),
             ) from e
+        if companies is not None:
+            companies[key] = company
+        return company
 
     def _get_filings(
         self,
@@ -587,19 +626,20 @@ class FilingFetcher:
             truncated to *count*.
         """
         all_available: list[FilingInfo] = []
-        for form_type in form_types:
-            try:
-                available = self.list_available(
-                    ticker,
-                    form_type,
-                    count=count,
-                    year=year,
-                    start_date=start_date,
-                    end_date=end_date,
-                )
-                all_available.extend(available)
-            except FetchError:
-                continue
+        with self.company_cache():
+            for form_type in form_types:
+                try:
+                    available = self.list_available(
+                        ticker,
+                        form_type,
+                        count=count,
+                        year=year,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                    all_available.extend(available)
+                except FetchError:
+                    continue
         all_available.sort(key=lambda fi: fi.filing_date, reverse=True)
         return all_available[:count]
 

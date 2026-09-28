@@ -16,7 +16,7 @@ import io
 import logging
 from datetime import date
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -301,3 +301,119 @@ class TestFetchLogStreamIsIdentifierFree:
         assert accession not in emitted
         assert amended not in emitted
         assert "<redacted:" in emitted
+
+
+# ---------------------------------------------------------------------------
+# F22 — one edgartools ``Company`` per ticker inside a work-list build
+# ---------------------------------------------------------------------------
+
+
+class _CountingCompany:
+    """Stands in for ``edgar.Company``; counts constructions per ticker."""
+
+    constructed: ClassVar[list[str]] = []
+
+    def __init__(self, ticker: str) -> None:
+        type(self).constructed.append(ticker)
+        self.ticker = ticker
+
+
+@pytest.fixture
+def counting_company(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    _CountingCompany.constructed = []
+    monkeypatch.setattr(fetch_module, "Company", _CountingCompany)
+    return _CountingCompany.constructed
+
+
+class TestCompanyCache:
+    def test_each_call_builds_a_company_outside_a_scope(
+        self, fetcher: FilingFetcher, counting_company: list[str]
+    ) -> None:
+        fetcher._get_company("AAPL")
+        fetcher._get_company("AAPL")
+        assert counting_company == ["AAPL", "AAPL"]
+
+    def test_scope_reuses_one_company_per_ticker(
+        self, fetcher: FilingFetcher, counting_company: list[str]
+    ) -> None:
+        with fetcher.company_cache():
+            first = fetcher._get_company("aapl")
+            assert fetcher._get_company("AAPL") is first
+            fetcher._get_company("MSFT")
+        assert counting_company == ["AAPL", "MSFT"]
+
+    def test_cache_ends_with_the_scope(
+        self, fetcher: FilingFetcher, counting_company: list[str]
+    ) -> None:
+        """A cached ``Company`` must never outlive the build that loaded it."""
+        with fetcher.company_cache():
+            inside = fetcher._get_company("AAPL")
+        assert fetcher._get_company("AAPL") is not inside
+        with fetcher.company_cache():
+            assert fetcher._get_company("AAPL") is not inside
+        assert counting_company == ["AAPL"] * 3
+
+    def test_nested_scope_reuses_the_outer_cache(
+        self, fetcher: FilingFetcher, counting_company: list[str]
+    ) -> None:
+        with fetcher.company_cache():
+            outer = fetcher._get_company("AAPL")
+            with fetcher.company_cache():
+                assert fetcher._get_company("AAPL") is outer
+            # Leaving the inner block must not drop the outer cache.
+            assert fetcher._get_company("AAPL") is outer
+        assert counting_company == ["AAPL"]
+
+    def test_threads_never_share_a_scope(
+        self, fetcher: FilingFetcher, counting_company: list[str]
+    ) -> None:
+        import threading
+
+        seen: list[object] = []
+        with fetcher.company_cache():
+            mine = fetcher._get_company("AAPL")
+            worker = threading.Thread(target=lambda: seen.append(fetcher._get_company("AAPL")))
+            worker.start()
+            worker.join(timeout=5.0)
+        assert seen and seen[0] is not mine
+        assert counting_company == ["AAPL", "AAPL"]
+
+    def test_a_failed_lookup_is_not_cached(
+        self, fetcher: FilingFetcher, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        attempts: list[str] = []
+
+        def _flaky(ticker: str) -> object:
+            attempts.append(ticker)
+            if len(attempts) == 1:
+                raise RuntimeError("EDGAR hiccup")
+            return SimpleNamespace(ticker=ticker)
+
+        monkeypatch.setattr(fetch_module, "Company", _flaky)
+        with fetcher.company_cache():
+            with pytest.raises(FetchError):
+                fetcher._get_company("AAPL")
+            assert fetcher._get_company("AAPL").ticker == "AAPL"
+        assert attempts == ["AAPL", "AAPL"]
+
+    def test_listing_across_forms_loads_the_company_once(
+        self,
+        fetcher: FilingFetcher,
+        counting_company: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def _filings(company: object, form_type: str, **_: Any) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    accession_no=f"0000320193-23-00000{i}",
+                    form=form_type,
+                    filing_date=date(2023, 11, i + 1),
+                    company="Apple Inc.",
+                )
+                for i in range(2)
+            ]
+
+        monkeypatch.setattr(fetcher, "_get_filings", _filings)
+        listed = fetcher.list_available_across_forms("AAPL", ("10-K", "10-Q", "8-K"), count=5)
+        assert len(listed) == 5
+        assert counting_company == ["AAPL"]

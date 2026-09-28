@@ -803,73 +803,75 @@ def add(
     skipped = 0
     failed = 0
 
-    for idx, form_type in enumerate(form_types):
-        try:
-            registry.check_filing_limit()
-        except FilingLimitExceededError as exc:
-            _print_error(
-                "Filing limit reached",
-                exc.message,
-                hint=(
-                    "Remove filings with the management command or raise the "
-                    "limit via DB_MAX_FILINGS."
-                ),
-            )
-            raise typer.Exit(code=1) from None
+    # One edgartools ``Company`` for all of this ticker's forms (F22).
+    with fetcher.company_cache():
+        for idx, form_type in enumerate(form_types):
+            try:
+                registry.check_filing_limit()
+            except FilingLimitExceededError as exc:
+                _print_error(
+                    "Filing limit reached",
+                    exc.message,
+                    hint=(
+                        "Remove filings with the management command or raise the "
+                        "limit via DB_MAX_FILINGS."
+                    ),
+                )
+                raise typer.Exit(code=1) from None
 
-        form_label = f" ({idx + 1}/{len(form_types)})" if len(form_types) > 1 else ""
+            form_label = f" ({idx + 1}/{len(form_types)})" if len(form_types) > 1 else ""
 
-        with _make_progress() as progress:
-            if effective_per_form == 1:
-                step_task = progress.add_task(
-                    f"Fetching {ticker} {form_type}{form_label}...",
-                    total=len(_STEPS),
-                )
-                s, sk, f = _ingest_one_form(
-                    ticker,
-                    form_type,
-                    count=1,
-                    year=year,
-                    start_date=start_date,
-                    end_date=end_date,
-                    fetcher=fetcher,
-                    orchestrator=orchestrator,
-                    registry=registry,
-                    store=store,
-                    progress=progress,
-                    step_task_id=step_task,
-                    form_label=form_label,
-                )
-            else:
-                estimated = effective_per_form or 0
-                filing_task = progress.add_task(
-                    f"{ticker} {form_type}{form_label}: filings",
-                    total=estimated or None,
-                )
-                step_task = progress.add_task(
-                    f"Fetching {ticker} {form_type}{form_label}...",
-                    total=len(_STEPS),
-                )
-                s, sk, f = _ingest_one_form(
-                    ticker,
-                    form_type,
-                    count=effective_per_form,
-                    year=year,
-                    start_date=start_date,
-                    end_date=end_date,
-                    fetcher=fetcher,
-                    orchestrator=orchestrator,
-                    registry=registry,
-                    store=store,
-                    progress=progress,
-                    step_task_id=step_task,
-                    filing_task_id=filing_task,
-                    form_label=form_label,
-                )
+            with _make_progress() as progress:
+                if effective_per_form == 1:
+                    step_task = progress.add_task(
+                        f"Fetching {ticker} {form_type}{form_label}...",
+                        total=len(_STEPS),
+                    )
+                    s, sk, f = _ingest_one_form(
+                        ticker,
+                        form_type,
+                        count=1,
+                        year=year,
+                        start_date=start_date,
+                        end_date=end_date,
+                        fetcher=fetcher,
+                        orchestrator=orchestrator,
+                        registry=registry,
+                        store=store,
+                        progress=progress,
+                        step_task_id=step_task,
+                        form_label=form_label,
+                    )
+                else:
+                    estimated = effective_per_form or 0
+                    filing_task = progress.add_task(
+                        f"{ticker} {form_type}{form_label}: filings",
+                        total=estimated or None,
+                    )
+                    step_task = progress.add_task(
+                        f"Fetching {ticker} {form_type}{form_label}...",
+                        total=len(_STEPS),
+                    )
+                    s, sk, f = _ingest_one_form(
+                        ticker,
+                        form_type,
+                        count=effective_per_form,
+                        year=year,
+                        start_date=start_date,
+                        end_date=end_date,
+                        fetcher=fetcher,
+                        orchestrator=orchestrator,
+                        registry=registry,
+                        store=store,
+                        progress=progress,
+                        step_task_id=step_task,
+                        filing_task_id=filing_task,
+                        form_label=form_label,
+                    )
 
-        succeeded += s
-        skipped += sk
-        failed += f
+            succeeded += s
+            skipped += sk
+            failed += f
 
     if len(form_types) > 1 or effective_per_form != 1:
         _print_summary(succeeded, skipped, failed, header="Summary:")
@@ -995,73 +997,75 @@ def batch(
     )
 
     for ticker in tickers:
-        for idx, form_type in enumerate(form_types):
-            try:
-                registry.check_filing_limit()
-            except FilingLimitExceededError as exc:
-                _print_error(
-                    "Filing limit reached",
-                    exc.message,
-                    hint=(
-                        "Remove filings with the management command or raise the "
-                        "limit via DB_MAX_FILINGS."
-                    ),
-                )
-                raise typer.Exit(code=1) from None
+        # One edgartools ``Company`` per ticker across its forms (F22).
+        with fetcher.company_cache():
+            for idx, form_type in enumerate(form_types):
+                try:
+                    registry.check_filing_limit()
+                except FilingLimitExceededError as exc:
+                    _print_error(
+                        "Filing limit reached",
+                        exc.message,
+                        hint=(
+                            "Remove filings with the management command or raise the "
+                            "limit via DB_MAX_FILINGS."
+                        ),
+                    )
+                    raise typer.Exit(code=1) from None
 
-            form_label = f" ({idx + 1}/{len(form_types)})" if len(form_types) > 1 else ""
+                form_label = f" ({idx + 1}/{len(form_types)})" if len(form_types) > 1 else ""
 
-            with _make_progress() as progress:
-                if effective_per_form == 1:
-                    step_task = progress.add_task(
-                        f"Fetching {ticker} {form_type}{form_label}...",
-                        total=len(_STEPS),
-                    )
-                    s, sk, f = _ingest_one_form(
-                        ticker,
-                        form_type,
-                        count=1,
-                        year=year,
-                        start_date=start_date,
-                        end_date=end_date,
-                        fetcher=fetcher,
-                        orchestrator=orchestrator,
-                        registry=registry,
-                        store=store,
-                        progress=progress,
-                        step_task_id=step_task,
-                        form_label=form_label,
-                    )
-                else:
-                    estimated = effective_per_form or 0
-                    filing_task = progress.add_task(
-                        f"{ticker} {form_type}{form_label}: filings",
-                        total=estimated or None,
-                    )
-                    step_task = progress.add_task(
-                        f"Fetching {ticker} {form_type}{form_label}...",
-                        total=len(_STEPS),
-                    )
-                    s, sk, f = _ingest_one_form(
-                        ticker,
-                        form_type,
-                        count=effective_per_form,
-                        year=year,
-                        start_date=start_date,
-                        end_date=end_date,
-                        fetcher=fetcher,
-                        orchestrator=orchestrator,
-                        registry=registry,
-                        store=store,
-                        progress=progress,
-                        step_task_id=step_task,
-                        filing_task_id=filing_task,
-                        form_label=form_label,
-                    )
+                with _make_progress() as progress:
+                    if effective_per_form == 1:
+                        step_task = progress.add_task(
+                            f"Fetching {ticker} {form_type}{form_label}...",
+                            total=len(_STEPS),
+                        )
+                        s, sk, f = _ingest_one_form(
+                            ticker,
+                            form_type,
+                            count=1,
+                            year=year,
+                            start_date=start_date,
+                            end_date=end_date,
+                            fetcher=fetcher,
+                            orchestrator=orchestrator,
+                            registry=registry,
+                            store=store,
+                            progress=progress,
+                            step_task_id=step_task,
+                            form_label=form_label,
+                        )
+                    else:
+                        estimated = effective_per_form or 0
+                        filing_task = progress.add_task(
+                            f"{ticker} {form_type}{form_label}: filings",
+                            total=estimated or None,
+                        )
+                        step_task = progress.add_task(
+                            f"Fetching {ticker} {form_type}{form_label}...",
+                            total=len(_STEPS),
+                        )
+                        s, sk, f = _ingest_one_form(
+                            ticker,
+                            form_type,
+                            count=effective_per_form,
+                            year=year,
+                            start_date=start_date,
+                            end_date=end_date,
+                            fetcher=fetcher,
+                            orchestrator=orchestrator,
+                            registry=registry,
+                            store=store,
+                            progress=progress,
+                            step_task_id=step_task,
+                            filing_task_id=filing_task,
+                            form_label=form_label,
+                        )
 
-            total_succeeded += s
-            total_skipped += sk
-            total_failed += f
+                total_succeeded += s
+                total_skipped += sk
+                total_failed += f
 
     _print_summary(
         total_succeeded,
