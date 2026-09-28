@@ -17,11 +17,9 @@ response body as ``candidates[0].finish_reason`` ``SAFETY``
 raise :class:`ProviderContentFilterError` directly — terminal, matching
 the OpenAI content-filter contract.
 
-Token counting is offline via :mod:`tiktoken`'s ``cl100k_base`` for the
-same reason as the Anthropic adapter: the context-window packer
-needs a cheap estimate *before* calling the model.  ``cl100k_base`` is
-not Gemini's native tokeniser, so the count is an approximation biased
-slightly high — the right direction for a budget guard.
+The adapter carries no tokeniser: prompt budgeting uses the one shared
+offline ``cl100k_base`` counter (``search/retrieval.py``) for every
+provider — never the SDK's network ``models.count_tokens``.
 """
 
 from __future__ import annotations
@@ -84,8 +82,7 @@ logger = get_logger(__name__)
 # / retryable types *inside* the call wrapper (see ``_translate``),
 # then let :func:`resilient_call` treat the :class:`ProviderError`
 # subclasses as usual.  Only ``TimeoutError`` needs a type-based
-# mapping, since :func:`with_timeout` raises that stdlib exception
-# rather than an SDK one.
+# mapping — a stdlib / socket timeout that escapes the SDK un-wrapped.
 GEMINI_EXCEPTION_MAPPING = ExceptionMapping(
     timeout=(TimeoutError,),
 )
@@ -221,7 +218,6 @@ class _GeminiClientMixin:
         self._policy = ResilientCallPolicy(
             retry_policy=retry_policy or RetryPolicy(),
             exception_mapping=GEMINI_EXCEPTION_MAPPING,
-            timeout=0.0,
         )
 
     def _call[T](self, fn: Callable[[], T]) -> T:
@@ -262,7 +258,6 @@ class GeminiProvider(_GeminiClientMixin, BaseLLMProvider):
     ) -> None:
         super().__init__(api_key)
         self._init_client(timeout=timeout, retry_policy=retry_policy)
-        self._encoder: Any | None = None
 
     # ------------------------------------------------------------------
     # Capability and validation
@@ -424,25 +419,6 @@ class GeminiProvider(_GeminiClientMixin, BaseLLMProvider):
             ),
             finish_reason=self._normalise_finish_reason(final_finish_reason),
         )
-
-    # ------------------------------------------------------------------
-    # Token counting — offline approximation
-    # ------------------------------------------------------------------
-
-    def count_tokens(self, text: str, model: str | None = None) -> int:
-        """Offline token approximation via ``cl100k_base``.
-
-        The SDK ships ``models.count_tokens`` but it is a network call.
-        The context-window packer budgets prompts *before* a
-        generation call, so we favour a cheap, over-estimating local
-        counter rather than round-tripping every budget check.
-        """
-        del model
-        if self._encoder is None:
-            import tiktoken
-
-            self._encoder = tiktoken.get_encoding("cl100k_base")
-        return len(self._encoder.encode(text))
 
     # ------------------------------------------------------------------
     # Helpers

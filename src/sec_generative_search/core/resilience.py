@@ -13,21 +13,20 @@ Contents:
 - :data:`INTERACTIVE_RETRY_POLICY` — the shorter budget for
   request-scoped LLM calls.
 - :class:`CircuitBreaker` — thread-safe three-state circuit breaker
-  (``CLOSED`` → ``OPEN`` → ``HALF_OPEN`` → ``CLOSED``/``OPEN``).
+  (``CLOSED`` → ``OPEN`` → ``HALF_OPEN`` → ``CLOSED``/``OPEN``), used
+  **observationally** by :mod:`~sec_generative_search.core.provider_health`
+  only — it records outcomes and reports a state; nothing consults it
+  before a call.
 - :class:`ExceptionMapping` — declarative mapping from SDK-specific
   exception types to :class:`ProviderError` subclasses.
 - :func:`normalise_exception` — consult a mapping and return the
   corresponding :class:`ProviderError` subclass.
 - :func:`retry_after_from_exception` — bounded parse of a provider's
   ``Retry-After`` from an SDK exception's response headers.
-- :func:`with_timeout` — run a callable with a wall-clock timeout using
-  a one-shot thread pool (safety net for SDKs that ignore their own
-  timeout arg).
-- :func:`resilient_call` — the top-level composer: optional circuit
-  breaker check, optional timeout, retry with jittered exponential
-  backoff (never sooner than a provider's ``Retry-After``, never past the
-  policy deadline), and exception normalisation, all driven by the
-  policies above.
+- :func:`resilient_call` — the top-level composer: retry with jittered
+  exponential backoff (never sooner than a provider's ``Retry-After``,
+  never past the policy deadline) and exception normalisation, driven by
+  the policies above.
 
 Design notes:
 
@@ -47,17 +46,18 @@ Design notes:
   a ``Retry-After`` above ``max_delay`` ends the loop instead of
   retrying early, and ``deadline_seconds`` stops starting new attempts
   once the budget is spent.
-- Timeout is a *safety net*, not the primary control.  Concrete
-  providers pass their SDK's own ``timeout=`` argument in addition to
-  this.  The Python thread we spawn for :func:`with_timeout` cannot be
-  killed; a runaway SDK call will continue in the background until the
-  process exits.  This is the standard trade-off for thread-based
-  timeouts in CPython.
+- The per-attempt timeout is the SDK's own ``timeout=`` argument
+  (``PROVIDER_TIMEOUT`` via ``providers/network_policy.py``).  There is
+  no thread-based wall-clock wrapper: the former ``with_timeout`` was
+  never enabled by any adapter, and its pool shutdown waited for the
+  call anyway, so it could not have returned early (F34).
+- No circuit breaker is wired in — a failing provider is reported by the
+  passive health registry, never short-circuited (F34 removed the unused
+  hook, so there is no path to wire one).
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import email.utils
 import math
 import random
@@ -89,7 +89,6 @@ __all__ = [
     "normalise_exception",
     "resilient_call",
     "retry_after_from_exception",
-    "with_timeout",
 ]
 
 # ---------------------------------------------------------------------------
@@ -213,10 +212,11 @@ class CircuitState(Enum):
 class CircuitBreaker:
     """Thread-safe three-state circuit breaker.
 
-    The breaker opens after ``threshold`` consecutive failures and
-    refuses calls for ``reset_timeout`` seconds.  After the cool-down,
-    the next call transitions the state to ``HALF_OPEN`` and is allowed
-    through as a probe: success closes the breaker, failure re-opens it.
+    The breaker opens after ``threshold`` consecutive failures and reports
+    ``OPEN`` for ``reset_timeout`` seconds; after the cool-down, reading
+    :attr:`state` moves it to ``HALF_OPEN``, and the next recorded
+    outcome closes it (success) or re-opens it (failure).  It is purely
+    observational — nothing asks it for permission before a call.
 
     The clock is injectable so unit tests can drive the FSM
     deterministically without :func:`time.sleep`.
@@ -260,23 +260,6 @@ class CircuitBreaker:
         ):
             self._state = CircuitState.HALF_OPEN
             logger.info("Circuit breaker entering HALF_OPEN for probe")
-
-    def before_call(self) -> None:
-        """Raise :class:`ProviderError` if the breaker is open.
-
-        Called before each attempt inside :func:`resilient_call`.  The
-        raised error is *not* counted as a failure against the breaker
-        — no upstream request was made.
-        """
-        with self._lock:
-            self._maybe_transition_to_half_open_locked()
-            if self._state is CircuitState.OPEN:
-                raise ProviderError(
-                    "Circuit breaker is open; upstream service is failing",
-                    hint=(
-                        f"Retry after {self._reset_timeout:.1f}s or investigate upstream failures."
-                    ),
-                )
 
     def on_success(self) -> None:
         """Record a successful call — closes the breaker."""
@@ -504,34 +487,6 @@ def _usable_retry_after(value: object) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Timeout helper
-# ---------------------------------------------------------------------------
-
-
-def with_timeout[T](fn: Callable[[], T], *, seconds: float) -> T:
-    """Run *fn* with a wall-clock timeout.
-
-    A ``seconds`` of 0 (or less) disables the guard and runs in the
-    calling thread.  When enabled, *fn* is submitted to a single-worker
-    thread pool and the current thread waits up to ``seconds`` for the
-    result.  A :class:`TimeoutError` is raised if the wait expires; the
-    worker thread keeps running in the background until *fn* returns
-    (Python threads are not killable).
-
-    Treat this as a defensive safety net, not a replacement for the
-    SDK's own timeout argument.
-    """
-    if seconds <= 0:
-        return fn()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(fn)
-        try:
-            return future.result(timeout=seconds)
-        except concurrent.futures.TimeoutError as e:
-            raise TimeoutError(f"Call exceeded {seconds:.1f}s timeout") from e
-
-
-# ---------------------------------------------------------------------------
 # Composite wrapper
 # ---------------------------------------------------------------------------
 
@@ -550,14 +505,12 @@ class ResilientCallPolicy:
     """Bundle of resilience policies applied by :func:`resilient_call`.
 
     Pass-through container so that provider subclasses can configure
-    retry/timeout/circuit-breaker behaviour in one place and forward it
+    the retry budget and exception mapping in one place and forward them
     to :func:`resilient_call` without a long argument list.
     """
 
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
     exception_mapping: ExceptionMapping = field(default_factory=ExceptionMapping)
-    timeout: float = 0.0
-    circuit_breaker: CircuitBreaker | None = None
 
 
 def resilient_call[T](
@@ -569,16 +522,13 @@ def resilient_call[T](
     clock: Callable[[], float] = time.monotonic,
     rng: Callable[[], float] | None = None,
 ) -> T:
-    """Execute *fn* under timeout, retry, circuit-breaker, and mapping policies.
+    """Execute *fn* under the retry and exception-mapping policies.
 
     Flow per attempt:
 
-    1. If a circuit breaker is configured and OPEN, raise immediately
-       (no retries, no attempt increment).
-    2. Run *fn* directly, or under :func:`with_timeout` when
-       ``policy.timeout > 0``.
-    3. On success: close the breaker and return the result.
-    4. On failure: normalise the exception, mark the breaker.
+    1. Run *fn* (its per-attempt timeout is the SDK's own).
+    2. On success: return the result.
+    3. On failure: normalise the exception.
        *Terminal* errors (auth, content-filter) raise immediately.
        *Retryable* errors raise when the retry budget is exhausted, when
        the provider's ``Retry-After`` exceeds ``max_delay``, or when the
@@ -594,22 +544,14 @@ def resilient_call[T](
     max_attempts = retry.max_retries + 1
     started = clock()
     for attempt in range(1, max_attempts + 1):
-        if policy.circuit_breaker is not None:
-            # Breaker raises a ProviderError when OPEN — propagate
-            # without recording a new failure.  The caller sees the
-            # breaker state in the error, which is enough context.
-            policy.circuit_breaker.before_call()
-
         try:
-            result = with_timeout(fn, seconds=policy.timeout) if policy.timeout > 0 else fn()
+            return fn()
         except Exception as raw:
             normalised = normalise_exception(
                 raw,
                 provider=provider,
                 mapping=policy.exception_mapping,
             )
-            if policy.circuit_breaker is not None:
-                policy.circuit_breaker.on_failure()
             if isinstance(normalised, _TERMINAL_PROVIDER_ERRORS):
                 raise normalised from raw
             last_exc = normalised
@@ -626,11 +568,6 @@ def resilient_call[T](
             if delay is None:
                 raise last_exc from raw
             sleep(delay)
-            continue
-
-        if policy.circuit_breaker is not None:
-            policy.circuit_breaker.on_success()
-        return result
 
     # The loop always returns on success or raises on exhaustion; this
     # line is unreachable.  Present to reassure type checkers.

@@ -6,7 +6,6 @@ Covers:
 - :class:`CircuitBreaker` state transitions: CLOSED → OPEN → HALF_OPEN
   → CLOSED (recovery) and HALF_OPEN → OPEN (failed probe).
 - :class:`ExceptionMapping` / :func:`normalise_exception` mapping paths.
-- :func:`with_timeout` success, timeout, and disabled-guard paths.
 - :func:`resilient_call` composition: retry on transient errors, no
   retry on terminal errors, circuit-breaker integration, retry
   exhaustion.
@@ -43,7 +42,6 @@ from sec_generative_search.core.resilience import (
     normalise_exception,
     resilient_call,
     retry_after_from_exception,
-    with_timeout,
 )
 
 # ---------------------------------------------------------------------------
@@ -139,12 +137,6 @@ class TestCircuitBreaker:
             breaker.on_failure()
         assert breaker.state is CircuitState.OPEN
 
-    def test_before_call_raises_when_open(self) -> None:
-        breaker = CircuitBreaker(threshold=1, reset_timeout=10)
-        breaker.on_failure()
-        with pytest.raises(ProviderError):
-            breaker.before_call()
-
     def test_transitions_to_half_open_after_timeout(self) -> None:
         clock = _FakeClock()
         breaker = CircuitBreaker(threshold=1, reset_timeout=5, clock=clock)
@@ -159,7 +151,7 @@ class TestCircuitBreaker:
         breaker = CircuitBreaker(threshold=1, reset_timeout=5, clock=clock)
         breaker.on_failure()
         clock.advance(6)
-        breaker.before_call()  # no raise — probe is allowed
+        assert breaker.state is CircuitState.HALF_OPEN  # reading applies the cool-down
         breaker.on_success()
         assert breaker.state is CircuitState.CLOSED
 
@@ -168,7 +160,7 @@ class TestCircuitBreaker:
         breaker = CircuitBreaker(threshold=1, reset_timeout=5, clock=clock)
         breaker.on_failure()
         clock.advance(6)
-        breaker.before_call()  # moves to half-open
+        assert breaker.state is CircuitState.HALF_OPEN
         breaker.on_failure()
         assert breaker.state is CircuitState.OPEN
 
@@ -315,26 +307,6 @@ class TestNormaliseException:
 
 
 # ---------------------------------------------------------------------------
-# with_timeout
-# ---------------------------------------------------------------------------
-
-
-class TestWithTimeout:
-    def test_runs_in_calling_thread_when_disabled(self) -> None:
-        assert with_timeout(lambda: 42, seconds=0) == 42
-
-    def test_returns_value_when_fast_enough(self) -> None:
-        assert with_timeout(lambda: "ok", seconds=5) == "ok"
-
-    def test_raises_timeout_error_when_slow(self) -> None:
-        def slow() -> None:
-            time.sleep(0.5)
-
-        with pytest.raises(TimeoutError):
-            with_timeout(slow, seconds=0.05)
-
-
-# ---------------------------------------------------------------------------
 # resilient_call
 # ---------------------------------------------------------------------------
 
@@ -347,8 +319,6 @@ def _make_policy(
     *,
     max_retries: int = 2,
     mapping: ExceptionMapping | None = None,
-    breaker: CircuitBreaker | None = None,
-    timeout: float = 0.0,
     jitter: bool = False,
 ) -> ResilientCallPolicy:
     return ResilientCallPolicy(
@@ -360,8 +330,6 @@ def _make_policy(
             jitter=jitter,
         ),
         exception_mapping=mapping or _MAPPING,
-        circuit_breaker=breaker,
-        timeout=timeout,
     )
 
 
@@ -482,46 +450,6 @@ class TestResilientCall:
             )
         # Initial + 2 retries = 3 total attempts.
         assert calls == 3
-
-    def test_circuit_breaker_opens_and_blocks_calls(self) -> None:
-        breaker = CircuitBreaker(threshold=2, reset_timeout=60)
-
-        calls = 0
-
-        def fn() -> str:
-            nonlocal calls
-            calls += 1
-            raise _FakeRateLimitError("429")
-
-        # First invocation: retry policy will keep hitting the breaker
-        # until threshold is reached, at which point the breaker opens
-        # and raises a ProviderError (not further retried).
-        with pytest.raises(ProviderError):
-            resilient_call(
-                fn,
-                provider="test",
-                policy=_make_policy(max_retries=5, breaker=breaker),
-                sleep=_zero_sleep,
-            )
-        # Breaker is open now.
-        assert breaker.state is CircuitState.OPEN
-
-        # A subsequent call must fail immediately without invoking fn.
-        calls_at_open = calls
-
-        def fn2() -> str:
-            nonlocal calls
-            calls += 1
-            return "won't run"
-
-        with pytest.raises(ProviderError):
-            resilient_call(
-                fn2,
-                provider="test",
-                policy=_make_policy(max_retries=2, breaker=breaker),
-                sleep=_zero_sleep,
-            )
-        assert calls == calls_at_open  # fn2 was never executed
 
     def test_timeout_is_retried(self) -> None:
         calls = 0
@@ -875,3 +803,32 @@ class TestResilientCallDeadline:
 def test_sleep_default_is_time_sleep() -> None:
     """Regression: callers must not accidentally pass ``None`` for ``sleep``."""
     sleep_default: Callable[[float], None] = time.sleep  # noqa: F841
+
+
+@pytest.mark.security
+class TestNoBreakerOrWallClockWrapperInTheCallPath:
+    """F34: the breaker is observational (passive health) and must never gate
+    a live call; the thread-based ``with_timeout`` was dead and could not
+    even return early.  Both hooks are gone — keep them gone."""
+
+    def test_policy_has_no_breaker_or_timeout_hook(self) -> None:
+        from dataclasses import fields
+
+        assert {f.name for f in fields(ResilientCallPolicy)} == {
+            "retry_policy",
+            "exception_mapping",
+        }
+
+    def test_resilient_call_takes_no_breaker(self) -> None:
+        import inspect
+
+        params = set(inspect.signature(resilient_call).parameters)
+        assert params == {"fn", "provider", "policy", "sleep", "clock", "rng"}
+
+    def test_breaker_has_no_call_gate(self) -> None:
+        breaker = CircuitBreaker(threshold=1, reset_timeout=60)
+        breaker.on_failure()
+        assert breaker.state is CircuitState.OPEN
+        assert not hasattr(breaker, "before_call")
+        # An open breaker still never stops a call.
+        assert resilient_call(lambda: "ok", provider="test", policy=_make_policy()) == "ok"

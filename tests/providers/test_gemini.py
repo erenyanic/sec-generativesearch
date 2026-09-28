@@ -666,18 +666,6 @@ class TestExceptionMapping:
         assert GEMINI_EXCEPTION_MAPPING.timeout == (TimeoutError,)
 
 
-class TestCountTokens:
-    def test_count_tokens_positive(self, provider: GeminiProvider) -> None:
-        assert provider.count_tokens("Apple Inc. reported strong revenues.") > 0
-
-    def test_count_tokens_caches_encoder(self, provider: GeminiProvider) -> None:
-        provider.count_tokens("warm up")
-        encoder = provider._encoder
-        assert encoder is not None
-        provider.count_tokens("again")
-        assert provider._encoder is encoder
-
-
 # ---------------------------------------------------------------------------
 # Security — keys must never leak
 # ---------------------------------------------------------------------------

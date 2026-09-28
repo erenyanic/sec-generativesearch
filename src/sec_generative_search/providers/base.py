@@ -272,9 +272,6 @@ class BaseLLMProvider(_ProviderBase):
     - Implement :meth:`generate` and :meth:`generate_stream` so that
       both populate a :class:`TokenUsage` (``generate_stream`` on the
       final yielded chunk).
-    - Implement :meth:`count_tokens` using the SDK's tokeniser (or a
-      documented approximation) so the context-window packer
-      can budget prompts before calling the model.
     - Use :func:`resilient_call` with a provider-specific
       :class:`ExceptionMapping` for every network call so the
       orchestrator sees only normalised :class:`ProviderError`
@@ -296,11 +293,6 @@ class BaseLLMProvider(_ProviderBase):
         yielded value MUST populate ``token_usage`` with the total for
         the stream; earlier values MAY leave it empty.
         """
-
-    @abstractmethod
-    def count_tokens(self, text: str, model: str | None = None) -> int:
-        """Return the token count of *text* under *model* (or the
-        provider's default when ``None``)."""
 
 
 # ---------------------------------------------------------------------------

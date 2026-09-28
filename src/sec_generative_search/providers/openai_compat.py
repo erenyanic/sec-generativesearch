@@ -166,7 +166,6 @@ class _OpenAIClientMixin:
         self._policy = ResilientCallPolicy(
             retry_policy=retry_policy or RetryPolicy(),
             exception_mapping=OPENAI_EXCEPTION_MAPPING,
-            timeout=0.0,
         )
 
     def _call[T](self, fn: Callable[[], T]) -> T:
@@ -186,12 +185,6 @@ class OpenAICompatibleLLMProvider(_OpenAIClientMixin, BaseLLMProvider):
     optionally, ``default_base_url``.  Model capabilities are no longer
     declared per class: the vendored :mod:`~sec_generative_search.providers.catalogue`
     is the single source, keyed by ``(provider_name, slug)``.
-
-    The ``count_tokens`` implementation uses :mod:`tiktoken` when an
-    encoding is registered for the model; otherwise it falls back to
-    the ``cl100k_base`` encoding that covers every current OpenAI chat
-    model.  An honest tokeniser keeps the cost surface accurate even
-    for vendors that never publish their own encoder.
     """
 
     # Default model used when a caller does not supply one.  Concrete
@@ -209,8 +202,6 @@ class OpenAICompatibleLLMProvider(_OpenAIClientMixin, BaseLLMProvider):
     ) -> None:
         super().__init__(api_key)
         self._init_client(base_url=base_url, timeout=timeout, retry_policy=retry_policy)
-        # Lazily populated tiktoken encoders, keyed by model slug.
-        self._encoders: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Capability and validation
@@ -372,30 +363,6 @@ class OpenAICompatibleLLMProvider(_OpenAIClientMixin, BaseLLMProvider):
                 provider=self.provider_name,
                 mapping=OPENAI_EXCEPTION_MAPPING,
             ) from exc
-
-    # ------------------------------------------------------------------
-    # Token counting
-    # ------------------------------------------------------------------
-
-    def count_tokens(self, text: str, model: str | None = None) -> int:
-        """Return the exact tiktoken token count of *text*.
-
-        Falls back to the ``cl100k_base`` encoding when the requested
-        model is not registered with tiktoken — this covers every
-        OpenAI-compatible vendor that ships a model not yet in the
-        upstream registry.
-        """
-        slug = model or self.default_model
-        encoder = self._encoders.get(slug)
-        if encoder is None:
-            import tiktoken
-
-            try:
-                encoder = tiktoken.encoding_for_model(slug)
-            except KeyError:
-                encoder = tiktoken.get_encoding("cl100k_base")
-            self._encoders[slug] = encoder
-        return len(encoder.encode(text))
 
     # ------------------------------------------------------------------
     # Helpers

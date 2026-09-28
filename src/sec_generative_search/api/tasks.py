@@ -750,7 +750,7 @@ class TaskManager:
         info.progress.filings_total = len(work)
 
         # Batch dup check — one SQL ``IN (?, ?, …)`` instead of N
-        # round-trips through ``is_duplicate``.
+        # per-accession lookups.
         all_accessions = [fi.accession_number for fi in work]
         existing = self._registry.get_existing_accessions(all_accessions)
 

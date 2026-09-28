@@ -195,10 +195,6 @@ class ScriptedLLM(BaseLLMProvider):
             token_usage=TokenUsage(input_tokens=20, output_tokens=10),
         )
 
-    def count_tokens(self, text: str, model: str | None = None) -> int:
-        del model
-        return max(1, len(text) // 4)
-
 
 # ---------------------------------------------------------------------------
 # Real-stack fixtures

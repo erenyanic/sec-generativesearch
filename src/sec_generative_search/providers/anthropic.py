@@ -18,12 +18,9 @@ Key notes:
   OpenAI content-filter path.  Doing the check on the response body
   (rather than via the exception mapping) matches the SDK's own
   behaviour: refusals come back as valid HTTP 200 responses.
-- ``count_tokens`` approximates with :mod:`tiktoken` ``cl100k_base``.
-  The SDK ships an accurate ``messages.count_tokens`` but it is a
-  network call; the context-window packer budgets prompts
-  *before* the generation call, so it needs an offline counter.  The
-  approximation is conservative (slightly over-counts), which is the
-  right direction for a budget guard.
+- The adapter carries no tokeniser: prompt budgeting uses the one
+  shared offline ``cl100k_base`` counter (``search/retrieval.py``) for
+  every provider — never the SDK's network ``messages.count_tokens``.
 """
 
 from __future__ import annotations
@@ -130,11 +127,7 @@ class AnthropicProvider(BaseLLMProvider):
         self._policy = ResilientCallPolicy(
             retry_policy=retry_policy or RetryPolicy(),
             exception_mapping=ANTHROPIC_EXCEPTION_MAPPING,
-            timeout=0.0,
         )
-        # Lazy tiktoken encoder — cl100k_base approximation (see
-        # module docstring for why).
-        self._encoder: Any | None = None
 
     def _call[T](self, fn: Callable[[], T]) -> T:
         return resilient_call(fn, provider=self.provider_name, policy=self._policy)
@@ -310,27 +303,6 @@ class AnthropicProvider(BaseLLMProvider):
             ),
             finish_reason=self._normalise_stop_reason(final_stop_reason),
         )
-
-    # ------------------------------------------------------------------
-    # Token counting — offline approximation
-    # ------------------------------------------------------------------
-
-    def count_tokens(self, text: str, model: str | None = None) -> int:
-        """Return an offline token count for *text*.
-
-        Uses :mod:`tiktoken`'s ``cl100k_base`` encoding as a conservative
-        approximation.  The context-window packer only needs
-        the count to stay *below* the model's window — a slight
-        over-count biases towards safety.  The SDK's own
-        ``messages.count_tokens`` is exact but a network call; we
-        avoid it in this hot path.
-        """
-        del model  # approximation does not vary by Claude model
-        if self._encoder is None:
-            import tiktoken
-
-            self._encoder = tiktoken.get_encoding("cl100k_base")
-        return len(self._encoder.encode(text))
 
     # ------------------------------------------------------------------
     # Helpers

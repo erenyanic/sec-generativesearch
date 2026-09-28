@@ -293,10 +293,10 @@ class TestObservationalBreakerNeverBlocksLiveCall:
         assert invocations == 1
 
     def test_adapter_default_policy_carries_no_circuit_breaker(self) -> None:
-        # The structural complement: the default ResilientCallPolicy that
-        # every provider adapter builds on carries no breaker, so there is
-        # no wiring path from the observational registry into a live call.
-        assert ResilientCallPolicy().circuit_breaker is None
+        # The structural complement: ResilientCallPolicy has no breaker
+        # field at all (F34 removed the unused hook), so there is no wiring
+        # path from the observational registry into a live call.
+        assert not hasattr(ResilientCallPolicy(), "circuit_breaker")
 
 
 # ---------------------------------------------------------------------------

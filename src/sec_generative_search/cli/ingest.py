@@ -218,7 +218,7 @@ def _build_pipeline() -> tuple[FilingFetcher, PipelineOrchestrator, MetadataRegi
         raise typer.Exit(code=1) from None
 
     fetcher = FilingFetcher()
-    orchestrator = PipelineOrchestrator(fetcher=fetcher, embedder=embedder)
+    orchestrator = PipelineOrchestrator(embedder=embedder)
     store = FilingStore(chroma, registry)
     return fetcher, orchestrator, registry, store
 
@@ -318,7 +318,7 @@ def _ingest_one_form(
 
     progress.advance(step_task_id)
 
-    # Single SQL batch in place of N is_duplicate() calls.
+    # Single SQL batch in place of N per-accession lookups.
     existing = registry.get_existing_accessions([fi.accession_number for fi in filings])
     with OneAheadFetches(
         fetcher.fetch_filing_content,

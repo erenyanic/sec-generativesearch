@@ -336,7 +336,7 @@ def test_server_runs_single_worker_behind_proxy(dockerfile: str) -> None:
 #     fallback default names the same path (the entrypoint re-owns it).
 # ---------------------------------------------------------------------------
 
-_TIKTOKEN_ENCODINGS = ("cl100k_base", "o200k_base")
+_TIKTOKEN_ENCODINGS = ("cl100k_base",)
 
 
 def _dockerfile_stages(dockerfile: str) -> dict[str, str]:
@@ -401,38 +401,46 @@ def test_tiktoken_encodings_are_baked_into_the_inherited_venv(dockerfile: str) -
     assert prefetch, "builder stage never prefetches the tiktoken encodings"
     position, command = prefetch[-1]
     assert position > env_at, "tiktoken prefetch runs before TIKTOKEN_CACHE_DIR is set"
-    for encoding in _TIKTOKEN_ENCODINGS:
-        assert f"get_encoding('{encoding}')" in command or (
-            f'get_encoding("{encoding}")' in command
-        ), f"tiktoken prefetch does not fetch {encoding}"
+    baked = set(re.findall(r"get_encoding\(['\"]([^'\"]+)['\"]\)", command))
+    assert baked == set(_TIKTOKEN_ENCODINGS), (
+        f"tiktoken prefetch bakes {sorted(baked)}; expected exactly "
+        f"{sorted(_TIKTOKEN_ENCODINGS)} (what the code reaches)"
+    )
 
 
-def test_tiktoken_prefetch_covers_every_encoding_the_catalogue_reaches() -> None:
+def test_tiktoken_prefetch_covers_exactly_the_encodings_the_code_reaches() -> None:
     # The baked cache is root-owned and read-only to the server; with a
     # user-specified TIKTOKEN_CACHE_DIR tiktoken RAISES on a failed cache
     # write instead of downloading. So an encoding outside the baked set is a
-    # hard failure at runtime, not a slow path — keep the set exhaustive.
-    tiktoken = pytest.importorskip("tiktoken")
-    from sec_generative_search.providers.catalogue import ModelCatalogue
-    from sec_generative_search.providers.registry import ProviderRegistry, ProviderSurface
-
-    baseline = ModelCatalogue.load_baseline()
-    llm_providers = [
-        entry.name
-        for entry in ProviderRegistry.all_entries(ProviderSurface.LLM, include_unavailable=True)
-    ]
-    assert any(baseline.list_llm_models(name) for name in llm_providers), "empty catalogue"
-    reached = {"cl100k_base"}  # retrieval / orchestrator / fallback counter
-    for provider in llm_providers:
-        for slug in baseline.list_llm_models(provider):
-            try:
-                reached.add(tiktoken.model.encoding_name_for_model(slug))
-            except KeyError:
-                reached.add("cl100k_base")  # openai_compat.count_tokens fallback
-    missing = reached - set(_TIKTOKEN_ENCODINGS)
-    assert not missing, (
-        f"catalogued models reach tiktoken encodings the image does not bake: "
-        f"{sorted(missing)} — add them to the Dockerfile prefetch and this locker"
+    # hard failure at runtime, not a slow path — keep the set exhaustive, and
+    # exact: an encoding nothing reaches is dead weight in every image.
+    #
+    # Every encoding must be named literally (``get_encoding("…")``) so this
+    # scan can see it. ``encoding_for_model`` maps a *model slug* to an
+    # encoding at runtime — the per-adapter ``count_tokens`` did that for
+    # every catalogued slug (reaching o200k_base) and was removed as dead
+    # code (OPTIMIZATIONS F34). Reintroducing it means walking the catalogue
+    # here again and extending the prefetch.
+    src = _REPO_ROOT / "src" / "sec_generative_search"
+    reached: set[str] = set()
+    dynamic: list[str] = []
+    for path in src.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr == "encoding_for_model":
+                dynamic.append(f"{path.relative_to(src)}:{node.lineno}")
+            if node.func.attr == "get_encoding":
+                arg = node.args[0] if node.args else None
+                assert isinstance(arg, ast.Constant) and isinstance(arg.value, str), (
+                    f"{path.relative_to(src)}:{node.lineno} names an encoding "
+                    "dynamically — this lock (and the image bake) cannot see it"
+                )
+                reached.add(arg.value)
+    assert dynamic == [], f"slug-to-encoding lookups the bake cannot cover: {dynamic}"
+    assert reached == set(_TIKTOKEN_ENCODINGS), (
+        f"code reaches {sorted(reached)}; the image bakes {sorted(_TIKTOKEN_ENCODINGS)} — "
+        "keep the Dockerfile prefetch and _TIKTOKEN_ENCODINGS equal to what is reached"
     )
 
 
@@ -2303,8 +2311,8 @@ def test_ci_workflow_torch_is_cpu_only(ci_workflow: str) -> None:
 
 
 def test_ci_workflow_caches_the_tiktoken_encodings(ci_workflow: str) -> None:
-    # F25/F31: without a cache every CI run downloads cl100k_base + o200k_base
-    # (~5 MB, ~15 s of the suite). The pytest step's TIKTOKEN_CACHE_DIR must be
+    # F25/F31: without a cache every CI run downloads the tiktoken encodings
+    # the suite reaches (~15 s of it before F25). The pytest step's TIKTOKEN_CACHE_DIR must be
     # exactly the path an actions/cache step restores.
     steps = yaml.safe_load(ci_workflow)["jobs"]["test"]["steps"]
     cached = {

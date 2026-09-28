@@ -74,15 +74,15 @@ jobs:
           python -m pip install -e ".[test,metrics]"
 
       - name: Cache tiktoken encodings
-        # RetrievalService and the OpenAI adapter tests load cl100k_base +
-        # o200k_base (~5 MB). With an empty cache tiktoken downloads them from
-        # Azure blob storage on every run. Warm runs skip the download; a cold
+        # RetrievalService loads cl100k_base (~1.7 MB), the only encoding the
+        # code reaches. With an empty cache tiktoken downloads it from Azure
+        # blob storage on every run. Warm runs skip the download; a cold
         # cache still fetches. Safe to cache: tiktoken verifies each blob
         # against a SHA-256 pinned in its own source on every read.
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ${{ runner.temp }}/tiktoken-cache
-          key: tiktoken-${{ runner.os }}-cl100k_base-o200k_base-v1
+          key: tiktoken-${{ runner.os }}-cl100k_base-v2
 
       - name: Run tests with coverage
         # ``-n auto`` spreads the suite over the runner's cores (pytest-xdist,

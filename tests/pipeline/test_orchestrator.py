@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import io
 import logging
-from collections.abc import Iterator
 from datetime import date
 
 import numpy as np
@@ -104,51 +103,6 @@ class StubEmbedder:
         return np.zeros((len(chunks), self.dim), dtype=np.float32)
 
 
-class StubFetcher:
-    def __init__(
-        self,
-        results: list[tuple[FilingIdentifier, str]] | None = None,
-    ) -> None:
-        self.results = results or []
-
-    def fetch_latest(self, ticker: str, form_type: str) -> tuple[FilingIdentifier, str]:
-        return self.results[0]
-
-    def fetch_one(
-        self,
-        ticker: str,
-        form_type: str,
-        *,
-        index: int = 0,
-        year: int | list[int] | range | None = None,
-    ) -> tuple[FilingIdentifier, str]:
-        return self.results[index]
-
-    def fetch(
-        self,
-        ticker: str,
-        form_type: str,
-        *,
-        count: int | None = None,
-        year: int | list[int] | range | None = None,
-        start_date: str | None = None,
-        end_date: str | None = None,
-    ) -> Iterator[tuple[FilingIdentifier, str]]:
-        yield from self.results
-
-    def fetch_batch(
-        self,
-        tickers: list[str],
-        form_type: str,
-        *,
-        count_per_ticker: int | None = None,
-        year: int | list[int] | range | None = None,
-        start_date: str | None = None,
-        end_date: str | None = None,
-    ) -> Iterator[tuple[FilingIdentifier, str]]:
-        yield from self.results
-
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -164,7 +118,6 @@ class TestProcessFiling:
         embedder = StubEmbedder(dim=3)
 
         orchestrator = PipelineOrchestrator(
-            fetcher=StubFetcher(),
             parser=parser,
             chunker=chunker,
             embedder=embedder,
@@ -189,7 +142,6 @@ class TestProcessFiling:
         # still return a ProcessedFiling with embeddings=None rather
         # than failing or silently embedding via a default.
         orchestrator = PipelineOrchestrator(
-            fetcher=StubFetcher(),
             parser=StubParser([_make_segment(filing_id)]),
             chunker=StubChunker([_make_chunk(filing_id)]),
             embedder=None,
@@ -204,7 +156,6 @@ class TestProcessFiling:
         calls: list[tuple[str, int, int]] = []
 
         orchestrator = PipelineOrchestrator(
-            fetcher=StubFetcher(),
             parser=StubParser([_make_segment(filing_id)]),
             chunker=StubChunker([_make_chunk(filing_id)]),
             embedder=None,
@@ -239,7 +190,6 @@ class TestChunkEmbedderProtocol:
         embedder: ChunkEmbedder = DuckEmbedder()  # type: ignore[assignment]
 
         orchestrator = PipelineOrchestrator(
-            fetcher=StubFetcher(),
             parser=StubParser([_make_segment(filing_id)]),
             chunker=StubChunker([_make_chunk(filing_id)]),
             embedder=embedder,
@@ -250,57 +200,6 @@ class TestChunkEmbedderProtocol:
         assert result.embeddings is not None
         assert result.embeddings.shape == (1, 2)
         assert np.all(result.embeddings == 1.0)
-
-
-class TestBatchMethods:
-    def test_ingest_multiple_skips_failing_filings(self, filing_id: FilingIdentifier) -> None:
-        other_id = FilingIdentifier(
-            ticker="MSFT",
-            form_type="10-K",
-            filing_date=date(2023, 7, 27),
-            accession_number="0000789019-23-000014",
-        )
-        fetcher = StubFetcher(results=[(filing_id, "<ok/>"), (other_id, "<boom/>")])
-
-        # Parser blows up on the second filing — the orchestrator must
-        # log-and-continue so one bad filing doesn't abort the batch.
-        class PickyParser:
-            def parse(self, html: str, fid: FilingIdentifier) -> list[Segment]:
-                if html == "<boom/>":
-                    raise RuntimeError("parser died")
-                return [_make_segment(fid)]
-
-        orchestrator = PipelineOrchestrator(
-            fetcher=fetcher,
-            parser=PickyParser(),
-            chunker=StubChunker([_make_chunk(filing_id)]),
-            embedder=None,
-        )
-
-        results = list(orchestrator.ingest_multiple("AAPL", "10-K"))
-
-        assert len(results) == 1
-        assert results[0].filing_id is filing_id
-
-    def test_ingest_batch_skips_failures_across_tickers(self, filing_id: FilingIdentifier) -> None:
-        fetcher = StubFetcher(results=[(filing_id, "<ok/>"), (filing_id, "<boom/>")])
-
-        class PickyParser:
-            def parse(self, html: str, fid: FilingIdentifier) -> list[Segment]:
-                if html == "<boom/>":
-                    raise RuntimeError("parser died")
-                return [_make_segment(fid)]
-
-        orchestrator = PipelineOrchestrator(
-            fetcher=fetcher,
-            parser=PickyParser(),
-            chunker=StubChunker([_make_chunk(filing_id)]),
-            embedder=None,
-        )
-
-        results = list(orchestrator.ingest_batch(["AAPL", "MSFT"], "10-K"))
-
-        assert len(results) == 1
 
 
 @pytest.mark.security
@@ -318,7 +217,6 @@ class TestOrchestratorSecurity:
         # Pass embedder=None explicitly; ForbiddenEmbedder is a safety
         # net — it must never execute.
         orchestrator = PipelineOrchestrator(
-            fetcher=StubFetcher(),
             parser=StubParser([_make_segment(filing_id)]),
             chunker=StubChunker([_make_chunk(filing_id)]),
             embedder=None,
@@ -342,7 +240,7 @@ class TestOrchestratorLogStreamIsIdentifierFree:
     wrapper survives the value.
     """
 
-    def test_ingest_latest_emits_no_raw_ticker_or_accession(
+    def test_process_filing_emits_no_raw_ticker_or_accession(
         self,
         filing_id: FilingIdentifier,
         monkeypatch: pytest.MonkeyPatch,
@@ -350,7 +248,6 @@ class TestOrchestratorLogStreamIsIdentifierFree:
         monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
 
         orchestrator = PipelineOrchestrator(
-            fetcher=StubFetcher(results=[(filing_id, "<html/>")]),
             parser=StubParser([_make_segment(filing_id)]),
             chunker=StubChunker([_make_chunk(filing_id, 0)]),
             embedder=StubEmbedder(dim=3),
@@ -365,7 +262,7 @@ class TestOrchestratorLogStreamIsIdentifierFree:
         package_logger.addHandler(handler)
         package_logger.setLevel(logging.DEBUG)
         try:
-            assert orchestrator.ingest_latest(filing_id.ticker, filing_id.form_type)
+            assert orchestrator.process_filing(filing_id, "<html/>")
         finally:
             package_logger.removeHandler(handler)
             package_logger.setLevel(prior_level)

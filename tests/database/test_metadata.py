@@ -90,16 +90,19 @@ class TestRegisterFiling:
             registry.register_filing(sample_filing_id, chunk_count=5)
 
 
-class TestIsDuplicate:
-    def test_true_for_registered(
+class TestExistingAccessions:
+    def test_returns_the_registered_subset(
         self,
         registry: MetadataRegistry,
         stored_filing: FilingIdentifier,
     ) -> None:
-        assert registry.is_duplicate(stored_filing.accession_number) is True
+        found = registry.get_existing_accessions(
+            [stored_filing.accession_number, "missing-accession"]
+        )
+        assert found == {stored_filing.accession_number}
 
-    def test_false_for_absent(self, registry: MetadataRegistry) -> None:
-        assert registry.is_duplicate("missing-accession") is False
+    def test_empty_for_absent(self, registry: MetadataRegistry) -> None:
+        assert registry.get_existing_accessions(["missing-accession"]) == set()
 
 
 class TestRegisterFilingIfNew:
@@ -970,7 +973,8 @@ class TestSQLInjectionSafety:
         registry: MetadataRegistry,
         stored_filing: FilingIdentifier,
     ) -> None:
-        assert registry.is_duplicate("' OR '1'='1") is False
+        # The batch duplicate check (``IN (?, …)``) is the production lookup.
+        assert registry.get_existing_accessions(["' OR '1'='1", "') OR ('1'='1"]) == set()
 
     def test_sort_by_injection_is_rejected_not_executed(
         self,

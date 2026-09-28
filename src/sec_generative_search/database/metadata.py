@@ -493,30 +493,6 @@ class MetadataRegistry:
         if current >= self._max_filings:
             raise FilingLimitExceededError(current, self._max_filings)
 
-    def is_duplicate(self, accession_number: str) -> bool:
-        """
-        Check whether a filing has already been ingested.
-
-        Args:
-            accession_number: SEC accession number to check.
-
-        Returns:
-            True if the filing exists in the registry.
-
-        Raises:
-            DatabaseError: If the query fails.
-        """
-        sql = "SELECT 1 FROM filings WHERE accession_number = ? LIMIT 1"
-        try:
-            with self._lock:
-                row = self._conn.execute(sql, (accession_number,)).fetchone()
-            return row is not None
-        except self._db_error as e:
-            raise DatabaseError(
-                "Failed to check for duplicate filing",
-                details=str(e),
-            ) from e
-
     def get_existing_accessions(
         self,
         accession_numbers: list[str],
@@ -525,8 +501,8 @@ class MetadataRegistry:
         Return the subset of accession numbers that already exist in the registry.
 
         Performs a single ``SELECT ... WHERE IN (...)`` query instead of
-        N individual ``is_duplicate()`` calls, reducing SQLite connection
-        overhead from O(N) to O(1) for batch operations.
+        N per-accession lookups, reducing SQLite connection overhead from
+        O(N) to O(1) for batch operations.
 
         Args:
             accession_numbers: Accession numbers to check.
@@ -620,8 +596,8 @@ class MetadataRegistry:
         Atomically check for duplicate and register a filing if new.
 
         Holds the threading lock across both the duplicate check and the
-        insert, closing the race window where two threads could both pass
-        ``is_duplicate()`` and then both attempt ``register_filing()``.
+        insert, closing the race window where two threads could both pass a
+        separate duplicate check and then both attempt ``register_filing()``.
 
         Args:
             filing_id: Identifier of the filing to register.

@@ -154,12 +154,6 @@ class FakeLLMProvider(BaseLLMProvider):
             token_usage=self.usage,
         )
 
-    def count_tokens(self, text: str, model: str | None = None) -> int:
-        del model
-        # Approximate — one token per four characters.  Good enough for
-        # tests; the real budget allocator never calls this.
-        return max(1, len(text) // 4)
-
 
 @pytest.fixture
 def fake_llm() -> FakeLLMProvider:

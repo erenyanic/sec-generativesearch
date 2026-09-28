@@ -591,23 +591,6 @@ class TestValidationAndCapabilities:
 
 
 # ---------------------------------------------------------------------------
-# Token counting
-# ---------------------------------------------------------------------------
-
-
-class TestCountTokens:
-    def test_count_tokens_returns_positive(self, llm_provider: _DemoLLM) -> None:
-        n = llm_provider.count_tokens("Apple Inc. reported strong revenues.")
-        assert n > 0
-
-    def test_count_tokens_caches_encoder(self, llm_provider: _DemoLLM) -> None:
-        llm_provider.count_tokens("first call")
-        cached = dict(llm_provider._encoders)
-        llm_provider.count_tokens("second call")
-        assert dict(llm_provider._encoders) == cached  # no new encoder built
-
-
-# ---------------------------------------------------------------------------
 # Embeddings
 # ---------------------------------------------------------------------------
 

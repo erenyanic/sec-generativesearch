@@ -3,7 +3,11 @@ Pipeline orchestrator for SEC filing ingestion.
 
 This module coordinates the filing-processing pipeline:
 
-    Fetch → Parse → Chunk → [Embed]
+    Parse → Chunk → [Embed]
+
+Fetching is the caller's job (the API worker and the CLI both fetch HTML
+through :class:`~sec_generative_search.pipeline.fetch.FilingFetcher` —
+one ahead of processing — and hand it to :meth:`PipelineOrchestrator.process_filing`).
 
 Embedding is optional — the orchestrator accepts any callable
 conforming to :class:`ChunkEmbedder` and produces chunk-only
@@ -18,26 +22,18 @@ Usage:
 
     # Process a single filing without embeddings
     result = orchestrator.process_filing(filing_id, html_content)
-
-    # Ingest latest filing for a company
-    result = orchestrator.ingest_latest("AAPL", "10-K")
-
-    # Batch ingest multiple companies
-    for result in orchestrator.ingest_batch(["AAPL", "MSFT"], "10-K"):
-        print(f"Ingested {result.filing_id.ticker}")
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from sec_generative_search.core.logging import get_logger, redact_for_log
 from sec_generative_search.core.types import Chunk, FilingIdentifier, IngestResult
 from sec_generative_search.pipeline.chunk import TextChunker
-from sec_generative_search.pipeline.fetch import FilingFetcher
 from sec_generative_search.pipeline.parse import FilingParser
 
 if TYPE_CHECKING:
@@ -97,11 +93,8 @@ class PipelineOrchestrator:
     """
     Coordinates the SEC filing ingestion pipeline.
 
-    The orchestrator handles:
-        - Single filing processing (when HTML is already available)
-        - Single company ingestion (fetch + process)
-        - Batch ingestion (multiple companies/filings)
-        - Progress reporting via callbacks
+    The orchestrator handles single-filing processing (the HTML is
+    already fetched) with progress reporting via callbacks.
 
     Note:
         The orchestrator does NOT handle database storage or duplicate
@@ -111,13 +104,12 @@ class PipelineOrchestrator:
 
     Example:
         >>> orchestrator = PipelineOrchestrator()
-        >>> result = orchestrator.ingest_latest("AAPL", "10-K")
+        >>> result = orchestrator.process_filing(filing_id, html_content)
         >>> print(f"Processed {result.ingest_result.chunk_count} chunks")
     """
 
     def __init__(
         self,
-        fetcher: FilingFetcher | None = None,
         parser: FilingParser | None = None,
         chunker: TextChunker | None = None,
         embedder: ChunkEmbedder | None = None,
@@ -131,14 +123,12 @@ class PipelineOrchestrator:
         ``ProcessedFiling`` objects with ``embeddings=None``.
 
         Args:
-            fetcher: FilingFetcher instance (optional).
             parser: FilingParser instance (optional).
             chunker: TextChunker instance (optional).
             embedder: Any object conforming to :class:`ChunkEmbedder`
                 (optional).  When ``None``, the embedding step is
                 skipped.
         """
-        self.fetcher = fetcher or FilingFetcher()
         self.parser = parser or FilingParser()
         self.chunker = chunker or TextChunker()
         self.embedder = embedder
@@ -236,169 +226,3 @@ class PipelineOrchestrator:
             embeddings=embeddings,
             ingest_result=ingest_result,
         )
-
-    def ingest_latest(
-        self,
-        ticker: str,
-        form_type: str = "10-K",
-        progress_callback: ProgressCallback | None = None,
-    ) -> ProcessedFiling:
-        """
-        Fetch and process the latest filing for a company.
-
-        Args:
-            ticker: Stock ticker symbol.
-            form_type: SEC form type ("8-K", "10-K", or "10-Q").
-            progress_callback: Optional callback
-                ``(step_name, current, total)``.
-
-        Returns:
-            ProcessedFiling containing all processed data.
-        """
-        logger.info("Ingesting latest %s for %s", form_type, redact_for_log(ticker))
-
-        if progress_callback:
-            progress_callback("Fetching", 0, 4)
-
-        filing_id, html_content = self.fetcher.fetch_latest(ticker, form_type)
-        return self.process_filing(filing_id, html_content, progress_callback)
-
-    def ingest_one(
-        self,
-        ticker: str,
-        form_type: str = "10-K",
-        *,
-        index: int = 0,
-        year: int | list[int] | range | None = None,
-        progress_callback: ProgressCallback | None = None,
-    ) -> ProcessedFiling:
-        """
-        Fetch and process a specific filing by index.
-
-        Args:
-            ticker: Stock ticker symbol.
-            form_type: SEC form type.
-            index: Position in results (0=most recent).
-            year: Optional year filter.
-            progress_callback: Optional callback.
-
-        Returns:
-            ProcessedFiling containing all processed data.
-        """
-        logger.info(
-            "Ingesting %s %s at index %d",
-            redact_for_log(ticker),
-            form_type,
-            index,
-        )
-
-        if progress_callback:
-            progress_callback("Fetching", 0, 4)
-
-        filing_id, html_content = self.fetcher.fetch_one(ticker, form_type, index=index, year=year)
-        return self.process_filing(filing_id, html_content, progress_callback)
-
-    def ingest_multiple(
-        self,
-        ticker: str,
-        form_type: str = "10-K",
-        *,
-        count: int | None = None,
-        year: int | list[int] | range | None = None,
-        start_date: str | None = None,
-        end_date: str | None = None,
-    ) -> Iterator[ProcessedFiling]:
-        """
-        Fetch and process multiple filings for a company.
-
-        Yields ProcessedFiling objects one at a time, allowing
-        incremental processing and storage.  Failed filings are logged
-        and skipped so a single bad filing does not abort the batch.
-
-        Args:
-            ticker: Stock ticker symbol.
-            form_type: SEC form type.
-            count: Maximum number of filings.
-            year: Year filter.
-            start_date: Date range start.
-            end_date: Date range end.
-
-        Yields:
-            ProcessedFiling for each successfully processed filing.
-        """
-        logger.info(
-            "Ingesting multiple %s filings for %s",
-            form_type,
-            redact_for_log(ticker),
-        )
-
-        for filing_id, html_content in self.fetcher.fetch(
-            ticker,
-            form_type,
-            count=count,
-            year=year,
-            start_date=start_date,
-            end_date=end_date,
-        ):
-            try:
-                yield self.process_filing(filing_id, html_content)
-            except Exception as e:
-                logger.warning(
-                    "Failed to process %s: %s",
-                    filing_id.accession_number,
-                    str(e),
-                )
-                continue
-
-    def ingest_batch(
-        self,
-        tickers: list[str],
-        form_type: str = "10-K",
-        *,
-        count_per_ticker: int | None = None,
-        year: int | list[int] | range | None = None,
-        start_date: str | None = None,
-        end_date: str | None = None,
-    ) -> Iterator[ProcessedFiling]:
-        """
-        Fetch and process filings for multiple companies.
-
-        Yields ProcessedFiling objects for each successfully processed
-        filing across all specified tickers.  Failed filings are
-        logged and skipped.
-
-        Args:
-            tickers: List of stock ticker symbols.
-            form_type: SEC form type.
-            count_per_ticker: Max filings per company.
-            year: Year filter.
-            start_date: Date range start.
-            end_date: Date range end.
-
-        Yields:
-            ProcessedFiling for each successfully processed filing.
-        """
-        logger.info(
-            "Batch ingesting %s filings for %d companies",
-            form_type,
-            len(tickers),
-        )
-
-        for filing_id, html_content in self.fetcher.fetch_batch(
-            tickers,
-            form_type,
-            count_per_ticker=count_per_ticker,
-            year=year,
-            start_date=start_date,
-            end_date=end_date,
-        ):
-            try:
-                yield self.process_filing(filing_id, html_content)
-            except Exception as e:
-                logger.warning(
-                    "Failed to process %s %s: %s",
-                    redact_for_log(filing_id.ticker),
-                    filing_id.accession_number,
-                    str(e),
-                )
-                continue

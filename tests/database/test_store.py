@@ -179,7 +179,7 @@ class TestStoreFiling:
 
         assert stored is True
         assert chroma.collection_count() == 2
-        assert registry.is_duplicate(pf.filing_id.accession_number)
+        assert registry.get_existing_accessions([pf.filing_id.accession_number])
         record = registry.get_filing(pf.filing_id.accession_number)
         assert record is not None
         assert record.chunk_count == 2
@@ -682,8 +682,8 @@ class TestEvictExpired:
         # Fresh filing survives both stores.
         assert chroma.collection_count() == 2
         assert registry.count() == 1
-        assert registry.is_duplicate(pf_fresh.filing_id.accession_number) is True
-        assert registry.is_duplicate(pf_old.filing_id.accession_number) is False
+        assert registry.get_existing_accessions([pf_fresh.filing_id.accession_number])
+        assert not registry.get_existing_accessions([pf_old.filing_id.accession_number])
 
     def test_chroma_failure_leaves_sqlite_untouched(
         self,

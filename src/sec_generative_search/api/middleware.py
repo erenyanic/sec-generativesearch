@@ -51,7 +51,6 @@ import json
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Any
 
 from starlette.requests import cookie_parser
 from starlette.responses import JSONResponse
@@ -717,24 +716,3 @@ class RateLimitMiddleware:
             ),
             headers={"Retry-After": str(retry_after)},
         )
-
-
-# ---------------------------------------------------------------------------
-# Internal: typing helper for tests
-# ---------------------------------------------------------------------------
-
-
-def _security_headers_for_test() -> dict[str, str]:
-    """Expose the static security-headers map for unit assertions."""
-    return {name.decode(): value.decode() for name, value in _SECURITY_HEADERS}
-
-
-_security_headers_for_test.__test__ = False  # type: ignore[attr-defined]
-
-
-# Re-exported for tests that want the raw bytes pairs.
-SECURITY_HEADERS_RAW: tuple[tuple[bytes, bytes], ...] = _SECURITY_HEADERS
-
-
-# Re-exported for tests that want to inspect the typing of dispatched messages.
-_MessageT = dict[str, Any]

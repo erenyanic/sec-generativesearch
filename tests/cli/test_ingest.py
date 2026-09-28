@@ -188,8 +188,7 @@ class _FakeOrchestrator:
 
     instances: ClassVar[list[_FakeOrchestrator]] = []
 
-    def __init__(self, *, fetcher: Any = None, embedder: Any = None) -> None:
-        self.fetcher = fetcher
+    def __init__(self, *, embedder: Any = None) -> None:
         self.embedder = embedder
         self.process_calls: list[FilingIdentifier] = []
         self.process_raises: BaseException | None = None

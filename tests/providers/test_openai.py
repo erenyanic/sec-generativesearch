@@ -151,24 +151,6 @@ class TestEmbeddingDimensions:
 
 
 # ---------------------------------------------------------------------------
-# Token counting — uses tiktoken with model-specific encoding
-# ---------------------------------------------------------------------------
-
-
-class TestTokenCounting:
-    def test_count_tokens_matches_tiktoken_for_known_model(
-        self,
-        _patch_openai_client: dict,
-    ) -> None:
-        import tiktoken
-
-        provider = OpenAIProvider(_LONG_KEY)
-        encoder = tiktoken.get_encoding("cl100k_base")
-        text = "Apple Inc. reported strong revenues in Q4 2023."
-        assert provider.count_tokens(text, model="gpt-5.4-mini") == len(encoder.encode(text))
-
-
-# ---------------------------------------------------------------------------
 # Security — keys never leak via repr or any log path
 # ---------------------------------------------------------------------------
 

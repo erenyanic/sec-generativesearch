@@ -1,36 +1,25 @@
 """
 SEC filing fetcher using edgartools.
 
-This module wraps the edgartools library to fetch SEC filings (8-K, 10-K, 10-Q)
-from the EDGAR database. It provides flexible selection methods including:
-    - Single latest filing
-    - Specific filing by index position
-    - Multiple recent filings
-    - Filter by year or year range
-    - Filter by date range
+This module wraps the edgartools library to fetch SEC filings (8-K, 10-K, 10-Q
+and amendments) from the EDGAR database.  Ingest is list-first: callers list
+filing metadata (no HTML), drop known duplicates, then fetch each new
+filing's HTML on demand — one ahead of processing (``pipeline/prefetch.py``).
 
 Usage:
     from sec_generative_search.pipeline import FilingFetcher
 
     fetcher = FilingFetcher()
 
-    # Single latest filing
-    filing_id, html = fetcher.fetch_latest("AAPL", "10-K")
+    # Newest 5 non-amendment 10-Ks (metadata only), optionally filtered by
+    # year / date range
+    available = fetcher.list_available("AAPL", "10-K", count=5)
 
-    # Multiple filings (last 5 years)
-    for filing_id, html in fetcher.fetch("AAPL", "10-K", count=5):
-        process(filing_id, html)
+    # The newest filings across several form types, merged by date
+    available = fetcher.list_available_across_forms("AAPL", ("10-K", "10-Q"), count=4)
 
-    # Specific filing by index (0=most recent, 1=second most recent)
-    filing_id, html = fetcher.fetch_one("AAPL", "10-K", index=2)
-
-    # Filter by year range
-    for filing_id, html in fetcher.fetch("AAPL", "10-Q", year=range(2020, 2025)):
-        process(filing_id, html)
-
-    # Filter by date range
-    for filing_id, html in fetcher.fetch("AAPL", "10-K", start_date="2020-01-01"):
-        process(filing_id, html)
+    # HTML for one listed filing
+    filing_id, html = fetcher.fetch_filing_content(available[0])
 """
 
 from __future__ import annotations
@@ -114,31 +103,24 @@ class FilingFetcher:
     """
     Fetches SEC filings from EDGAR using edgartools.
 
-    This class provides flexible methods for fetching SEC filings with
-    various selection criteria. It handles identity configuration
-    automatically using credentials from settings.
+    Lists filing metadata with optional filters and fetches one filing's
+    HTML at a time.  It handles identity configuration automatically
+    using credentials from settings.
 
-    Selection Methods:
-        - fetch_latest(): Single most recent filing
-        - fetch_one(): Single filing by index position
-        - fetch(): Multiple filings with optional filters
-        - list_available(): Preview filings without downloading
+    Methods:
+        - list_available(): newest *count* filings of one form (metadata)
+        - list_available_across_forms(): newest *count* across forms
+        - fetch_filing_content(): HTML for one listed filing
+        - fetch_by_accession(): fallback for a hand-built ``FilingInfo``
 
     Filter Options:
-        - count: Maximum number of filings to fetch
-        - index: Specific position (0=most recent)
+        - count: Maximum number of filings to list
         - year: Single year, list of years, or range
         - start_date/end_date: Date range filtering
 
     Attributes:
         settings: Application settings instance
         max_filings: Maximum filings limit from settings
-
-    Example:
-        >>> fetcher = FilingFetcher()
-        >>> # Get last 5 years of 10-K filings
-        >>> for filing_id, html in fetcher.fetch("AAPL", "10-K", count=5):
-        ...     print(f"Processing {filing_id.date_str}")
     """
 
     def __init__(self) -> None:
@@ -668,211 +650,6 @@ class FilingFetcher:
         all_available.sort(key=lambda fi: fi.filing_date, reverse=True)
         return all_available[:count]
 
-    def fetch_latest(
-        self,
-        ticker: str,
-        form_type: str = "10-K",
-    ) -> tuple[FilingIdentifier, str]:
-        """
-        Fetch the most recent filing for a company.
-
-        This is a convenience method equivalent to fetch_one(ticker, form, index=0).
-
-        Args:
-            ticker: Stock ticker symbol (e.g., "AAPL", "MSFT")
-            form_type: SEC form type ("8-K", "10-K", or "10-Q")
-
-        Returns:
-            Tuple of (FilingIdentifier, html_content)
-
-        Raises:
-            FetchError: If ticker is invalid, no filings found, or fetch fails
-
-        Example:
-            >>> filing_id, html = fetcher.fetch_latest("NVDA", "10-Q")
-            >>> print(f"Fetched: {filing_id.date_str}, {len(html):,} chars")
-        """
-        return self.fetch_one(ticker, form_type, index=0)
-
-    def fetch_one(
-        self,
-        ticker: str,
-        form_type: str = "10-K",
-        *,
-        index: int = 0,
-        year: int | list[int] | range | None = None,
-        start_date: str | date | None = None,
-        end_date: str | date | None = None,
-    ) -> tuple[FilingIdentifier, str]:
-        """
-        Fetch a single filing by index position.
-
-        Index 0 is the most recent filing, index 1 is the second most
-        recent, and so on. Filters are applied before indexing.
-
-        Args:
-            ticker: Stock ticker symbol
-            form_type: SEC form type ("8-K", "10-K", or "10-Q")
-            index: Position in filtered results (0=most recent)
-            year: Filter by year before selecting index
-            start_date: Filter by date range start
-            end_date: Filter by date range end
-
-        Returns:
-            Tuple of (FilingIdentifier, html_content)
-
-        Raises:
-            FetchError: If index out of range or fetch fails
-
-        Example:
-            >>> # Get the third most recent 10-K
-            >>> filing_id, html = fetcher.fetch_one("AAPL", "10-K", index=2)
-
-            >>> # Get the most recent 10-K from 2023
-            >>> filing_id, html = fetcher.fetch_one("AAPL", "10-K", year=2023)
-        """
-        form_type = self._validate_form_type(form_type)
-        ticker = ticker.upper()
-
-        logger.info(
-            "Fetching %s %s at index %d",
-            redact_for_log(ticker),
-            form_type,
-            index,
-        )
-
-        company = self._get_company(ticker)
-        filings = self._get_filings(
-            company, form_type, year=year, start_date=start_date, end_date=end_date
-        )
-
-        # When a base form is requested, filter out amendments before indexing.
-        filings_list = [f for f in filings if not self._should_skip(f, form_type)]
-
-        if index >= len(filings_list):
-            raise FetchError(
-                f"Index {index} out of range",
-                details=f"Only {len(filings_list)} filings available.",
-            )
-
-        filing = filings_list[index]
-        filing_id, html_content = self._fetch_filing_content(filing, ticker, form_type)
-
-        logger.info(
-            "Fetched %s %s (%s): %s characters",
-            redact_for_log(ticker),
-            form_type,
-            filing_id.date_str,
-            f"{len(html_content):,}",
-        )
-
-        return filing_id, html_content
-
-    def fetch(
-        self,
-        ticker: str,
-        form_type: str = "10-K",
-        *,
-        count: int | None = None,
-        year: int | list[int] | range | None = None,
-        start_date: str | date | None = None,
-        end_date: str | date | None = None,
-    ) -> Iterator[tuple[FilingIdentifier, str]]:
-        """
-        Fetch multiple filings with flexible filtering.
-
-        This is the main method for batch fetching. It returns a generator
-        that yields filings one at a time, allowing incremental processing.
-
-        Args:
-            ticker: Stock ticker symbol
-            form_type: SEC form type ("8-K", "10-K", or "10-Q")
-            count: Maximum number of filings (default: max_filings setting)
-            year: Filter by year - accepts:
-                  - Single int: year=2023
-                  - List: year=[2022, 2023, 2024]
-                  - Range: year=range(2020, 2025)
-            start_date: Date range start (YYYY-MM-DD string or date object)
-            end_date: Date range end (YYYY-MM-DD string or date object)
-
-        Yields:
-            Tuples of (FilingIdentifier, html_content)
-
-        Raises:
-            FetchError: If ticker is invalid or no filings match filters
-
-        Examples:
-            >>> # Last 5 filings
-            >>> for fid, html in fetcher.fetch("AAPL", "10-K", count=5):
-            ...     print(f"Processing {fid.date_str}")
-
-            >>> # All 10-Ks from 2020-2024
-            >>> for fid, html in fetcher.fetch("AAPL", "10-K", year=range(2020, 2025)):
-            ...     print(f"Processing {fid.date_str}")
-
-            >>> # Filings since 2022
-            >>> for fid, html in fetcher.fetch("MSFT", "10-Q", start_date="2022-01-01"):
-            ...     print(f"Processing {fid.date_str}")
-        """
-        form_type = self._validate_form_type(form_type)
-        ticker = ticker.upper()
-
-        # Default to max_filings if count not specified
-        if count is None:
-            count = self.max_filings
-
-        logger.info(
-            "Fetching up to %d %s filings for %s",
-            count,
-            form_type,
-            redact_for_log(ticker),
-        )
-
-        company = self._get_company(ticker)
-        filings = self._get_filings(
-            company, form_type, year=year, start_date=start_date, end_date=end_date
-        )
-
-        # When a base form is requested, filter out amendments; then limit.
-        all_filings = [f for f in filings if not self._should_skip(f, form_type)]
-        filings_list = all_filings[:count]
-        total_available = len(all_filings)
-
-        if total_available > count:
-            logger.info(
-                "Limiting to %d of %d available filings",
-                count,
-                total_available,
-            )
-
-        fetched_count = 0
-        for filing in filings_list:
-            try:
-                filing_id, html_content = self._fetch_filing_content(filing, ticker, form_type)
-                fetched_count += 1
-                logger.debug(
-                    "Fetched %d/%d: %s",
-                    fetched_count,
-                    len(filings_list),
-                    filing_id.accession_number,
-                )
-                yield filing_id, html_content
-
-            except FetchError as e:
-                logger.warning(
-                    "Skipping filing %s: %s",
-                    filing.accession_no,
-                    e.message,
-                )
-                continue
-
-        logger.info(
-            "Completed: fetched %d %s filings for %s",
-            fetched_count,
-            form_type,
-            redact_for_log(ticker),
-        )
-
     def fetch_by_accession(
         self,
         ticker: str,
@@ -933,165 +710,4 @@ class FilingFetcher:
         raise FetchError(
             f"Filing not found: {accession_number}",
             details=f"No {form_type} filing with this accession number for {ticker}.",
-        )
-
-    # =========================================================================
-    # Batch Methods (Multiple Companies)
-    # =========================================================================
-
-    def list_available_batch(
-        self,
-        tickers: list[str],
-        form_type: str = "10-K",
-        *,
-        count_per_ticker: int | None = None,
-        year: int | list[int] | range | None = None,
-        start_date: str | date | None = None,
-        end_date: str | date | None = None,
-    ) -> dict[str, list[FilingInfo]]:
-        """
-        List available filings for multiple companies.
-
-        Args:
-            tickers: List of stock ticker symbols
-            form_type: SEC form type ("8-K", "10-K", or "10-Q")
-            count_per_ticker: Max filings per company (default: max_filings)
-            year: Filter by year (single int, list, or range)
-            start_date: Filter by date range start
-            end_date: Filter by date range end
-
-        Returns:
-            Dictionary mapping ticker to list of FilingInfo objects.
-            Failed tickers are included with empty lists.
-
-        Example:
-            >>> available = fetcher.list_available_batch(
-            ...     ['AAPL', 'MSFT', 'GOOGL'],
-            ...     '10-K',
-            ...     year=range(2022, 2025)
-            ... )
-            >>> for ticker, filings in available.items():
-            ...     print(f"{ticker}: {len(filings)} filings")
-        """
-        if count_per_ticker is None:
-            count_per_ticker = self.max_filings
-
-        results: dict[str, list[FilingInfo]] = {}
-
-        logger.info(
-            "Listing available %s filings for %d companies",
-            form_type,
-            len(tickers),
-        )
-
-        for ticker in tickers:
-            try:
-                filings = self.list_available(
-                    ticker,
-                    form_type,
-                    count=count_per_ticker,
-                    year=year,
-                    start_date=start_date,
-                    end_date=end_date,
-                )
-                results[ticker.upper()] = filings
-            except FetchError as e:
-                logger.warning(
-                    "Failed to list filings for %s: %s", redact_for_log(ticker), e.message
-                )
-                results[ticker.upper()] = []
-
-        total_filings = sum(len(f) for f in results.values())
-        logger.info(
-            "Listed %d total filings across %d companies",
-            total_filings,
-            len(tickers),
-        )
-
-        return results
-
-    def fetch_batch(
-        self,
-        tickers: list[str],
-        form_type: str = "10-K",
-        *,
-        count_per_ticker: int | None = None,
-        year: int | list[int] | range | None = None,
-        start_date: str | date | None = None,
-        end_date: str | date | None = None,
-    ) -> Iterator[tuple[FilingIdentifier, str]]:
-        """
-        Fetch filings for multiple companies.
-
-        This method iterates through multiple tickers and yields filings
-        one at a time. Useful for batch ingestion operations.
-
-        Args:
-            tickers: List of stock ticker symbols
-            form_type: SEC form type ("8-K", "10-K", or "10-Q")
-            count_per_ticker: Max filings per company (default: max_filings)
-            year: Filter by year (single int, list, or range)
-            start_date: Filter by date range start
-            end_date: Filter by date range end
-
-        Yields:
-            Tuples of (FilingIdentifier, html_content)
-
-        Note:
-            Failed tickers are logged and skipped (no exception raised).
-            The total number of filings is limited by max_filings setting
-            multiplied by number of tickers.
-
-        Example:
-            >>> # Get last 2 years of 10-K for multiple companies
-            >>> tickers = ['AAPL', 'AMZN', 'GOOGL', 'META']
-            >>> for fid, html in fetcher.fetch_batch(
-            ...     tickers, '10-K', year=range(2023, 2025)
-            ... ):
-            ...     print(f"Processing {fid.ticker} {fid.date_str}")
-        """
-        if count_per_ticker is None:
-            count_per_ticker = self.max_filings
-
-        logger.info(
-            "Batch fetching %s filings for %d companies (max %d each)",
-            form_type,
-            len(tickers),
-            count_per_ticker,
-        )
-
-        total_fetched = 0
-        for ticker in tickers:
-            try:
-                ticker_count = 0
-                for filing_id, html_content in self.fetch(
-                    ticker,
-                    form_type,
-                    count=count_per_ticker,
-                    year=year,
-                    start_date=start_date,
-                    end_date=end_date,
-                ):
-                    ticker_count += 1
-                    total_fetched += 1
-                    yield filing_id, html_content
-
-                logger.debug(
-                    "Fetched %d filings for %s",
-                    ticker_count,
-                    redact_for_log(ticker),
-                )
-
-            except FetchError as e:
-                logger.warning(
-                    "Skipping %s due to error: %s",
-                    redact_for_log(ticker),
-                    e.message,
-                )
-                continue
-
-        logger.info(
-            "Batch complete: fetched %d total %s filings",
-            total_fetched,
-            form_type,
         )

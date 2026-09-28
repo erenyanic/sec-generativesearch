@@ -9,8 +9,8 @@ from fastapi.testclient import TestClient
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sec_generative_search.api.middleware import (
+    _SECURITY_HEADERS,
     DEFAULT_MAX_CONTENT_LENGTH,
-    SECURITY_HEADERS_RAW,
     ContentSizeLimitMiddleware,
 )
 
@@ -20,7 +20,7 @@ class TestSecurityHeaders:
     def test_all_security_headers_present_on_health(self, api_client: TestClient) -> None:
         response = api_client.get("/api/health")
         assert response.status_code == 200
-        for name, value in SECURITY_HEADERS_RAW:
+        for name, value in _SECURITY_HEADERS:
             assert response.headers.get(name.decode()) == value.decode()
 
     def test_security_headers_on_error_response(self, api_client: TestClient) -> None:

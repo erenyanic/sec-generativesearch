@@ -92,10 +92,6 @@ class _FakeLLM(BaseLLMProvider):
             token_usage=TokenUsage(input_tokens=2, output_tokens=2),
         )
 
-    def count_tokens(self, text: str, model: str | None = None) -> int:
-        del model
-        return len(text.split())
-
 
 class _FakeEmbedder(BaseEmbeddingProvider):
     provider_name = "fake-embed"
@@ -155,10 +151,6 @@ class _LLMMissingProviderName(BaseLLMProvider):
         request: GenerationRequest,
     ) -> Iterator[GenerationResponse]:  # pragma: no cover
         yield GenerationResponse(text="", model=request.model)
-
-    def count_tokens(self, text: str, model: str | None = None) -> int:  # pragma: no cover
-        del model
-        return len(text)
 
 
 # ---------------------------------------------------------------------------

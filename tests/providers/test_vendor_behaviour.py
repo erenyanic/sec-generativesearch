@@ -24,9 +24,10 @@ lock of their own:
   non-streaming paths.
 - **Cost safety (security).**  Omitting ``model`` must never land a
   caller on a ``PREMIUM``-tier model.
-- **Token budgeting stays offline.**  ``count_tokens`` is a local
-  ``tiktoken`` approximation — never an SDK round-trip — on the hot
-  budgeting path.
+- **No adapter carries a tokeniser.**  Prompt budgeting uses the one
+  shared offline ``cl100k_base`` counter (``search/retrieval.py``); the
+  dead per-adapter ``count_tokens`` (F34) must not come back as a
+  second, network-capable budgeting path.
 - Vendor-specific endpoint / slug invariants (Grok's dated slugs,
     Z.ai's general-PaaS endpoint).
 
@@ -281,26 +282,22 @@ class TestVendorGeneration:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("provider_cls", "default_model"), _LLM_PARAMS)
-def test_count_tokens_is_offline_and_positive(
-    provider_cls: type,
-    default_model: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``count_tokens`` uses the local tiktoken approximation only.
+def test_no_llm_adapter_carries_a_tokeniser() -> None:
+    """F34: ``count_tokens`` had no caller; budgeting is the shared counter.
 
-    The context-window packer calls this for every prompt; an accidental
-    SDK round-trip here would put a network hop on the budgeting path.
+    Walks every registered LLM adapter (not just the OpenAI-wire vendors
+    above) and the ABC itself.
     """
-    del default_model
-    provider, client = _build(provider_cls, monkeypatch)
-    client.reset_mock()
+    from sec_generative_search.providers.base import BaseLLMProvider
+    from sec_generative_search.providers.registry import ProviderRegistry, ProviderSurface
 
-    n = provider.count_tokens("Apple Inc. reported record quarterly revenue.")
-
-    assert n > 0
-    client.chat.completions.create.assert_not_called()
-    client.models.list.assert_not_called()
+    classes = [
+        entry.provider_cls
+        for entry in ProviderRegistry.all_entries(ProviderSurface.LLM, include_unavailable=True)
+    ]
+    assert len(classes) >= 13
+    for cls in [BaseLLMProvider, *classes]:
+        assert not hasattr(cls, "count_tokens"), cls.__name__
 
 
 # ---------------------------------------------------------------------------
