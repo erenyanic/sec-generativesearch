@@ -1448,52 +1448,321 @@ class TestDurationTimerAutoCancel:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _RecordingOrchestrator(_StubOrchestrator):
+    processed: list[str] = field(default_factory=list)
+
+    def process_filing(self, filing_id, html_content, progress_callback=None):
+        self.processed.append(filing_id.accession_number)
+        return super().process_filing(filing_id, html_content, progress_callback)
+
+
 class TestCancelBetweenStages:
     """``cancel_event`` is observed at every stage boundary.
 
     A long-running fetch (EDGAR rate-limited at 9 req/s + network
     latency) can defer cancellation by many seconds without a check
-    immediately after fetch. This test pins the post-fetch check.
+    immediately after fetch. These tests pin the post-fetch check, and
+    what a cancel means once the next fetch runs one ahead (F21).
     """
 
-    def test_cancel_after_fetch_skips_processing_and_rolls_back(self) -> None:
+    def test_cancel_during_inline_fetch_skips_processing(self) -> None:
+        """The first filing is fetched inline; a cancel that lands during
+        that fetch is caught by the post-fetch check, before processing."""
         f1 = _make_filing_info("AAPL", "0000320193-23-000001")
-        f2 = _make_filing_info("AAPL", "0000320193-23-000002")
-        p1 = _make_processed_filing(f1)
-        p2 = _make_processed_filing(f2)
-
         manager_holder: dict[str, TaskManager] = {}
 
-        # Cancel inside the fetch stub for f2 — by the time the worker
-        # exits ``fetch_filing_content`` the cancel flag is set, and
-        # the post-fetch check must catch it before processing /
-        # storing f2.
         class _CancelInsideFetch(_StubFetcher):
             def fetch_filing_content(self, filing_info):
-                if filing_info.accession_number == f2.accession_number:
-                    mgr = manager_holder["mgr"]
-                    for task in mgr.list_tasks():
-                        if task.state == TaskState.RUNNING:
-                            task.cancel_event.set()
+                manager_holder["mgr"].list_tasks()[0].cancel_event.set()
                 return super().fetch_filing_content(filing_info)
 
+        orchestrator = _RecordingOrchestrator(
+            by_accession={f1.accession_number: _make_processed_filing(f1)}
+        )
         manager, store, _, _, _ = _build_manager(
-            fetcher=_CancelInsideFetch(work_lists={("AAPL", "10-K"): [f1, f2]}),
-            orchestrator=_StubOrchestrator(
-                by_accession={f1.accession_number: p1, f2.accession_number: p2},
-            ),
+            fetcher=_CancelInsideFetch(work_lists={("AAPL", "10-K"): [f1]}),
+            orchestrator=orchestrator,
         )
         manager_holder["mgr"] = manager
 
         task_id = manager.create_task(tickers=["AAPL"], form_types=["10-K"])
         info = _wait_for_state(manager, task_id, target=TaskState.CANCELLED)
 
-        # f1 stored then rolled back; f2 fetched but never stored
-        # because the post-fetch cancel check fired first.
-        assert store.stored == [f1.accession_number]
-        assert store.deleted == [[f1.accession_number]]
-        assert f2.accession_number not in store.stored
+        assert orchestrator.processed == []
+        assert store.stored == []
         assert info._stored_accessions == []
+
+    def test_cancel_during_prefetch_never_processes_the_prefetched_filing(self) -> None:
+        """f2 is fetched one ahead, while f1 is processed, and the cancel
+        fires inside that fetch.  The worker meets it at whichever boundary
+        comes first (before storing f1, top of f2's iteration, or after
+        collecting f2); every path must end CANCELLED with f2 never
+        processed or stored and anything stored rolled back."""
+        f1 = _make_filing_info("AAPL", "0000320193-23-000001")
+        f2 = _make_filing_info("AAPL", "0000320193-23-000002")
+        manager_holder: dict[str, TaskManager] = {}
+
+        class _CancelInsideFetch(_StubFetcher):
+            def fetch_filing_content(self, filing_info):
+                if filing_info.accession_number == f2.accession_number:
+                    manager_holder["mgr"].list_tasks()[0].cancel_event.set()
+                return super().fetch_filing_content(filing_info)
+
+        orchestrator = _RecordingOrchestrator(
+            by_accession={
+                f1.accession_number: _make_processed_filing(f1),
+                f2.accession_number: _make_processed_filing(f2),
+            }
+        )
+        manager, store, _, _, _ = _build_manager(
+            fetcher=_CancelInsideFetch(work_lists={("AAPL", "10-K"): [f1, f2]}),
+            orchestrator=orchestrator,
+        )
+        manager_holder["mgr"] = manager
+
+        task_id = manager.create_task(tickers=["AAPL"], form_types=["10-K"])
+        info = _wait_for_state(manager, task_id, target=TaskState.CANCELLED)
+
+        assert f2.accession_number not in orchestrator.processed
+        assert f2.accession_number not in store.stored
+        rolled_back = [a for batch in store.deleted for a in batch]
+        assert set(store.stored) <= set(rolled_back)
+        assert info._stored_accessions == []
+
+
+# ---------------------------------------------------------------------------
+# F21 — one-ahead prefetch of the next filing's HTML
+# ---------------------------------------------------------------------------
+
+
+class _GatedFetcher(_StubFetcher):
+    """Records every fetch (and on which thread) and can gate one accession."""
+
+    def __init__(self, work: list[FilingInfo], **kwargs: Any) -> None:
+        super().__init__(work_lists={("AAPL", "10-K"): work}, **kwargs)
+        self.fetched: list[str] = []
+        self.fetch_started: dict[str, threading.Event] = {
+            fi.accession_number: threading.Event() for fi in work
+        }
+        self.gates: dict[str, threading.Event] = {}
+        self.resident = 0
+        self.max_resident = 0
+        self._count_lock = threading.Lock()
+
+    def fetch_filing_content(self, filing_info: FilingInfo) -> tuple[FilingIdentifier, str]:
+        accession = filing_info.accession_number
+        self.fetched.append(accession)
+        self.fetch_started[accession].set()
+        gate = self.gates.get(accession)
+        if gate is not None:
+            assert gate.wait(timeout=5.0), "test never opened the fetch gate"
+        result = super().fetch_filing_content(filing_info)
+        with self._count_lock:
+            self.resident += 1
+            self.max_resident = max(self.max_resident, self.resident)
+        return result
+
+    def released(self) -> None:
+        with self._count_lock:
+            self.resident -= 1
+
+
+@dataclass
+class _ReleasingOrchestrator(_StubOrchestrator):
+    """Marks a filing's HTML released once processed; optional per-filing hook."""
+
+    fetcher: _GatedFetcher | None = None
+    on_process: dict[str, Any] = field(default_factory=dict)
+    processed: list[str] = field(default_factory=list)
+
+    def process_filing(self, filing_id, html_content, progress_callback=None):
+        accession = filing_id.accession_number
+        self.processed.append(accession)
+        hook = self.on_process.get(accession)
+        if hook is not None:
+            hook()
+        try:
+            return super().process_filing(filing_id, html_content, progress_callback)
+        finally:
+            if self.fetcher is not None:
+                self.fetcher.released()
+
+
+def _prefetch_run(
+    work: list[FilingInfo],
+    *,
+    registry: _StubRegistry | None = None,
+    fetcher: _GatedFetcher | None = None,
+    **orchestrator_kwargs: Any,
+) -> tuple[TaskManager, _GatedFetcher, _ReleasingOrchestrator, _StubFilingStore]:
+    fetcher = fetcher or _GatedFetcher(work)
+    orchestrator = _ReleasingOrchestrator(
+        by_accession={fi.accession_number: _make_processed_filing(fi) for fi in work},
+        fetcher=fetcher,
+        **orchestrator_kwargs,
+    )
+    manager, store, _, _, _ = _build_manager(
+        registry=registry, fetcher=fetcher, orchestrator=orchestrator
+    )
+    return manager, fetcher, orchestrator, store
+
+
+def _filings(n: int) -> list[FilingInfo]:
+    return [
+        _make_filing_info("AAPL", f"0000320193-23-{i:06d}", filing_date=date(2023, 1, 1 + i))
+        for i in range(n)
+    ]
+
+
+class TestOneAheadPrefetch:
+    def test_next_fetch_overlaps_the_current_filing_processing(self) -> None:
+        f1, f2 = _filings(2)
+        overlap: list[bool] = []
+        manager, fetcher, _, store = _prefetch_run([f1, f2])
+        orchestrator = manager._orchestrator
+        # While f1 is being processed, f2's fetch must already be under way.
+        orchestrator.on_process[f1.accession_number] = lambda: overlap.append(
+            fetcher.fetch_started[f2.accession_number].wait(timeout=2.0)
+        )
+
+        task_id = manager.create_task(tickers=["AAPL"], form_types=["10-K"], count=2)
+        _wait_for_state(manager, task_id, target=TaskState.COMPLETED)
+
+        assert overlap == [True]
+        assert store.stored == [f1.accession_number, f2.accession_number]
+
+    def test_known_duplicates_are_never_fetched(self) -> None:
+        f1, dup, f3 = _filings(3)
+        registry = _StubRegistry(existing_accessions={dup.accession_number})
+        manager, fetcher, _, store = _prefetch_run([f1, dup, f3], registry=registry)
+
+        task_id = manager.create_task(tickers=["AAPL"], form_types=["10-K"], count=3)
+        info = _wait_for_state(manager, task_id, target=TaskState.COMPLETED)
+
+        assert fetcher.fetched == [f1.accession_number, f3.accession_number]
+        assert store.stored == [f1.accession_number, f3.accession_number]
+        assert info.progress.filings_skipped == 1
+
+    def test_at_most_two_filings_are_resident(self) -> None:
+        work = _filings(6)
+        manager, fetcher, _, store = _prefetch_run(work)
+
+        task_id = manager.create_task(tickers=["AAPL"], form_types=["10-K"], count=6)
+        _wait_for_state(manager, task_id, target=TaskState.COMPLETED)
+
+        assert len(store.stored) == 6
+        assert fetcher.max_resident <= 2
+
+    def test_prefetched_fetch_failures_keep_the_inline_envelopes(self) -> None:
+        """f2 and f4 are fetched one ahead (after f1 / f3 succeed inline) and
+        fail there; the worker must emit exactly the inline envelopes."""
+        f1, f2, f3, f4 = _filings(4)
+        fetcher = _GatedFetcher(
+            [f1, f2, f3, f4],
+            raise_on_fetch={
+                f2.accession_number: FetchError("Filing not found"),
+                f4.accession_number: RuntimeError("edgartools internals /srv/path"),
+            },
+        )
+        manager, _, _, store = _prefetch_run([f1, f2, f3, f4], fetcher=fetcher)
+        threads_seen: dict[str, str] = {}
+        original = fetcher.fetch_filing_content
+
+        def _fetch(filing_info: FilingInfo) -> tuple[FilingIdentifier, str]:
+            threads_seen[filing_info.accession_number] = threading.current_thread().name
+            return original(filing_info)
+
+        fetcher.fetch_filing_content = _fetch  # type: ignore[method-assign]
+
+        task_id = manager.create_task(tickers=["AAPL"], form_types=["10-K"], count=4)
+        info = _wait_for_state(manager, task_id, target=TaskState.COMPLETED)
+
+        prefix = f"ingest-prefetch-{task_id[:8]}"
+        assert threads_seen[f2.accession_number] == prefix
+        assert threads_seen[f4.accession_number] == prefix
+        frames = _drain_queue(info)
+        failed = [f for f in frames if f["type"] == "filing_failed"]
+        assert [(f["accession_number"], f["error"]) for f in failed] == [
+            (f2.accession_number, "Filing not found"),
+            (f4.accession_number, "fetch failed"),  # never the exception text
+        ]
+        assert store.stored == [f1.accession_number, f3.accession_number]
+        assert info.progress.filings_failed == 2
+
+    def test_no_prefetch_when_the_next_filing_would_hit_the_ceiling(self, monkeypatch) -> None:
+        monkeypatch.setenv("DB_MAX_FILINGS", "2")
+        reload_settings()
+        f1, f2 = _filings(2)
+        manager, fetcher, _, store = _prefetch_run([f1, f2], registry=_StubRegistry(filing_count=1))
+
+        task_id = manager.create_task(tickers=["AAPL"], form_types=["10-K"], count=2)
+        _wait_for_state(manager, task_id, target=TaskState.FAILED)
+
+        # f1 fills the last slot; f2 is refused by the ceiling, so fetching
+        # it ahead would have been a wasted EDGAR request.
+        assert fetcher.fetched == [f1.accession_number]
+        assert store.stored == [f1.accession_number]
+
+
+@pytest.mark.security
+class TestPrefetchNeverOutlivesTheTask:
+    """The worker's ``finally`` drops the task's EDGAR identity resolver.  A
+    prefetch still running — or not yet started — after that would fetch
+    under whatever identity is process-global by then (``edgar.set_identity``
+    is global): another tenant's in B/C.  ``_execute`` must wait for it."""
+
+    def test_cancelled_task_waits_for_its_prefetch_before_dropping_the_resolver(self) -> None:
+        from sec_generative_search.core.edgar_identity import EdgarIdentity
+
+        f1, f2 = _filings(2)
+        identity = EdgarIdentity(name="Tenant A", email="a@example.invalid")
+        fetcher = _GatedFetcher([f1, f2])
+        fetcher.gates[f2.accession_number] = threading.Event()
+        resolver_present_at_fetch_end: list[bool] = []
+        manager_holder: dict[str, TaskManager] = {}
+
+        original = fetcher.fetch_filing_content
+
+        def _fetch(filing_info: FilingInfo) -> tuple[FilingIdentifier, str]:
+            result = original(filing_info)
+            mgr = manager_holder["mgr"]
+            with mgr._lock:
+                resolver_present_at_fetch_end.append(bool(mgr._task_resolvers))
+            return result
+
+        fetcher.fetch_filing_content = _fetch  # type: ignore[method-assign]
+
+        def _cancel_mid_processing() -> None:
+            # f2's prefetch is now blocked at its gate; cancel the task, and
+            # open the gate only after the worker has had time to finish.
+            assert fetcher.fetch_started[f2.accession_number].wait(timeout=5.0)
+            manager_holder["mgr"].list_tasks()[0].cancel_event.set()
+            threading.Timer(0.3, fetcher.gates[f2.accession_number].set).start()
+
+        manager, _, _, store = _prefetch_run(
+            [f1, f2],
+            fetcher=fetcher,
+            on_process={f1.accession_number: _cancel_mid_processing},
+        )
+        manager_holder["mgr"] = manager
+
+        task_id = manager.create_task(
+            tickers=["AAPL"],
+            form_types=["10-K"],
+            count=2,
+            edgar_identity_resolver=lambda: identity,
+        )
+        _wait_for_state(manager, task_id, target=TaskState.CANCELLED, timeout=10.0)
+
+        # The worker thread has exited (``_wait_for_state`` joined it): no
+        # prefetch thread may still be alive, and the prefetch finished while
+        # the resolver was still registered.
+        assert not [t for t in threading.enumerate() if t.name.startswith("ingest-prefetch-")]
+        assert resolver_present_at_fetch_end == [True, True]
+        assert fetcher.identity_calls  # every EDGAR call applied the tenant's identity
+        assert set(fetcher.identity_calls) == {("Tenant A", "a@example.invalid")}
+        assert store.stored == []
 
 
 # ---------------------------------------------------------------------------

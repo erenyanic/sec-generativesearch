@@ -29,7 +29,6 @@ hints) survive Rich's markup parser.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from datetime import datetime
 from typing import Annotated
 
@@ -61,9 +60,11 @@ from sec_generative_search.database import (
 )
 from sec_generative_search.pipeline import (
     FilingFetcher,
+    FilingInfo,
     PipelineOrchestrator,
     ProcessedFiling,
 )
+from sec_generative_search.pipeline.prefetch import OneAheadFetches
 from sec_generative_search.providers.factory import build_embedder
 from sec_generative_search.providers.registry import ProviderRegistry
 
@@ -227,50 +228,6 @@ def _build_pipeline() -> tuple[FilingFetcher, PipelineOrchestrator, MetadataRegi
 # ---------------------------------------------------------------------------
 
 
-def _fetch_filings(
-    fetcher: FilingFetcher,
-    ticker: str,
-    form_type: str,
-    *,
-    count: int | None,
-    year: int | None,
-    start_date: str | None,
-    end_date: str | None,
-) -> Iterator[tuple[FilingIdentifier, str]]:
-    """Yield ``(FilingIdentifier, html)`` tuples honouring the CLI flags.
-
-    Routes to the cheapest fetcher method for the requested shape:
-
-    - ``count == 1`` with no filters → ``fetch_latest`` (single HTTP hit).
-    - ``count == 1`` with filters    → ``fetch_one`` (one filter pass).
-    - everything else                 → ``fetch`` (streaming generator).
-    """
-    has_filters = year is not None or start_date is not None or end_date is not None
-
-    if count == 1 and not has_filters:
-        yield fetcher.fetch_latest(ticker, form_type)
-        return
-
-    if count == 1 and has_filters:
-        yield fetcher.fetch_one(
-            ticker,
-            form_type,
-            year=year,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        return
-
-    yield from fetcher.fetch(
-        ticker,
-        form_type,
-        count=count,
-        year=year,
-        start_date=start_date,
-        end_date=end_date,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Single-form ingestion (used by both ``add`` and ``batch``)
 # ---------------------------------------------------------------------------
@@ -309,11 +266,16 @@ def _ingest_one_form(
 ) -> tuple[int, int, int]:
     """Ingest filings for one ticker + one form type.
 
-    Pipeline per filing: fetch (already done in bulk) → batch duplicate
-    check → process (parse + chunk + embed) → store via
-    :class:`FilingStore`.  Per-filing failure isolation mirrors the
-    API-side worker: a single bad filing emits a row error and the
-    loop continues; only an early fetch failure aborts the form.
+    Pipeline: list the matching filings' metadata (no HTML) → batch
+    duplicate check → per new filing: fetch → process (parse + chunk +
+    embed) → store via :class:`FilingStore`.  HTML is streamed — the next
+    new filing is fetched one ahead while the current one is processed
+    (F21), so at most two filings are resident and a duplicate is never
+    downloaded.  ``list_available`` selects exactly what the old
+    ``fetch_latest`` / ``fetch_one`` / ``fetch`` routing did (the newest
+    *count* non-amendment filings).  Per-filing failure isolation mirrors
+    the API-side worker: a single bad filing emits a row error and the
+    loop continues; only a listing failure aborts the form.
 
     Returns:
         ``(succeeded, skipped, failed)`` counts.
@@ -325,16 +287,13 @@ def _ingest_one_form(
         description=f"Fetching {ticker} {form_type}{form_label}...",
     )
     try:
-        filings = list(
-            _fetch_filings(
-                fetcher,
-                ticker,
-                form_type,
-                count=count,
-                year=year,
-                start_date=start_date,
-                end_date=end_date,
-            )
+        filings = fetcher.list_available(
+            ticker,
+            form_type,
+            count=count,
+            year=year,
+            start_date=start_date,
+            end_date=end_date,
         )
     except FetchError as exc:
         progress.stop()
@@ -359,15 +318,54 @@ def _ingest_one_form(
 
     progress.advance(step_task_id)
 
+    # Single SQL batch in place of N is_duplicate() calls.
+    existing = registry.get_existing_accessions([fi.accession_number for fi in filings])
+    with OneAheadFetches(
+        fetcher.fetch_filing_content,
+        [fi for fi in filings if fi.accession_number not in existing],
+        name="ingest-prefetch",
+    ) as fetches:
+        return _ingest_listed_form(
+            ticker,
+            form_type,
+            filings,
+            existing,
+            fetches=fetches,
+            multi=multi,
+            orchestrator=orchestrator,
+            registry=registry,
+            store=store,
+            progress=progress,
+            step_task_id=step_task_id,
+            filing_task_id=filing_task_id,
+            form_label=form_label,
+        )
+
+
+def _ingest_listed_form(
+    ticker: str,
+    form_type: str,
+    filings: list[FilingInfo],
+    existing: set[str],
+    *,
+    fetches: OneAheadFetches[FilingInfo, tuple[FilingIdentifier, str]],
+    multi: bool,
+    orchestrator: PipelineOrchestrator,
+    registry: MetadataRegistry,
+    store: FilingStore,
+    progress: Progress,
+    step_task_id: int,
+    filing_task_id: int | None,
+    form_label: str,
+) -> tuple[int, int, int]:
+    """Stream *filings* (already listed and dup-checked) through the pipeline."""
     succeeded = 0
     skipped = 0
     failed = 0
 
-    # Single SQL batch in place of N is_duplicate() calls.
-    existing = registry.get_existing_accessions([fid.accession_number for fid, _ in filings])
-
-    for filing_idx, (filing_id, html_content) in enumerate(filings):
+    for filing_idx, filing_info in enumerate(filings):
         filing_num = f" [{filing_idx + 1}/{len(filings)}]" if multi else ""
+        filing_id = filing_info.to_identifier()
 
         if filing_idx > 0:
             try:
@@ -379,7 +377,7 @@ def _ingest_one_form(
                     f"{succeeded} ingestion(s) — stopping."
                 )
                 break
-            # Reset step bar between filings (fetch already done).
+            # Reset step bar between filings.
             progress.update(step_task_id, completed=1)
 
         if filing_id.accession_number in existing:
@@ -400,6 +398,29 @@ def _ingest_one_form(
             if filing_task_id is not None:
                 progress.advance(filing_task_id)
             continue
+
+        try:
+            filing_id, html_content = fetches.fetch(filing_info)
+        except FetchError as exc:
+            if multi:
+                progress.console.print(
+                    f"  [red]Fetch failed{filing_num}:[/red] {escape(exc.message)}"
+                )
+            else:
+                progress.stop()
+                _print_error(
+                    f"Fetch failed for {ticker} {form_type}",
+                    exc.message,
+                    details=exc.details,
+                    hint="Check you have an internet connection, then retry.",
+                )
+            failed += 1
+            if filing_task_id is not None:
+                progress.advance(filing_task_id)
+            continue
+
+        # Fetch the next new filing while this one is processed (F21).
+        fetches.start_after(filing_info)
 
         def _on_progress(
             step: str,
@@ -549,7 +570,14 @@ def _ingest_across_forms(
 
     existing = registry.get_existing_accessions([fi.accession_number for fi in selected])
 
-    with _make_progress() as progress:
+    with (
+        _make_progress() as progress,
+        OneAheadFetches(
+            fetcher.fetch_filing_content,
+            [fi for fi in selected if fi.accession_number not in existing],
+            name="ingest-prefetch",
+        ) as fetches,
+    ):
         filing_task = progress.add_task(
             f"{escape(ticker)}: 0/{len(selected)} filings",
             total=len(selected),
@@ -589,7 +617,7 @@ def _ingest_across_forms(
                 continue
 
             try:
-                filing_id, html_content = fetcher.fetch_filing_content(fi)
+                filing_id, html_content = fetches.fetch(fi)
             except FetchError as exc:
                 progress.console.print(
                     f"  [red]Fetch failed{filing_num}:[/red] {escape(exc.message)}"
@@ -598,6 +626,8 @@ def _ingest_across_forms(
                 progress.advance(filing_task)
                 continue
 
+            # Fetch the next new filing while this one is processed (F21).
+            fetches.start_after(fi)
             progress.advance(step_task)
 
             def _on_progress(

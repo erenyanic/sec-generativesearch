@@ -101,9 +101,12 @@ from sec_generative_search.core.logging import (
 from sec_generative_search.core.metrics import get_metrics
 from sec_generative_search.pipeline.fetch import FilingFetcher, FilingInfo
 from sec_generative_search.pipeline.orchestrator import PipelineOrchestrator
+from sec_generative_search.pipeline.prefetch import OneAheadFetches
 
 if TYPE_CHECKING:
+    from sec_generative_search.config.settings import Settings
     from sec_generative_search.core.edgar_identity import EdgarIdentity
+    from sec_generative_search.core.types import FilingIdentifier
     from sec_generative_search.database.metadata import MetadataRegistry
     from sec_generative_search.database.store import FilingStore
     from sec_generative_search.providers.base import BaseEmbeddingProvider
@@ -737,9 +740,10 @@ class TaskManager:
         """Ingest one filing at a time, fetching HTML on demand.
 
         Fetching HTML per filing (rather than batching) keeps memory
-        bounded at one filing's worth of HTML regardless of work-list
-        size; on a 4 GB-VRAM single-user setup the alternative would
-        OOM on a wide ticker selection.
+        bounded regardless of work-list size; on a 4 GB-VRAM single-user
+        setup the alternative would OOM on a wide ticker selection.  The
+        next filing's HTML is fetched one ahead while the current one is
+        processed (F21), so at most two filings are resident.
         """
         # Build the work list under the correct effective identity.
         work = self._run_with_edgar_identity(info, self._build_work_list, info)
@@ -755,6 +759,32 @@ class TaskManager:
             new_count = sum(1 for fi in work if fi.accession_number not in existing)
             self._maybe_evict(info, new_count)
 
+        # One-ahead prefetch over the new filings only — a duplicate is
+        # never fetched. Every fetch, inline or ahead, applies this task's
+        # EDGAR identity under ``_edgar_lock`` for its whole duration.
+        fetches: OneAheadFetches[FilingInfo, tuple[FilingIdentifier, str]] = OneAheadFetches(
+            lambda fi: self._run_with_edgar_identity(info, self._fetcher.fetch_filing_content, fi),
+            [fi for fi in work if fi.accession_number not in existing],
+            name=f"ingest-prefetch-{info.task_id[:8]}",
+            should_stop=info.cancel_event.is_set,
+        )
+        try:
+            self._ingest_work_list(info, work, existing, fetches, settings)
+        finally:
+            # Load-bearing: the caller drops this task's EDGAR identity
+            # resolver as soon as we return, so no prefetch may still be
+            # running (or about to start) past this point.
+            fetches.close()
+
+    def _ingest_work_list(
+        self,
+        info: TaskInfo,
+        work: list[FilingInfo],
+        existing: set[str],
+        fetches: OneAheadFetches[FilingInfo, tuple[FilingIdentifier, str]],
+        settings: Settings,
+    ) -> None:
+        """Run fetch → process → store over *work*; see :meth:`_execute`."""
         cached_count = self._registry.count()
         max_filings = settings.database.max_filings
 
@@ -815,11 +845,9 @@ class TaskManager:
             info.progress.step_index = 0
 
             try:
-                _, html_content = self._run_with_edgar_identity(
-                    info,
-                    self._fetcher.fetch_filing_content,
-                    filing_info,
-                )
+                # The prefetched result when this filing was fetched one
+                # ahead; raises exactly what an inline fetch would.
+                _, html_content = fetches.fetch(filing_info)
             except FetchError as exc:
                 info.progress.filings_failed += 1
                 info.progress.filings_done += 1
@@ -877,6 +905,13 @@ class TaskManager:
                 self._push(info, {"type": "cancelled"})
                 logger.info("Task %s cancelled after fetch", info.task_id[:8])
                 return
+
+            # Fetch the next new filing while this one is parsed, chunked
+            # and embedded (F21).  Skipped when storing this filing would
+            # leave no room for it outside demo mode — the loop would stop
+            # at the ceiling and the fetch would be thrown away.
+            if settings.api.demo_mode or cached_count + 1 < max_filings:
+                fetches.start_after(filing_info)
 
             def _progress_cb(
                 step: str,

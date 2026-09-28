@@ -22,6 +22,7 @@ Goals:
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date
@@ -92,26 +93,25 @@ class _FakeEmbedder:
 class _FakeFetcher:
     """Programmable :class:`FilingFetcher` stand-in.
 
-    Each method's return / raise can be set per-test; calls are
-    recorded so the test can assert on the routing decisions the CLI
-    makes (``fetch_latest`` vs ``fetch_one`` vs ``fetch``).
+    ``queued_filings`` is the listing: ``list_available`` returns one
+    ``FilingInfo`` per entry and ``fetch_filing_content`` serves the
+    entry's HTML.  Calls are recorded so a test can assert on what the CLI
+    listed, and which filings it actually downloaded (F21: list first,
+    then fetch only new filings, one ahead).
     """
 
     instances: ClassVar[list[_FakeFetcher]] = []
 
     def __init__(self) -> None:
-        self.fetch_latest_calls: list[tuple[str, str]] = []
-        self.fetch_one_calls: list[tuple[str, str, dict]] = []
-        self.fetch_calls: list[tuple[str, str, dict]] = []
+        self.list_calls: list[tuple[str, str, dict]] = []
         self.list_across_calls: list[tuple[str, tuple, dict]] = []
         self.fetch_content_calls: list[FilingInfo] = []
         self.queued_filings: list[tuple[FilingIdentifier, str]] = []
         self.queued_list: list[FilingInfo] = []
-        self.fetch_latest_raises: BaseException | None = None
-        self.fetch_raises: BaseException | None = None
         self.list_raises: BaseException | None = None
         self.fetch_content_raises: BaseException | None = None
-        # ``company_cache()`` bookkeeping (F22): which tickers were fetched
+        self.fetch_content_raises_for: dict[str, BaseException] = {}
+        # ``company_cache()`` bookkeeping (F22): which tickers were listed
         # inside which scope.
         self.cache_scopes: list[list[str]] = []
         self.fetched_outside_scope: list[str] = []
@@ -133,26 +133,21 @@ class _FakeFetcher:
         else:
             self._scope.append(ticker)
 
-    def fetch_latest(self, ticker: str, form_type: str):
+    def list_available(self, ticker: str, form_type: str, **kwargs: Any) -> list[FilingInfo]:
         self._record_scope(ticker)
-        self.fetch_latest_calls.append((ticker, form_type))
-        if self.fetch_latest_raises is not None:
-            raise self.fetch_latest_raises
-        return self.queued_filings[0]
-
-    def fetch_one(self, ticker: str, form_type: str, **kwargs: Any):
-        self._record_scope(ticker)
-        self.fetch_one_calls.append((ticker, form_type, kwargs))
-        if self.fetch_latest_raises is not None:
-            raise self.fetch_latest_raises
-        return self.queued_filings[0]
-
-    def fetch(self, ticker: str, form_type: str, **kwargs: Any):
-        self._record_scope(ticker)
-        self.fetch_calls.append((ticker, form_type, kwargs))
-        if self.fetch_raises is not None:
-            raise self.fetch_raises
-        yield from self.queued_filings
+        self.list_calls.append((ticker, form_type, kwargs))
+        if self.list_raises is not None:
+            raise self.list_raises
+        return [
+            FilingInfo(
+                ticker=fid.ticker,
+                form_type=fid.form_type,
+                filing_date=fid.filing_date,
+                accession_number=fid.accession_number,
+                company_name=f"{fid.ticker} Inc.",
+            )
+            for fid, _ in self.queued_filings
+        ]
 
     def list_available_across_forms(
         self,
@@ -169,13 +164,19 @@ class _FakeFetcher:
         self.fetch_content_calls.append(fi)
         if self.fetch_content_raises is not None:
             raise self.fetch_content_raises
+        if fi.accession_number in self.fetch_content_raises_for:
+            raise self.fetch_content_raises_for[fi.accession_number]
+        html = next(
+            (h for fid, h in self.queued_filings if fid.accession_number == fi.accession_number),
+            "<html>body</html>",
+        )
         filing_id = FilingIdentifier(
             ticker=fi.ticker,
             form_type=fi.form_type,
             filing_date=fi.filing_date,
             accession_number=fi.accession_number,
         )
-        return filing_id, "<html>body</html>"
+        return filing_id, html
 
 
 class _FakeOrchestrator:
@@ -362,7 +363,8 @@ class TestAddHappyPath:
         patched_pipeline: dict[str, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """End-to-end ``add AAPL -f 10-K``: fetch_latest path, single store call."""
+        """End-to-end ``add AAPL -f 10-K``: list the newest filing, fetch it,
+        single store call."""
         filing_id = _make_filing_id(ticker="AAPL", form_type="10-K")
 
         original_init = _FakeFetcher.__init__
@@ -381,9 +383,12 @@ class TestAddHappyPath:
         orchestrator = _FakeOrchestrator.instances[-1]
         chroma = _FakeChroma.instances[-1]
 
-        assert fetcher.fetch_latest_calls == [("AAPL", "10-K")]
-        assert fetcher.fetch_one_calls == []
-        assert fetcher.fetch_calls == []
+        assert fetcher.list_calls == [
+            ("AAPL", "10-K", {"count": 1, "year": None, "start_date": None, "end_date": None})
+        ]
+        assert [fi.accession_number for fi in fetcher.fetch_content_calls] == [
+            filing_id.accession_number
+        ]
         assert orchestrator.process_calls == [filing_id]
         # Write goes through the store — not through chroma directly.
         assert store.calls == [(filing_id, False)]
@@ -393,17 +398,16 @@ class TestAddHappyPath:
         assert chroma.stamp.dimension == 1536
         assert "Ingested" in result.output
 
-    def test_with_year_filter_uses_fetch_one(
+    def test_with_year_filter_lists_all_matching(
         self,
         runner: CliRunner,
         app: typer.Typer,
         patched_pipeline: dict[str, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """``add AAPL -f 10-K -y 2023`` (single filter, no count) routes to
-        ``fetch_one`` — not ``fetch_latest`` (filters present) and not
-        ``fetch`` (count effectively 1 with one filter, but since filter
-        narrows the result the CLI falls back to ``fetch`` with count=None)."""
+        """``add AAPL -f 10-K -y 2023`` (a filter, no count) lists every
+        matching filing (``count=None``, capped by ``max_filings`` in the
+        fetcher)."""
         filing_id = _make_filing_id(filing_date=date(2023, 5, 1))
         original_init = _FakeFetcher.__init__
 
@@ -416,19 +420,19 @@ class TestAddHappyPath:
         result = runner.invoke(app, ["ingest", "add", "AAPL", "-f", "10-K", "-y", "2023"])
         assert result.exit_code == 0, result.output
         fetcher = _FakeFetcher.instances[-1]
-        # Filter present without explicit count → "all matching" → fetch().
-        assert fetcher.fetch_calls and fetcher.fetch_calls[0][0] == "AAPL"
-        assert fetcher.fetch_calls[0][2]["year"] == 2023
-        assert fetcher.fetch_calls[0][2]["count"] is None
+        # Filter present without explicit count → "all matching".
+        assert fetcher.list_calls and fetcher.list_calls[0][0] == "AAPL"
+        assert fetcher.list_calls[0][2]["year"] == 2023
+        assert fetcher.list_calls[0][2]["count"] is None
 
-    def test_explicit_number_routes_to_fetch(
+    def test_explicit_number_lists_that_many(
         self,
         runner: CliRunner,
         app: typer.Typer,
         patched_pipeline: dict[str, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """``-n 2`` always uses the streaming ``fetch`` path."""
+        """``-n 2`` lists two filings and streams both through the pipeline."""
         fid_a = _make_filing_id(accession="0000320193-24-000001")
         fid_b = _make_filing_id(
             filing_date=date(2023, 1, 15),
@@ -449,7 +453,8 @@ class TestAddHappyPath:
         result = runner.invoke(app, ["ingest", "add", "AAPL", "-f", "10-K", "-n", "2"])
         assert result.exit_code == 0, result.output
         fetcher = _FakeFetcher.instances[-1]
-        assert fetcher.fetch_calls and fetcher.fetch_calls[0][2]["count"] == 2
+        assert fetcher.list_calls and fetcher.list_calls[0][2]["count"] == 2
+        assert len(fetcher.fetch_content_calls) == 2
 
         store = _FakeStore.instances[-1]
         assert len(store.calls) == 2
@@ -526,6 +531,8 @@ class TestAddEdgeCases:
 
         store = _FakeStore.instances[-1]
         assert store.calls == []  # No write attempted for a duplicate.
+        # F21: listed first, so a duplicate's HTML is never downloaded.
+        assert _FakeFetcher.instances[-1].fetch_content_calls == []
 
     def test_fetch_error_exits_1(
         self,
@@ -534,12 +541,12 @@ class TestAddEdgeCases:
         patched_pipeline: dict[str, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A pre-loop fetch failure exits non-zero with a hint."""
+        """A listing failure exits non-zero with a hint."""
         original_init = _FakeFetcher.__init__
 
         def _seeded_init(self: _FakeFetcher) -> None:
             original_init(self)
-            self.fetch_latest_raises = FetchError("network down", details="EDGAR unreachable")
+            self.list_raises = FetchError("network down", details="EDGAR unreachable")
 
         monkeypatch.setattr(_FakeFetcher, "__init__", _seeded_init)
 
@@ -685,6 +692,154 @@ class TestCompanyCacheScope:
         assert fetcher.fetched_outside_scope == []
 
 
+class TestStreamingIngest:
+    """F21: the CLI lists metadata, then fetches only new filings — one ahead
+    of the filing being processed — instead of downloading every filing's
+    HTML up front."""
+
+    @staticmethod
+    def _three_filings() -> list[FilingIdentifier]:
+        return [
+            _make_filing_id(accession=f"0000320193-24-00000{i}", filing_date=date(2024, 1, i))
+            for i in (1, 2, 3)
+        ]
+
+    def _seed(self, monkeypatch: pytest.MonkeyPatch, fids: list[FilingIdentifier]) -> None:
+        original_init = _FakeFetcher.__init__
+
+        def _seeded_init(self: _FakeFetcher) -> None:
+            original_init(self)
+            self.queued_filings = [(fid, f"<html>{fid.accession_number}</html>") for fid in fids]
+            self.queued_list = [
+                FilingInfo(
+                    ticker=fid.ticker,
+                    form_type=fid.form_type,
+                    filing_date=fid.filing_date,
+                    accession_number=fid.accession_number,
+                    company_name="Apple Inc.",
+                )
+                for fid in fids
+            ]
+
+        monkeypatch.setattr(_FakeFetcher, "__init__", _seeded_init)
+
+    def _assert_overlap(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fids: list[FilingIdentifier],
+    ) -> list[bool]:
+        """While filing 1 is processed, filing 2 must already be downloading."""
+        overlap: list[bool] = []
+        original_process = _FakeOrchestrator.process_filing
+
+        def _process(self, filing_id, html, progress_callback=None):
+            if filing_id == fids[0]:
+                fetcher = _FakeFetcher.instances[-1]
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if any(
+                        fi.accession_number == fids[1].accession_number
+                        for fi in fetcher.fetch_content_calls
+                    ):
+                        break
+                    time.sleep(0.005)
+                overlap.append(
+                    any(
+                        fi.accession_number == fids[1].accession_number
+                        for fi in fetcher.fetch_content_calls
+                    )
+                )
+            return original_process(self, filing_id, html, progress_callback)
+
+        monkeypatch.setattr(_FakeOrchestrator, "process_filing", _process)
+        return overlap
+
+    def test_per_form_path_fetches_the_next_filing_during_processing(
+        self,
+        runner: CliRunner,
+        app: typer.Typer,
+        patched_pipeline: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fids = self._three_filings()
+        self._seed(monkeypatch, fids)
+        overlap = self._assert_overlap(monkeypatch, fids)
+
+        result = runner.invoke(app, ["ingest", "add", "AAPL", "-f", "10-K", "-n", "3"])
+        assert result.exit_code == 0, result.output
+        assert overlap == [True]
+        assert [fid for fid, _ in _FakeStore.instances[-1].calls] == fids
+
+    def test_cross_form_path_fetches_the_next_filing_during_processing(
+        self,
+        runner: CliRunner,
+        app: typer.Typer,
+        patched_pipeline: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fids = self._three_filings()
+        self._seed(monkeypatch, fids)
+        overlap = self._assert_overlap(monkeypatch, fids)
+
+        result = runner.invoke(app, ["ingest", "add", "AAPL", "-t", "3"])
+        assert result.exit_code == 0, result.output
+        assert overlap == [True]
+        assert [fid for fid, _ in _FakeStore.instances[-1].calls] == fids
+
+    @pytest.mark.parametrize(
+        "flags", [["-f", "10-K", "-n", "3"], ["-t", "3"]], ids=["per-form", "cross-form"]
+    )
+    def test_a_duplicate_after_a_new_filing_is_never_prefetched(
+        self,
+        flags: list[str],
+        runner: CliRunner,
+        app: typer.Typer,
+        patched_pipeline: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fids = self._three_filings()
+        self._seed(monkeypatch, fids)
+        original_registry_init = _FakeRegistry.__init__
+
+        def _second_is_known(self: _FakeRegistry, *args: Any, **kwargs: Any) -> None:
+            original_registry_init(self, *args, **kwargs)
+            self.existing = {fids[1].accession_number}
+
+        monkeypatch.setattr(_FakeRegistry, "__init__", _second_is_known)
+
+        result = runner.invoke(app, ["ingest", "add", "AAPL", *flags])
+        assert result.exit_code == 0, result.output
+        fetched = [fi.accession_number for fi in _FakeFetcher.instances[-1].fetch_content_calls]
+        assert fetched == [fids[0].accession_number, fids[2].accession_number]
+
+    def test_a_failed_filing_fetch_is_reported_and_the_run_continues(
+        self,
+        runner: CliRunner,
+        app: typer.Typer,
+        patched_pipeline: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Before F21 ``fetch()`` logged and silently dropped such a filing;
+        now it is a visible, counted failure, like the cross-form path."""
+        fids = self._three_filings()
+        self._seed(monkeypatch, fids)
+        original_init = _FakeFetcher.__init__
+
+        def _failing_second(self: _FakeFetcher) -> None:
+            original_init(self)
+            self.fetch_content_raises_for = {
+                fids[1].accession_number: FetchError("Empty HTML content received")
+            }
+
+        monkeypatch.setattr(_FakeFetcher, "__init__", _failing_second)
+
+        result = runner.invoke(app, ["ingest", "add", "AAPL", "-f", "10-K", "-n", "3"])
+        assert result.exit_code == 0, result.output
+        assert "Fetch failed [2/3]" in result.output
+        assert [fid for fid, _ in _FakeStore.instances[-1].calls] == [fids[0], fids[2]]
+        assert "1 failed" in result.output
+
+
 # ---------------------------------------------------------------------------
 # batch — happy path
 # ---------------------------------------------------------------------------
@@ -707,17 +862,17 @@ class TestBatchHappyPath:
 
         def _seeded_init(self: _FakeFetcher) -> None:
             original_init(self)
-            # Both tickers share the same fetcher; the CLI calls fetch_latest
-            # once per ticker, so we cycle through queued returns by ticker.
+            # Both tickers share the same fetcher; the CLI lists once per
+            # ticker, so serve each ticker its own filing.
             calls["count"] = 0
+            original_list = self.list_available
 
-            def _next_filing(ticker: str, form: str):
-                self.fetch_latest_calls.append((ticker, form))
-                if ticker == "AAPL":
-                    return fid_aapl, "<html>aapl</html>"
-                return fid_msft, "<html>msft</html>"
+            def _list_for(ticker: str, form: str, **kwargs: Any) -> list[FilingInfo]:
+                fid = fid_aapl if ticker == "AAPL" else fid_msft
+                self.queued_filings = [(fid, f"<html>{ticker.lower()}</html>")]
+                return original_list(ticker, form, **kwargs)
 
-            self.fetch_latest = _next_filing  # type: ignore[assignment]
+            self.list_available = _list_for  # type: ignore[method-assign]
 
         monkeypatch.setattr(_FakeFetcher, "__init__", _seeded_init)
 
