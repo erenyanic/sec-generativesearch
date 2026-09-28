@@ -76,13 +76,25 @@ function upstreamOrderHasError(entries: string[]): boolean {
 // — the backend catalogue is the single source of truth. This control does
 // NOT fetch or look anything up: it only EXPLAINS what the tier words mean
 // so an operator who sees "premium" on a model row knows the cost band.
-// Thresholds mirror the 14.3 contract (per 1M output tokens).
-const PRICING_TIERS: ReadonlyArray<{ tier: string; blurb: string }> = [
-  { tier: "Free", blurb: "No charge for output tokens." },
-  { tier: "Low", blurb: "Under $2 per 1M output tokens." },
-  { tier: "Standard", blurb: "Under $5 per 1M output tokens." },
-  { tier: "High", blurb: "Under $10 per 1M output tokens." },
-  { tier: "Premium", blurb: "$10 or more per 1M output tokens." },
+//
+// The tier is derived from the BLENDED price — the mean of the input and
+// output USD per 1M tokens — by `derive_pricing_tier` in
+// `src/sec_generative_search/core/types.py`. These upper bounds MUST equal
+// its `_PRICING_TIER_BLENDED_BOUNDS` (Low / Standard / High; Premium is at
+// or above the last); `tests/core/test_types.py` fails the build when the
+// two drift, and `tests/security/model-picker.test.tsx` pins the rendered
+// numbers.
+export const PRICING_TIER_BLENDED_BOUNDS_USD = [1, 4, 15] as const;
+
+const [LOW_BELOW, STANDARD_BELOW, HIGH_BELOW] = PRICING_TIER_BLENDED_BOUNDS_USD;
+const BLENDED = "per 1M tokens, blended (mean of input and output price)";
+
+export const PRICING_TIERS: ReadonlyArray<{ tier: string; blurb: string }> = [
+  { tier: "Free", blurb: "No per-token cost (e.g. a model server you host)." },
+  { tier: "Low", blurb: `Under $${LOW_BELOW} ${BLENDED}.` },
+  { tier: "Standard", blurb: `$${LOW_BELOW} to under $${STANDARD_BELOW} ${BLENDED}.` },
+  { tier: "High", blurb: `$${STANDARD_BELOW} to under $${HIGH_BELOW} ${BLENDED}.` },
+  { tier: "Premium", blurb: `$${HIGH_BELOW} or more ${BLENDED}.` },
   {
     tier: "Unknown",
     blurb:

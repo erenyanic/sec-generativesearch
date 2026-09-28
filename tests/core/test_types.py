@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, fields
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pytest
 
@@ -641,3 +642,43 @@ class TestNoCredentialFieldsOnDomainTypes:
                     f"{cls.__name__}.{f.name} looks credential-bearing; "
                     "domain types must not carry secrets."
                 )
+
+
+class TestPricingTierHelpTextMatchesTheTierFunction:
+    """F37: the web model-picker explains the tiers to users.  It said "Under
+    $2 / $5 / $10 per 1M output tokens" while ``derive_pricing_tier`` buckets
+    the *blended* mean at 1 / 4 / 15 USD — and nothing failed when the two
+    disagreed.  The legend now derives from one named constant that must
+    equal ``_PRICING_TIER_BLENDED_BOUNDS``; this lock reads it from the TSX."""
+
+    _PICKER = (
+        Path(__file__).resolve().parents[2] / "frontend" / "src" / "components" / "model-picker.tsx"
+    )
+
+    def _frontend_bounds(self) -> list[float]:
+        import re
+
+        source = self._PICKER.read_text(encoding="utf-8")
+        match = re.search(
+            r"export const PRICING_TIER_BLENDED_BOUNDS_USD = \[([^\]]*)\] as const;", source
+        )
+        assert match, "PRICING_TIER_BLENDED_BOUNDS_USD not found in model-picker.tsx"
+        return [float(v) for v in match.group(1).split(",")]
+
+    def test_frontend_bounds_equal_the_backend_bounds(self) -> None:
+        from sec_generative_search.core.types import _PRICING_TIER_BLENDED_BOUNDS
+
+        assert self._frontend_bounds() == [bound for bound, _ in _PRICING_TIER_BLENDED_BOUNDS]
+
+    def test_bounds_split_the_tiers_the_legend_names(self) -> None:
+        """Each legend band agrees with the function at its edges."""
+        from sec_generative_search.core.types import derive_pricing_tier
+
+        low, standard, high = self._frontend_bounds()
+        assert derive_pricing_tier(0.0, 0.0) is PricingTier.FREE
+        assert derive_pricing_tier(low - 0.01, low - 0.01) is PricingTier.LOW
+        assert derive_pricing_tier(low, low) is PricingTier.STANDARD
+        assert derive_pricing_tier(standard, standard) is PricingTier.HIGH
+        assert derive_pricing_tier(high, high) is PricingTier.PREMIUM
+        # Blended, not output-only: cheap input pulls an expensive output down.
+        assert derive_pricing_tier(0.5, 7.0) is PricingTier.STANDARD
