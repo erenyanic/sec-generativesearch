@@ -183,14 +183,15 @@ def build_embedder(
         # this, EMBEDDING_DEVICE / EMBEDDING_BATCH_SIZE are silently ignored
         # and a GPU deployment pinned to "cuda" falls back to the CPU.
         # Hosted adapters never receive them (the settings validator rejects
-        # them for a hosted provider). ``idle_timeout_minutes`` is deliberately
-        # NOT forwarded yet: idle unload can null the model mid-encode
-        # (OPTIMIZATIONS.md F15) — wire it together with that fix.
+        # them for a hosted provider). ``idle_timeout_minutes`` is safe to
+        # honour because an unload now refuses while an encode is in flight
+        # (OPTIMIZATIONS.md F15).
         return provider_cls(
             api_key,
             model=settings.model_name,
             device=settings.device,
             batch_size=settings.batch_size,
+            idle_timeout_minutes=settings.idle_timeout_minutes,
         )
     # Hosted embedders: PROVIDER_TIMEOUT + the background retry budget.
     return provider_cls(

@@ -33,6 +33,13 @@ Key design choices:
   spawn a background ``Timer`` thread — that would complicate teardown
   and fixture state without any operational benefit.
 
+- An unload never races an encode.  Each encode takes its model
+  reference and bumps an in-flight counter under ``self._load_lock``,
+  and :meth:`unload` refuses while that counter is non-zero, so a
+  caller-driven unload (a task-poll sweep) can no longer null the
+  model between the load check and ``encode`` — the ``None.encode``
+  ``AttributeError`` the idle unload used to risk.
+
 The provider is stateless with respect to per-call input: nothing from
 :meth:`embed_texts` is cached across calls.
 """
@@ -183,7 +190,10 @@ class LocalEmbeddingProvider(BaseEmbeddingProvider):
         self._model: Any = None
         self._resolved_device: str | None = None
         self._last_used: float | None = None
+        # Guards the model reference, the idle timestamp and the in-flight
+        # count. Encodes run *outside* it on a reference taken under it.
         self._load_lock = threading.Lock()
+        self._in_flight = 0
 
     # ------------------------------------------------------------------
     # Public API — BaseEmbeddingProvider
@@ -217,14 +227,7 @@ class LocalEmbeddingProvider(BaseEmbeddingProvider):
         if not texts:
             return np.zeros((0, self.get_dimension()), dtype=np.float32)
 
-        self._ensure_model()
-        vectors = self._model.encode(
-            texts,
-            batch_size=self._batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
-        self._mark_used()
+        vectors = self._encode(texts, show_progress_bar=False)
         return np.asarray(vectors, dtype=np.float32)
 
     def embed_query(self, text: str) -> np.ndarray:
@@ -246,14 +249,7 @@ class LocalEmbeddingProvider(BaseEmbeddingProvider):
         if not chunks:
             return np.zeros((0, self.get_dimension()), dtype=np.float32)
 
-        self._ensure_model()
-        vectors = self._model.encode(
-            [c.content for c in chunks],
-            batch_size=self._batch_size,
-            show_progress_bar=show_progress,
-            convert_to_numpy=True,
-        )
-        self._mark_used()
+        vectors = self._encode([c.content for c in chunks], show_progress_bar=show_progress)
         return np.asarray(vectors, dtype=np.float32)
 
     def get_dimension(self) -> int:
@@ -287,84 +283,125 @@ class LocalEmbeddingProvider(BaseEmbeddingProvider):
         Returns ``True`` when an unload actually happened.
 
         Disabled when ``idle_timeout_minutes == 0`` or when the model
-        has never been loaded.  The clock source is injectable via the
-        constructor so tests do not need to sleep.
+        has never been loaded, and never fires while an encode is in
+        flight — the threshold check and the unload happen under one
+        acquisition of the load lock, so an encode cannot start in
+        between.  The clock source is injectable via the constructor so
+        tests do not need to sleep.
         """
         if self._idle_timeout_seconds == 0:
             return False
-        if self._model is None or self._last_used is None:
-            return False
-        current = now if now is not None else self._clock()
-        if current - self._last_used < self._idle_timeout_seconds:
-            return False
-        self.unload()
-        return True
+        with self._load_lock:
+            if self._model is None or self._last_used is None or self._in_flight:
+                return False
+            current = now if now is not None else self._clock()
+            if current - self._last_used < self._idle_timeout_seconds:
+                return False
+            self._unload_locked()
+            return True
 
-    def unload(self) -> None:
+    def unload(self) -> bool:
         """Drop the model reference and empty the CUDA cache if present.
 
-        Safe to call when the model was never loaded.  The cache flush
-        is best-effort — failures to import torch or talk to the driver
-        are logged and swallowed so ingestion teardown never raises
-        from a cleanup hook.
+        Returns ``True`` when a model was released.  A no-op (``False``)
+        when the model was never loaded **or an encode is in flight** —
+        the running encode keeps its own reference, so unloading under
+        it would free nothing and the next encode would reload at once.
+        The cache flush is best-effort — failures to import torch or
+        talk to the driver are logged and swallowed so ingestion
+        teardown never raises from a cleanup hook.
         """
         with self._load_lock:
-            if self._model is None:
-                return
-            logger.info(
-                "LocalEmbeddingProvider: unloading model=%s (device=%s)",
-                self._model_slug,
-                self._resolved_device,
-            )
-            self._model = None
-            self._last_used = None
-            self._resolved_device = None
-            self._try_empty_cuda_cache()
+            if self._model is None or self._in_flight:
+                return False
+            self._unload_locked()
+            return True
 
     # ------------------------------------------------------------------
     # Internals — model load, device resolution, quantisation
     # ------------------------------------------------------------------
 
-    def _ensure_model(self) -> None:
-        """Lazy, thread-safe model load.
+    def _encode(self, texts: list[str], *, show_progress_bar: bool) -> Any:
+        """Encode *texts* on a model reference no unload can pull away.
 
-        The double-checked pattern avoids acquiring the lock on the hot
-        path once the model is loaded.  All network / filesystem I/O is
-        owned by the injected loader; this method is responsible only
-        for device resolution and optional quantisation.
+        The reference is taken and the in-flight count raised under the
+        load lock (loading first if needed); the encode itself runs
+        outside it so concurrent callers and ``is_loaded`` probes never
+        queue behind a long batch.  The idle timer is refreshed at both
+        ends, and the count is dropped in ``finally`` so a failing
+        encode cannot pin the model resident forever.
+        """
+        with self._load_lock:
+            self._ensure_model_locked()
+            model = self._model
+            self._in_flight += 1
+            self._mark_used()
+        try:
+            return model.encode(
+                texts,
+                batch_size=self._batch_size,
+                show_progress_bar=show_progress_bar,
+                convert_to_numpy=True,
+            )
+        finally:
+            with self._load_lock:
+                self._in_flight -= 1
+                self._mark_used()
+
+    def _unload_locked(self) -> None:
+        """Release the model.  Caller holds ``self._load_lock``."""
+        logger.info(
+            "LocalEmbeddingProvider: unloading model=%s (device=%s)",
+            self._model_slug,
+            self._resolved_device,
+        )
+        self._model = None
+        self._last_used = None
+        self._resolved_device = None
+        self._try_empty_cuda_cache()
+
+    def _ensure_model(self) -> None:
+        """Lazy, thread-safe model load (``validate_key`` / ``warm_up``)."""
+        with self._load_lock:
+            self._ensure_model_locked()
+
+    def _ensure_model_locked(self) -> None:
+        """Load the model if absent.  Caller holds ``self._load_lock``.
+
+        Holding the lock across the load makes concurrent first calls
+        single-flight.  All network / filesystem I/O is owned by the
+        injected loader; this method is responsible only for device
+        resolution and optional quantisation.
         """
         if self._model is not None:
             return
-        with self._load_lock:
-            if self._model is not None:
-                return
 
-            resolved_device = self._resolve_device(self._device_preference)
-            loader = self._loader or self._default_loader
-            token = self._api_key if self._has_hf_token else None
+        resolved_device = self._resolve_device(self._device_preference)
+        loader = self._loader or self._default_loader
+        token = self._api_key if self._has_hf_token else None
 
-            model = loader(
-                model_name=self._model_slug,
-                device=resolved_device,
-                token=token,
-            )
+        model = loader(
+            model_name=self._model_slug,
+            device=resolved_device,
+            token=token,
+        )
 
-            if self._quantise_on_cuda and self._is_cuda(resolved_device):
-                model = self._to_bfloat16(model)
+        if self._quantise_on_cuda and self._is_cuda(resolved_device):
+            model = self._to_bfloat16(model)
 
-            self._model = model
-            self._resolved_device = resolved_device
-            self._mark_used()
+        self._model = model
+        self._resolved_device = resolved_device
+        self._mark_used()
 
-            logger.info(
-                "LocalEmbeddingProvider: loaded model=%s (device=%s, quantised=%s)",
-                self._model_slug,
-                resolved_device,
-                self._quantise_on_cuda and self._is_cuda(resolved_device),
-            )
+        logger.info(
+            "LocalEmbeddingProvider: loaded model=%s (device=%s, quantised=%s)",
+            self._model_slug,
+            resolved_device,
+            self._quantise_on_cuda and self._is_cuda(resolved_device),
+        )
 
     def _mark_used(self) -> None:
-        """Refresh the idle timer.  Called on every successful embed."""
+        """Refresh the idle timer.  Caller holds ``self._load_lock``."""
         self._last_used = self._clock()
 
     @staticmethod

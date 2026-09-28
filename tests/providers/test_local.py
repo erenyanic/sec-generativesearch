@@ -18,7 +18,8 @@ Coverage map:
   available, else CPU.  Explicit ``"cpu"`` / ``"cuda"`` pass through.
 - BF16 quantisation is applied on CUDA only and opt-out via
   ``quantise_on_cuda=False``.
-- Idle unload: ``maybe_unload`` honours the timeout, is a no-op when
+- Idle unload: ``maybe_unload`` honours the timeout, never fires while an
+  encode is in flight (F15), is a no-op when
   disabled, and releases the model reference.
 - Empty-input short-circuit: ``embed_texts([])`` returns an empty
   ``(0, dimension)`` array without loading the model.
@@ -593,6 +594,192 @@ class TestIdleUnload:
         # ``now`` is in the far future: caller forces a unload decision.
         assert provider.maybe_unload(now=clock.now + 1_000_000) is True
         assert not provider.is_loaded
+
+
+# ---------------------------------------------------------------------------
+# F15 — an idle unload must never pull the model out from under an encode
+# ---------------------------------------------------------------------------
+
+
+class _BlockingModel(_StubModel):
+    """Stub whose ``encode`` parks until released, so a test can act mid-encode."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def encode(self, texts: list[str], **kwargs: Any) -> Any:
+        self.entered.set()
+        assert self.release.wait(timeout=5.0), "test never released the encode"
+        return super().encode(texts, **kwargs)
+
+
+class _FailingModel(_StubModel):
+    def encode(self, texts: list[str], **kwargs: Any) -> Any:
+        raise RuntimeError("CUDA out of memory")
+
+
+def _run_in_thread(fn: Any) -> tuple[threading.Thread, list[BaseException]]:
+    errors: list[BaseException] = []
+
+    def _target() -> None:
+        try:
+            fn()
+        except BaseException as exc:  # recorded, asserted by the caller
+            errors.append(exc)
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    return thread, errors
+
+
+class TestIdleUnloadInFlightGuard:
+    """``maybe_unload`` fires on every ingest-task poll; before F15 it could
+    null ``_model`` between the load check and ``encode`` (a 500 on search)."""
+
+    @staticmethod
+    def _provider(model: _StubModel, clock: _ManualClock) -> LocalEmbeddingProvider:
+        return LocalEmbeddingProvider(
+            loader=_StubLoader(model=model),
+            device="cpu",
+            idle_timeout_minutes=15,
+            clock=clock,
+        )
+
+    @pytest.mark.security
+    def test_maybe_unload_refuses_while_an_encode_is_in_flight(self) -> None:
+        clock = _ManualClock()
+        model = _BlockingModel()
+        provider = self._provider(model, clock)
+
+        thread, errors = _run_in_thread(lambda: provider.embed_texts(["slow"]))
+        assert model.entered.wait(timeout=5.0)
+        clock.tick(15 * 60 + 1)  # idle window elapses mid-encode
+
+        assert provider.maybe_unload() is False
+        assert provider.is_loaded
+
+        model.release.set()
+        thread.join(timeout=5.0)
+        assert errors == []
+        # Once the encode has finished the idle clock restarts from its end.
+        assert provider.maybe_unload() is False
+        clock.tick(15 * 60 + 1)
+        assert provider.maybe_unload() is True
+        assert not provider.is_loaded
+
+    @pytest.mark.security
+    def test_embed_chunks_is_guarded_too(self) -> None:
+        clock = _ManualClock()
+        model = _BlockingModel()
+        provider = self._provider(model, clock)
+        chunk = Chunk(
+            content="slow",
+            path="Part I",
+            content_type=ContentType.TEXT,
+            filing_id=FilingIdentifier(
+                ticker="AAPL",
+                form_type="10-K",
+                filing_date=date(2024, 1, 1),
+                accession_number="0000320193-24-000001",
+            ),
+            chunk_index=0,
+        )
+
+        thread, errors = _run_in_thread(lambda: provider.embed_chunks([chunk]))
+        assert model.entered.wait(timeout=5.0)
+        assert provider.maybe_unload(now=clock.now + 1_000_000) is False
+        model.release.set()
+        thread.join(timeout=5.0)
+        assert errors == []
+        assert provider.is_loaded
+
+    def test_explicit_unload_refuses_while_an_encode_is_in_flight(self) -> None:
+        clock = _ManualClock()
+        model = _BlockingModel()
+        provider = self._provider(model, clock)
+
+        thread, errors = _run_in_thread(lambda: provider.embed_texts(["slow"]))
+        assert model.entered.wait(timeout=5.0)
+        assert provider.unload() is False
+        assert provider.is_loaded
+
+        model.release.set()
+        thread.join(timeout=5.0)
+        assert errors == []
+        assert provider.unload() is True
+        assert not provider.is_loaded
+
+    def test_failed_encode_does_not_pin_the_model(self) -> None:
+        clock = _ManualClock()
+        provider = self._provider(_FailingModel(), clock)
+
+        with pytest.raises(RuntimeError, match="out of memory"):
+            provider.embed_texts(["x"])
+
+        clock.tick(15 * 60 + 1)
+        assert provider.maybe_unload() is True
+        assert not provider.is_loaded
+
+    @pytest.mark.security
+    def test_poll_unload_between_load_check_and_encode_is_harmless(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The literal F15 interleaving: a task-poll unload lands after the
+        embed has confirmed the model is resident but before it encodes.
+
+        Pre-F15 that unload completed and ``encode`` ran on ``None``
+        (``AttributeError`` → a 500 on search).  Now the check, the model
+        reference and the in-flight count are taken under the load lock,
+        so the poll waits for it and then refuses (encode in flight) or
+        unloads after the encode — never in between.
+        """
+        provider = LocalEmbeddingProvider(
+            loader=_StubLoader(), device="cpu", idle_timeout_minutes=1
+        )
+        provider.embed_texts(["warm"])
+        original = provider._ensure_model_locked
+        polls: list[threading.Thread] = []
+        poll_errors: list[BaseException] = []
+
+        def _check_then_poll() -> None:
+            original()
+            poll, errors = _run_in_thread(lambda: provider.maybe_unload(now=float("inf")))
+            poll.join(timeout=0.2)  # pre-F15 the unload completed inside this window
+            polls.append(poll)
+            poll_errors.extend(errors)
+
+        monkeypatch.setattr(provider, "_ensure_model_locked", _check_then_poll)
+
+        assert provider.embed_texts(["q"]).shape == (1, _DIM)
+        for poll in polls:
+            poll.join(timeout=5.0)
+        assert polls and poll_errors == []
+
+    @pytest.mark.security
+    def test_load_check_and_in_flight_count_are_one_critical_section(self) -> None:
+        """Every release of the load lock during an embed must already count
+        the encode in flight — a release in between (check, release, then
+        take the reference) re-opens the window the test above forces."""
+        provider = LocalEmbeddingProvider(
+            loader=_StubLoader(), device="cpu", idle_timeout_minutes=1
+        )
+        real_lock = threading.Lock()
+        in_flight_at_release: list[int] = []
+
+        class _AuditedLock:
+            def __enter__(self) -> None:
+                real_lock.acquire()
+
+            def __exit__(self, *_exc: object) -> None:
+                in_flight_at_release.append(provider._in_flight)
+                real_lock.release()
+
+        provider._load_lock = _AuditedLock()  # type: ignore[assignment]
+        provider.embed_texts(["cold"])  # includes the first load
+        provider.embed_texts(["warm"])
+        assert in_flight_at_release == [1, 0, 1, 0]
 
 
 # ---------------------------------------------------------------------------

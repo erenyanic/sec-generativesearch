@@ -1046,12 +1046,11 @@ class TestRemovedKnobsAreIgnored:
         assert {"host", "port"}.isdisjoint(ApiSettings.model_fields)
 
 
-# Fields read only inside ``settings.py`` itself, or deliberately parked.
+# Fields read only inside ``settings.py`` itself (by a validator).
 _READER_ALLOW_LIST = {
     ("database", "encryption_key_file"): "resolved into encryption_key by a validator",
     ("api", "auth_pepper_file"): "resolved into auth_pepper by a validator",
     ("local_llm", "allow_non_local"): "read by the loopback host-policy validator",
-    ("embedding", "idle_timeout_minutes"): "parked until the F15 in-flight guard lands",
 }
 
 
@@ -1099,8 +1098,6 @@ class TestEverySettingHasAReader:
             Path(__file__).resolve().parents[2] / "src/sec_generative_search/config/settings.py"
         ).read_text(encoding="utf-8")
         for (_section, field), _why in _READER_ALLOW_LIST.items():
-            if field == "idle_timeout_minutes":
-                continue  # parked, not consumed — see the reason above
             assert text.count(f"self.{field}") + text.count(f'"{field}"') >= 1, field
 
 

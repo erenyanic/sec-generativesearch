@@ -364,14 +364,14 @@ class TestBuildEmbedderForwardsLocalKnobs:
             idle_timeout_minutes=5,
         )
         build_embedder(settings, api_key_resolver=lambda _name: None)
-        # idle_timeout_minutes is deliberately NOT forwarded until the
-        # idle-unload race (OPTIMIZATIONS.md F15) is fixed.
+        # idle_timeout_minutes is forwarded since the F15 in-flight guard.
         assert calls == [
             {
                 "api_key": None,
                 "model": "google/embeddinggemma-300m",
                 "device": "cuda",
                 "batch_size": 8,
+                "idle_timeout_minutes": 5,
             }
         ]
 
