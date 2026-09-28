@@ -329,8 +329,11 @@ class FilingFetcher:
         try:
             company = Company(key)
         except Exception as e:
+            # The message is logged by callers (``exc.message``), so it must
+            # not name the ticker — that would bypass LOG_REDACT_QUERIES.  A
+            # caller that shows the error to an operator names it itself.
             raise FetchError(
-                f"Invalid ticker symbol: {ticker}",
+                "Invalid ticker symbol or EDGAR lookup failed",
                 details=str(e),
             ) from e
         if companies is not None:

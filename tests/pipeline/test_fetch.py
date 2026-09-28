@@ -417,3 +417,76 @@ class TestCompanyCache:
         listed = fetcher.list_available_across_forms("AAPL", ("10-K", "10-Q", "8-K"), count=5)
         assert len(listed) == 5
         assert counting_company == ["AAPL"]
+
+
+# ---------------------------------------------------------------------------
+# A FetchError *message* never carries a ticker (callers log ``.message``)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.security
+class TestFetchErrorMessagesCarryNoTicker:
+    """``TaskManager._build_work_list`` logs ``exc.message`` beside an already
+    redacted ticker, so a message that embeds the symbol re-leaks it under
+    ``LOG_REDACT_QUERIES`` — out of reach of both the accession filter and
+    the static ticker call-site lock (``exc.message`` is not a ticker
+    carrier).  ``_get_company`` did exactly that ("Invalid ticker symbol:
+    NVDA"), and a transient EDGAR failure raises it for a *valid* ticker."""
+
+    def test_work_list_build_logs_no_raw_ticker_when_company_lookup_fails(
+        self,
+        fetcher: FilingFetcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from sec_generative_search.api.tasks import TaskInfo, TaskManager
+
+        monkeypatch.setenv("LOG_REDACT_QUERIES", "1")
+        ticker = "ZQXW"
+
+        def _unreachable(_ticker: str) -> object:
+            raise ConnectionError("EDGAR unreachable")
+
+        monkeypatch.setattr(fetch_module, "Company", _unreachable)
+        manager = TaskManager.__new__(TaskManager)  # only the build path is used
+        manager._fetcher = fetcher
+        info = TaskInfo(task_id="f" * 32, tickers=[ticker], form_types=["10-K", "10-Q"])
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.DEBUG)
+        handler.addFilter(AccessionRedactionFilter())
+        package_logger = logging.getLogger(LOGGER_NAME)
+        prior_level = package_logger.level
+        package_logger.addHandler(handler)
+        package_logger.setLevel(logging.DEBUG)
+        try:
+            assert manager._build_work_list(info) == []
+        finally:
+            package_logger.removeHandler(handler)
+            package_logger.setLevel(prior_level)
+
+        emitted = stream.getvalue()
+        assert "fetch failed" in emitted  # the failure is still logged…
+        assert ticker not in emitted  # …without the symbol
+
+    def test_no_fetch_error_message_interpolates_a_ticker(self) -> None:
+        """Static companion: every ``FetchError(...)`` built in ``fetch.py``
+        keeps ``ticker`` out of its first (message) argument."""
+        import ast
+        from pathlib import Path
+
+        source = Path(fetch_module.__file__).read_text(encoding="utf-8")
+        offenders: list[int] = []
+        for node in ast.walk(ast.parse(source)):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "FetchError"
+                and node.args
+            ):
+                continue
+            names = {n.id for n in ast.walk(node.args[0]) if isinstance(n, ast.Name)}
+            attrs = {n.attr for n in ast.walk(node.args[0]) if isinstance(n, ast.Attribute)}
+            if {"ticker", "tickers"} & (names | attrs):
+                offenders.append(node.lineno)
+        assert offenders == [], f"FetchError messages interpolating a ticker at lines {offenders}"

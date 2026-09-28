@@ -339,7 +339,7 @@ def _ingest_one_form(
     except FetchError as exc:
         progress.stop()
         _print_error(
-            "Fetch failed",
+            f"Fetch failed for {ticker} {form_type}",
             exc.message,
             details=exc.details,
             hint="Check the ticker symbol is valid and you have an internet connection.",
@@ -525,7 +525,7 @@ def _ingest_across_forms(
         )
     except FetchError as exc:
         _print_error(
-            "Listing failed",
+            f"Listing failed for {ticker}",
             exc.message,
             details=exc.details,
             hint="Check the ticker symbol is valid and you have an internet connection.",

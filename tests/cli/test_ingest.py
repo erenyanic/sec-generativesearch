@@ -545,7 +545,9 @@ class TestAddEdgeCases:
 
         result = runner.invoke(app, ["ingest", "add", "AAPL", "-f", "10-K"])
         assert result.exit_code == 1
-        assert "Fetch failed" in result.output
+        # The fetcher's message no longer names the ticker (it is logged by
+        # the API worker); the operator's console still does.
+        assert "Fetch failed for AAPL 10-K" in result.output
         assert "network down" in result.output
 
     def test_storage_error_exits_1(
