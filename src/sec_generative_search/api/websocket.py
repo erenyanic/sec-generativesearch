@@ -76,8 +76,10 @@ Disconnect handling: the worker thread is decoupled from the consumer
 via :class:`asyncio.Queue`; a client disconnect during streaming raises
 :class:`WebSocketDisconnect`, the route releases its resources, and the
 worker continues to completion.  Reconnecting picks up the current
-state via the snapshot frame plus any queued events that have not yet
-been drained.
+state via the snapshot frame plus the queued events that have not yet
+been drained — the most recent ``_MESSAGE_QUEUE_MAXSIZE`` of them, since
+the per-task queue drops its oldest frame at capacity (the terminal
+frame is always the newest, so it survives).
 """
 
 from __future__ import annotations
@@ -93,7 +95,7 @@ from sec_generative_search.api.dependencies import (
     SESSION_COOKIE_NAME,
     is_valid_session_id_shape,
 )
-from sec_generative_search.api.tasks import TaskInfo, TaskManager, TaskState
+from sec_generative_search.api.tasks import TaskInfo, TaskManager, TaskState, new_message_queue
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.logging import audit_log, get_logger
 from sec_generative_search.core.security import mask_secret
@@ -436,7 +438,7 @@ async def _stream_loop(websocket: WebSocket, info: TaskInfo) -> None:
     # we need a queue to ``get()`` from.  Constructing here is safe
     # because we are already on the async loop.
     if info._message_queue is None:
-        info._message_queue = asyncio.Queue()
+        info._message_queue = new_message_queue()
 
     queue = info._message_queue
 

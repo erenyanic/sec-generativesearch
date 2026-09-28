@@ -43,11 +43,14 @@ from starlette.websockets import WebSocketDisconnect
 
 from sec_generative_search.api.app import create_app
 from sec_generative_search.api.tasks import (
+    _MESSAGE_QUEUE_MAXSIZE,
     FilingResult,
     TaskInfo,
+    TaskManager,
     TaskProgress,
     TaskState,
 )
+from sec_generative_search.api.websocket import _stream_loop
 from sec_generative_search.config.settings import reload_settings
 from sec_generative_search.core.credentials import InMemorySessionCredentialStore
 from sec_generative_search.core.edgar_identity import InMemorySessionEdgarIdentityStore
@@ -471,6 +474,71 @@ class TestSnapshotAndTerminal:
             assert ws.receive_json()["type"] == "snapshot"
             terminal = ws.receive_json()
             assert terminal["type"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# F19 — bounded per-task queue: reconnect still sees the terminal frame
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSocket:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send_json(self, payload: dict) -> None:
+        self.sent.append(payload)
+
+
+@pytest.mark.security
+class TestBoundedQueueReconnect:
+    def test_overflowed_completed_task_still_delivers_its_terminal_frame(
+        self, ws_app_factory
+    ) -> None:
+        """An unwatched task overflowed its queue; a later reconnect must still
+        get the worker's own terminal frame (with its payload), not a
+        synthesised one — it is the newest frame, so the bound never drops it."""
+        app, manager = ws_app_factory()
+        info = _build_task(state=TaskState.COMPLETED, queue=None)
+        pusher = TaskManager.__new__(TaskManager)  # only ``_push`` is used
+        pusher._loop = None
+        for i in range(2 * _MESSAGE_QUEUE_MAXSIZE):
+            pusher._push(info, {"type": "filing_done", "seq": i})
+        pusher._push(
+            info,
+            {"type": "completed", "results": [{"ticker": "AAPL"}], "summary": {"total": 512}},
+        )
+        assert info._message_queue is not None
+        assert info._message_queue.qsize() == _MESSAGE_QUEUE_MAXSIZE
+        manager.tasks["a" * 32] = info
+
+        client = TestClient(app, base_url="https://testserver")
+        with _connect(client, "a" * 32) as ws:
+            assert ws.receive_json()["type"] == "snapshot"
+            terminal = ws.receive_json()
+            assert terminal == {
+                "type": "completed",
+                "results": [{"ticker": "AAPL"}],
+                "summary": {"total": 512},
+            }
+
+    def test_socket_builds_the_same_bounded_queue(self) -> None:
+        """The first reader of a queue-less running task creates the queue;
+        it must be the bounded one the worker would have built."""
+
+        async def _scenario() -> tuple[int, list[dict]]:
+            info = _build_task(queue=None)
+            socket = _RecordingSocket()
+            reader = asyncio.create_task(_stream_loop(socket, info))  # type: ignore[arg-type]
+            await asyncio.sleep(0)
+            assert info._message_queue is not None
+            maxsize = info._message_queue.maxsize
+            info._message_queue.put_nowait({"type": "cancelled"})
+            await asyncio.wait_for(reader, timeout=5.0)
+            return maxsize, socket.sent
+
+        maxsize, sent = asyncio.run(_scenario())
+        assert maxsize == _MESSAGE_QUEUE_MAXSIZE
+        assert sent == [{"type": "cancelled"}]
 
 
 # ---------------------------------------------------------------------------

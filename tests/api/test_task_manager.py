@@ -38,12 +38,14 @@ import numpy as np
 import pytest
 
 from sec_generative_search.api.tasks import (
+    _MESSAGE_QUEUE_MAXSIZE,
     FilingResult,
     TaskInfo,
     TaskManager,
     TaskProgress,
     TaskQueueFullError,
     TaskState,
+    new_message_queue,
     run_retention_eviction_safe,
 )
 from sec_generative_search.config.settings import reload_settings
@@ -877,6 +879,98 @@ class TestQueueCap:
         manager.shutdown()
         with pytest.raises(TaskQueueFullError):
             manager.create_task(tickers=["AAPL"], form_types=["10-K"])
+
+
+# ---------------------------------------------------------------------------
+# F19 — the per-task WebSocket queue is bounded (oldest frame dropped)
+# ---------------------------------------------------------------------------
+
+
+def _drain_queue(info: TaskInfo) -> list[dict]:
+    assert info._message_queue is not None
+    out: list[dict] = []
+    while not info._message_queue.empty():
+        out.append(info._message_queue.get_nowait())
+    return out
+
+
+@pytest.mark.security
+class TestMessageQueueBound:
+    """The SPA never opens ``/ws/ingest``, so nothing drains this queue in the
+    web deployment; unbounded it held every frame for the 24 h task TTL."""
+
+    def test_unwatched_task_holds_at_most_the_bound(self) -> None:
+        manager, _, _, _, _ = _build_manager()
+        info = TaskInfo(task_id="q" * 32, tickers=["AAPL"], form_types=["10-K"])
+        for i in range(_MESSAGE_QUEUE_MAXSIZE + 44):
+            manager._push(info, {"type": "step", "seq": i})
+        manager._push(info, {"type": "completed", "results": [], "summary": {}})
+
+        frames = _drain_queue(info)
+        assert len(frames) == _MESSAGE_QUEUE_MAXSIZE
+        # The oldest frames went; the newest (and the terminal one) stayed.
+        assert frames[0] == {"type": "step", "seq": 45}
+        assert frames[-2] == {"type": "step", "seq": _MESSAGE_QUEUE_MAXSIZE + 43}
+        assert frames[-1]["type"] == "completed"
+
+    def test_bound_holds_on_the_event_loop_path(self) -> None:
+        """Production path: the worker thread hands frames to the loop via
+        ``call_soon_threadsafe``; the drop must happen there, not raise
+        ``QueueFull`` into the loop's exception handler."""
+        import asyncio
+
+        manager, _, _, _, _ = _build_manager()
+        info = TaskInfo(task_id="r" * 32, tickers=["AAPL"], form_types=["10-K"])
+        loop = asyncio.new_event_loop()
+        loop_errors: list[dict] = []
+        loop.set_exception_handler(lambda _loop, ctx: loop_errors.append(ctx))
+        runner = threading.Thread(target=loop.run_forever, daemon=True)
+        runner.start()
+        try:
+            while not loop.is_running():
+                time.sleep(0.001)
+            manager.set_event_loop(loop)
+            for i in range(3 * _MESSAGE_QUEUE_MAXSIZE):
+                manager._push(info, {"type": "step", "seq": i})
+            manager._push(info, {"type": "failed", "error": "x", "details": None})
+            # Every scheduled put has run once this barrier callback does.
+            asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result(timeout=5.0)
+            frames = asyncio.run_coroutine_threadsafe(_drain_async(info), loop).result(5.0)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            runner.join(timeout=5.0)
+            loop.close()
+
+        assert loop_errors == []
+        assert len(frames) == _MESSAGE_QUEUE_MAXSIZE
+        assert frames[-1]["type"] == "failed"
+        assert frames[0]["seq"] == 3 * _MESSAGE_QUEUE_MAXSIZE - _MESSAGE_QUEUE_MAXSIZE + 1
+
+    def test_large_real_run_keeps_the_terminal_frame(self) -> None:
+        count = _MESSAGE_QUEUE_MAXSIZE + 50
+        infos = [_make_filing_info("AAPL", f"0000320193-23-{i:06d}") for i in range(count)]
+        fetcher = _StubFetcher(work_lists={("AAPL", "10-K"): infos})
+        orchestrator = _StubOrchestrator(
+            by_accession={fi.accession_number: _make_processed_filing(fi) for fi in infos},
+            invoke_progress=True,
+        )
+        manager, store, _, _, _ = _build_manager(fetcher=fetcher, orchestrator=orchestrator)
+
+        task_id = manager.create_task(tickers=["AAPL"], form_types=["10-K"], count=count)
+        info = _wait_for_state(manager, task_id, target=TaskState.COMPLETED, timeout=20.0)
+
+        assert len(store.stored) == count
+        frames = _drain_queue(info)
+        assert len(frames) == _MESSAGE_QUEUE_MAXSIZE
+        assert frames[-1]["type"] == "completed"
+        assert frames[-1]["summary"]["succeeded"] == count
+
+    def test_shared_constructor_is_bounded(self) -> None:
+        assert new_message_queue().maxsize == _MESSAGE_QUEUE_MAXSIZE
+
+
+async def _drain_async(info: TaskInfo) -> list[dict]:
+    return _drain_queue(info)
 
 
 # ---------------------------------------------------------------------------

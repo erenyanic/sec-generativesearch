@@ -75,6 +75,7 @@ cooldown plumbing. This file is the worker substrate they wire onto.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 import uuid
@@ -114,6 +115,7 @@ __all__ = [
     "TaskProgress",
     "TaskQueueFullError",
     "TaskState",
+    "new_message_queue",
     "run_retention_eviction_safe",
 ]
 
@@ -126,6 +128,35 @@ logger = get_logger(__name__)
 # for a day so a polling client can still see the result without a SQLite
 # round-trip. Lazy eviction only — no background thread.
 _TASK_TTL_SECONDS = 86_400  # 24 hours
+
+
+# Frames buffered per task for the ingest WebSocket. The SPA polls
+# ``GET /api/ingest/tasks/{id}`` and never opens the socket, so in the web
+# deployment nothing drains this queue: unbounded, a 500-filing task held
+# ~3 000 frames for the 24 h task TTL. At capacity the *oldest* frame is
+# dropped. A (re)connecting client gets the ``snapshot`` frame for
+# cumulative state first, so a dropped intermediate frame is not
+# observable; the terminal frame is always the last one pushed, so it is
+# always the newest and never dropped.
+_MESSAGE_QUEUE_MAXSIZE = 256
+
+
+def new_message_queue() -> asyncio.Queue:
+    """Build a task's bounded WebSocket queue (worker and socket share it)."""
+    return asyncio.Queue(maxsize=_MESSAGE_QUEUE_MAXSIZE)
+
+
+def _put_dropping_oldest(queue: asyncio.Queue, message: dict) -> None:
+    """Enqueue *message*, evicting the oldest buffered frame when full.
+
+    Runs on the event-loop thread (scheduled via ``call_soon_threadsafe``),
+    or directly when no loop is bound (unit tests) — never as a
+    ``full()`` check on the worker thread racing the loop's consumer.
+    """
+    if queue.full():
+        with contextlib.suppress(asyncio.QueueEmpty):
+            queue.get_nowait()
+    queue.put_nowait(message)
 
 
 # Type alias for the per-task EDGAR identity resolver. Returning ``None``
@@ -328,9 +359,10 @@ class TaskInfo:
     # repeated cancels do not redo a no-op delete pass.
     _stored_accessions: list[str] = field(default_factory=list)
 
-    # WebSocket message queue. Worker thread pushes typed dicts via
+    # WebSocket message queue, bounded by ``new_message_queue`` (oldest
+    # frame dropped at capacity). Worker thread pushes typed dicts via
     # ``call_soon_threadsafe`` when an event loop is bound (the
-    # production path); falls back to a direct ``put_nowait`` when not
+    # production path); falls back to a direct put when not
     # (the unit-test path). The queue is built lazily so creating a
     # task outside an async context does not bind it to a closed loop.
     _message_queue: asyncio.Queue | None = field(default=None, repr=False)
@@ -1197,15 +1229,19 @@ class TaskManager:
         ``TaskInfo.__init__`` (off the worker thread) would either
         require ``asyncio.run`` to be active or fail with "no current
         event loop". Lazy construction sidesteps both.
+
+        The queue is bounded (F19): at capacity the oldest frame is
+        dropped, on the loop thread, so a task nobody watches holds at
+        most ``_MESSAGE_QUEUE_MAXSIZE`` frames instead of every event.
         """
         if info._message_queue is None:
-            info._message_queue = asyncio.Queue()
+            info._message_queue = new_message_queue()
 
         loop = self._loop
         if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(info._message_queue.put_nowait, message)
+            loop.call_soon_threadsafe(_put_dropping_oldest, info._message_queue, message)
         else:
-            info._message_queue.put_nowait(message)
+            _put_dropping_oldest(info._message_queue, message)
 
     # ------------------------------------------------------------------
     # Work list builder
