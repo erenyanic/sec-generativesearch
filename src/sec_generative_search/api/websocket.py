@@ -86,7 +86,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import re
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -99,7 +98,7 @@ from sec_generative_search.api.dependencies import (
 from sec_generative_search.api.tasks import TaskInfo, TaskManager, TaskState, new_message_queue
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.logging import audit_log, get_logger
-from sec_generative_search.core.security import mask_secret
+from sec_generative_search.core.security import mask_secret, secure_compare
 
 __all__ = ["router"]
 
@@ -292,15 +291,16 @@ async def _authenticate_websocket(websocket: WebSocket) -> bool:
     application-supplied header surface; we accept a single ``auth``
     message within ``_AUTH_TIMEOUT_SECONDS``.
 
-    Header comparison uses :func:`hmac.compare_digest` to keep the
-    timing characteristic the same as the HTTP auth path.
+    Both comparisons use :func:`secure_compare` (constant time, like the
+    HTTP auth path, and a plain mismatch — never a ``TypeError`` — for a
+    non-ASCII value, which a JSON ``auth`` frame can carry trivially).
     """
     expected = get_settings().api.key
     if expected is None:
         return True
 
     header_key = websocket.headers.get("x-api-key")
-    if header_key is not None and hmac.compare_digest(header_key, expected):
+    if secure_compare(header_key, expected):
         return True
 
     try:
@@ -325,7 +325,7 @@ async def _authenticate_websocket(websocket: WebSocket) -> bool:
         return False
 
     provided = message.get("api_key")
-    if not isinstance(provided, str) or not hmac.compare_digest(provided, expected):
+    if not isinstance(provided, str) or not secure_compare(provided, expected):
         await _close_unauth(websocket, "Invalid or missing API key")
         return False
 

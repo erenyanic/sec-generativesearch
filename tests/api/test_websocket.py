@@ -272,6 +272,48 @@ class TestApiKeyHandshake:
             ws.receive_json()  # never arrives — close instead
         assert exc.value.code == 4001
 
+    def test_non_ascii_header_is_a_plain_mismatch(self, ws_app_factory) -> None:
+        """A non-ASCII header falls through to the auth message like any wrong
+        key — a bare ``compare_digest`` on ``str`` raised ``TypeError`` here."""
+        app, manager = ws_app_factory(env={"API_KEY": "secret"})
+        manager.tasks["a" * 32] = _build_task(state=TaskState.COMPLETED)
+        client = TestClient(app, base_url="https://testserver")
+        with _connect(client, "a" * 32, headers={"X-API-Key": b"\xe9" * 24}) as ws:
+            ws.send_json({"type": "auth", "api_key": "secret"})  # pragma:allowlist secret
+            assert ws.receive_json()["type"] == "snapshot"
+
+    def test_non_ascii_message_key_closes_4001(self, ws_app_factory) -> None:
+        """A JSON ``auth`` frame carries any Unicode trivially; it must close
+        with the auth code, not crash the handler."""
+        app, _ = ws_app_factory(env={"API_KEY": "secret"})
+        client = TestClient(app, base_url="https://testserver")
+        with pytest.raises(WebSocketDisconnect) as exc, _connect(client, "a" * 32) as ws:
+            ws.send_json({"type": "auth", "api_key": "éécrêt\U0001f511"})  # pragma:allowlist secret
+            ws.receive_json()
+        assert exc.value.code == 4001
+
+    def test_both_paths_compare_through_secure_compare(
+        self, ws_app_factory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Header and message paths both use the constant-time primitive."""
+        import sec_generative_search.api.websocket as ws_module
+
+        seen: list[object] = []
+        real = ws_module.secure_compare
+
+        def _spy(a: object, b: object) -> bool:
+            seen.append(a)
+            return real(a, b)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(ws_module, "secure_compare", _spy)
+        app, manager = ws_app_factory(env={"API_KEY": "secret"})
+        manager.tasks["a" * 32] = _build_task(state=TaskState.COMPLETED)
+        client = TestClient(app, base_url="https://testserver")
+        with _connect(client, "a" * 32, headers={"X-API-Key": "header-guess"}) as ws:
+            ws.send_json({"type": "auth", "api_key": "secret"})  # pragma:allowlist secret
+            assert ws.receive_json()["type"] == "snapshot"
+        assert seen == ["header-guess", "secret"]
+
     def test_first_message_auth_accepted(self, ws_app_factory) -> None:
         app, manager = ws_app_factory(env={"API_KEY": "secret"})
         manager.tasks["a" * 32] = _build_task(state=TaskState.COMPLETED)

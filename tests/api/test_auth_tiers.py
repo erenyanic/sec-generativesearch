@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
+from httpx import Response
 
 from sec_generative_search.api.dependencies import (
     admin_route_dependencies,
@@ -320,3 +323,115 @@ class TestAdminRouteDependencies:
         audit = [r for r in caplog.records if "SECURITY_AUDIT:" in r.getMessage()]
         assert any("admin_denied" in r.getMessage() for r in audit)
         assert any("/sentinel" in r.getMessage() for r in audit)
+
+
+def _get_with_audit(
+    caplog: pytest.LogCaptureFixture, app: FastAPI, headers: dict[str, str | bytes]
+) -> tuple[Response, list[str]]:
+    """``GET /sentinel`` without re-raising server errors (a 500 must show up
+    as a status), returning the response and its ``SECURITY_AUDIT`` lines."""
+    client = TestClient(app, raise_server_exceptions=False)
+    package_logger = logging.getLogger(LOGGER_NAME)
+    prior_propagate = package_logger.propagate
+    package_logger.propagate = True
+    try:
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            response = client.get("/sentinel", headers=headers)
+    finally:
+        package_logger.propagate = prior_propagate
+    audit = [r.getMessage() for r in caplog.records if "SECURITY_AUDIT:" in r.getMessage()]
+    return response, audit
+
+
+@pytest.mark.security
+class TestNonAsciiCredentialIsAPlainMismatch:
+    """A non-ASCII header value is a wrong key: the tier's own denial status
+    and audit line.  A bare ``hmac.compare_digest`` on ``str`` raised
+    ``TypeError`` there — an unaudited ``500`` with a traceback."""
+
+    # Starlette decodes header bytes as latin-1, so each byte arrives as "é".
+    _NON_ASCII = b"\xe9" * 24
+
+    def test_api_key_tier_is_an_audited_401(
+        self, env_clear: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        app = _build_app_with(
+            [Depends(verify_api_key)],
+            env={"API_KEY": "shared-team-key"},  # pragma: allowlist secret
+        )
+        response, audit = _get_with_audit(caplog, app, {"X-API-Key": self._NON_ASCII})
+        assert response.status_code == 401
+        assert response.json()["error"] == "unauthorised"
+        assert any("api_key_denied" in message for message in audit)
+
+    def test_admin_tier_is_an_audited_403(
+        self, env_clear: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        app = _build_app_with(
+            admin_route_dependencies(),
+            env={
+                "API_KEY": "shared-team-key",  # pragma: allowlist secret
+                "API_ADMIN_KEY": "secret-admin-key",  # pragma: allowlist secret
+            },
+        )
+        response, audit = _get_with_audit(
+            caplog,
+            app,
+            {
+                "X-API-Key": "shared-team-key",  # pragma: allowlist secret
+                "X-Admin-Key": self._NON_ASCII,
+            },
+        )
+        assert response.status_code == 403
+        assert response.json()["error"] == "admin_required"
+        assert any("admin_denied" in message for message in audit)
+
+    def test_both_tiers_compare_through_secure_compare(
+        self, env_clear: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pins the constant-time primitive: an ``==`` would pass every
+        status assertion above while re-opening the timing oracle."""
+        import sec_generative_search.api.dependencies as deps
+
+        seen: list[tuple[object, object]] = []
+        real = deps.secure_compare
+
+        def _spy(a: object, b: object) -> bool:
+            seen.append((a, b))
+            return real(a, b)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(deps, "secure_compare", _spy)
+        app = _build_app_with(
+            admin_route_dependencies(),
+            env={
+                "API_KEY": "shared-team-key",  # pragma: allowlist secret
+                "API_ADMIN_KEY": "secret-admin-key",  # pragma: allowlist secret
+            },
+        )
+        response = TestClient(app).get(
+            "/sentinel",
+            headers={
+                "X-API-Key": "shared-team-key",  # pragma: allowlist secret
+                "X-Admin-Key": "secret-admin-key",  # pragma: allowlist secret
+            },
+        )
+        assert response.status_code == 200
+        assert ("shared-team-key", "shared-team-key") in seen
+        assert ("secret-admin-key", "secret-admin-key") in seen
+
+    def test_only_core_security_calls_compare_digest(self) -> None:
+        """Every secret comparison goes through ``secure_compare``, which
+        owns the ``str`` / ``bytes`` / ``None`` edges exactly once."""
+        src = Path(__file__).resolve().parents[2] / "src" / "sec_generative_search"
+        offenders = [
+            f"{path.relative_to(src)}:{node.lineno}"
+            for path in sorted(src.rglob("*.py"))
+            if path.relative_to(src).as_posix() != "core/security.py"
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if (isinstance(node, ast.Attribute) and node.attr == "compare_digest")
+            or (
+                isinstance(node, ast.ImportFrom)
+                and any(alias.name == "compare_digest" for alias in node.names)
+            )
+        ]
+        assert offenders == []

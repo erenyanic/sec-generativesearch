@@ -9,7 +9,9 @@ model across the process.
 Security contract:
 
         - ``API_KEY`` and ``API_ADMIN_KEY`` comparisons go through
-            :func:`hmac.compare_digest` — never ``==``.
+            :func:`~sec_generative_search.core.security.secure_compare` —
+            never ``==``, never a bare ``hmac.compare_digest`` (which raises
+            ``TypeError`` on a non-ASCII ``str``: a 500 instead of a 401).
         - ``session_id`` extracted from the cookie is validated against the
             mint policy: a non-empty URL-safe base64 string of at least 32
             characters before it is accepted as a key into the session store.
@@ -25,7 +27,6 @@ Security contract:
 
 from __future__ import annotations
 
-import hmac
 import re
 import secrets
 from collections.abc import Callable, Mapping
@@ -53,7 +54,7 @@ from sec_generative_search.core.edgar_identity import (
     validate_edgar_name,
 )
 from sec_generative_search.core.logging import audit_log, get_logger
-from sec_generative_search.core.security import mask_secret
+from sec_generative_search.core.security import mask_secret, secure_compare
 from sec_generative_search.providers.factory import default_api_key_resolver
 
 if TYPE_CHECKING:
@@ -214,10 +215,14 @@ _admin_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
 
 
 def _secrets_match(provided: str | None, expected: str) -> bool:
-    """Constant-time secret comparison.  ``None`` always returns False."""
-    if provided is None:
-        return False
-    return hmac.compare_digest(provided, expected)
+    """Constant-time secret comparison.  ``None`` always returns False.
+
+    :func:`secure_compare` compares UTF-8 bytes, so a non-ASCII header value
+    is a plain mismatch (``401`` + the denial audit line) — a bare
+    ``hmac.compare_digest`` on ``str`` raised ``TypeError`` there, which
+    surfaced as an unaudited ``500``.
+    """
+    return secure_compare(provided, expected)
 
 
 async def verify_api_key(

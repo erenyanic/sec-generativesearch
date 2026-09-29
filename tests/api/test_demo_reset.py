@@ -119,6 +119,21 @@ class TestTokenGate:
         other = client.delete("/api/filings/0000320193-23-000077", headers={_HEADER: _TOKEN})
         assert other.status_code == 401
 
+    def test_token_is_compared_in_constant_time(self, reset_client, monkeypatch) -> None:
+        import sec_generative_search.api.routes.demo as demo_module
+
+        seen: list[object] = []
+        real = demo_module.secure_compare
+
+        def _spy(a: object, b: object) -> bool:
+            seen.append(a)
+            return real(a, b)
+
+        monkeypatch.setattr(demo_module, "secure_compare", _spy)
+        client, store, _ = reset_client()
+        assert client.post(_PATH, headers={_HEADER: _TOKEN}).status_code == 200
+        assert seen == [_TOKEN] and store.cleared == 1
+
     def test_neither_token_is_echoed(self, reset_client) -> None:
         client, _, _ = reset_client()
         bodies = [
