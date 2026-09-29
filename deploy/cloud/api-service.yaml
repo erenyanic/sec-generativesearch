@@ -94,8 +94,12 @@ spec:
             # per-IP window becomes rotatable).
             - name: DB_DEPLOYMENT_PROFILE
               value: cloud
-            # Public demo: FIFO eviction + "clear all" disabled via the API.
-            # (The demo-reset Job uses the CLI, which bypasses demo mode.)
+            # Public demo: FIFO eviction + "clear all" disabled via the API. The
+            # nightly reset is POST /api/admin/demo-reset — run INSIDE this
+            # service (the only process that may write the gcsfuse volume,
+            # which has no file locking), triggered by Cloud Scheduler with
+            # API_DEMO_RESET_TOKEN below. The token is refused at load unless
+            # demo mode is on.
             - name: API_DEMO_MODE
               value: "true"
             # EDGAR identity must be supplied per session — never a shared
@@ -161,6 +165,14 @@ spec:
                 secretKeyRef:
                   name: sec-gs-db-encryption-key
                   key: latest
+            # Shared-secret token for the scheduled demo reset — a secret that can do
+            # nothing but that reset (never API_KEY / API_ADMIN_KEY). The same
+            # Secret Manager secret feeds the Cloud Scheduler job's header.
+            - name: API_DEMO_RESET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sec-gs-demo-reset-token
+                  key: latest
             # Admin-default LLM key (users may still supply their own via the
             # per-user encrypted vault, which overrides this admin-default tier).
             - name: ANTHROPIC_API_KEY
@@ -200,7 +212,11 @@ spec:
             failureThreshold: 3
       volumes:
         # GCS FUSE CSI volume — the durable store for a Cloud Run instance with
-        # no persistent local disk. Bucket is operator-provisioned.
+        # no persistent local disk. Bucket is operator-provisioned. Cloud
+        # Storage FUSE has NO file locking ("last write wins"), so this
+        # service MUST stay the only writer of the SQLite / ChromaDB files:
+        # nothing else may mount this bucket (the old demo-reset Job did; the
+        # reset now runs in-process — tests/ops lock this).
         - name: data
           csi:
             driver: gcsfuse.run.googleapis.com

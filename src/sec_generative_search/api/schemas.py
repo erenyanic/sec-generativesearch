@@ -31,6 +31,7 @@ __all__ = [
     "DeleteByIdsRequest",
     "DeleteByIdsResponse",
     "DeleteResponse",
+    "DemoResetResponse",
     "EdgarIdentityClearResponse",
     "EdgarIdentityRegisterResponse",
     "EdgarIdentityRequest",
@@ -474,6 +475,14 @@ class ClearAllResponse(_BaseModel):
 
     filings_deleted: int
     chunks_deleted: int
+
+
+class DemoResetResponse(_BaseModel):
+    """Result of ``POST /api/admin/demo-reset`` — counts only (rule L)."""
+
+    reset: bool
+    filings_removed: int
+    chunks_removed: int
 
 
 class ProviderValidateResponse(_BaseModel):

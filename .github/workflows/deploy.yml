@@ -133,15 +133,13 @@ jobs:
         run: |
           stamped="$(mktemp -d)"
           registry="$GCP_REGION-docker.pkg.dev/$GCP_PROJECT_ID/$REPO"
-          for manifest in api-service frontend-service demo-reset-job; do
+          for manifest in api-service frontend-service; do
             sed \
               -e "s|PROJECT_ID|$GCP_PROJECT_ID|g" \
               -e "s|REGION|$GCP_REGION|g" \
               "deploy/cloud/$manifest.yaml" > "$stamped/$manifest.yaml"
           done
-          # api + demo-reset Job share the api image; frontend has its own.
-          sed -i "s|$registry/api:latest|$API_IMAGE|g" \
-            "$stamped/api-service.yaml" "$stamped/demo-reset-job.yaml"
+          sed -i "s|$registry/api:latest|$API_IMAGE|g" "$stamped/api-service.yaml"
           sed -i "s|$registry/frontend:latest|$FRONTEND_IMAGE|g" \
             "$stamped/frontend-service.yaml"
           echo "STAMPED_DIR=$stamped" >> "$GITHUB_ENV"
@@ -151,6 +149,4 @@ jobs:
           gcloud run services replace "$STAMPED_DIR/api-service.yaml" \
             --project "$GCP_PROJECT_ID" --region "$GCP_REGION"
           gcloud run services replace "$STAMPED_DIR/frontend-service.yaml" \
-            --project "$GCP_PROJECT_ID" --region "$GCP_REGION"
-          gcloud run jobs replace "$STAMPED_DIR/demo-reset-job.yaml" \
             --project "$GCP_PROJECT_ID" --region "$GCP_REGION"

@@ -140,6 +140,14 @@ ROUTE_POLICIES: tuple[tuple[str, str | None, RoutePolicy], ...] = (
         None,
         RoutePolicy(rate_category="delete", max_body_bytes=4 * _KIB),
     ),
+    # Scheduled demo reset (F27): token-gated POST with no body. Rides the
+    # destructive ``delete`` bucket like every other corpus-wide write; a
+    # 1 KiB cap refuses a body the route never reads.
+    (
+        "/api/admin/demo-reset",
+        "POST",
+        RoutePolicy(rate_category="delete", max_body_bytes=1 * _KIB),
+    ),
     # Provider-key validation: bound generously above the worst-case
     # envelope (provider slug + bearer key + optional model name).
     (

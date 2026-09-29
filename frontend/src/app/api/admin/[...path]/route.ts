@@ -50,6 +50,8 @@ const STRIPPED_REQUEST_HEADERS = new Set([
   "host",
   "x-api-key",
   "x-admin-key",
+  // The scheduled demo-reset token (F27) is never a browser credential.
+  "x-demo-reset-token",
   "x-forwarded-for",
   "x-forwarded-host",
   "x-forwarded-proto",

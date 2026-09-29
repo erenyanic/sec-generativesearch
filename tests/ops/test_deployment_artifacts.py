@@ -56,7 +56,7 @@ _NGINX_CONF = _REPO_ROOT / "deploy" / "nginx" / "nginx.conf"
 _GITIGNORE = _REPO_ROOT / ".gitignore"
 _CLOUD_API = _REPO_ROOT / "deploy" / "cloud" / "api-service.yaml"
 _CLOUD_FRONTEND = _REPO_ROOT / "deploy" / "cloud" / "frontend-service.yaml"
-_CLOUD_JOB = _REPO_ROOT / "deploy" / "cloud" / "demo-reset-job.yaml"
+_CLOUD_DIR = _REPO_ROOT / "deploy" / "cloud"
 _WORKFLOWS_DIR = _REPO_ROOT / ".github" / "workflows"
 _DEPLOY_WORKFLOW = _WORKFLOWS_DIR / "deploy.yml"
 _CI_WORKFLOW = _WORKFLOWS_DIR / "ci.yml"
@@ -1014,6 +1014,7 @@ _SECRET_ENV = (
     "ANTHROPIC_API_KEY",
     "HUGGING_FACE_TOKEN",
     "HF_TOKEN",
+    "API_DEMO_RESET_TOKEN",
 )
 
 
@@ -1360,8 +1361,8 @@ def test_nginx_no_baked_secret(nginx_conf: str) -> None:
 
 
 # ==========================================================================
-# GCP Cloud Run manifests (deploy/cloud/{api,frontend}-service.yaml,
-# demo-reset-job.yaml) — the Cloud Run counterparts of the Compose stack and
+# GCP Cloud Run manifests (deploy/cloud/{api,frontend}-service.yaml) — the
+# Cloud Run counterparts of the Compose stack and
 # carry the same load-bearing contracts, expressed in Knative annotations:
 #
 #   - the in-process TaskManager single-instance contract (maxScale=1, no
@@ -1377,7 +1378,6 @@ def test_nginx_no_baked_secret(nginx_conf: str) -> None:
 # ===========================================================================
 
 _KNATIVE_SERVICE_KIND = "Service"
-_CLOUD_RUN_JOB_KIND = "Job"
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -1388,17 +1388,6 @@ def _service_container(doc: dict[str, Any]) -> dict[str, Any]:
     """The first container of a Knative ``Service`` revision template."""
     containers = doc["spec"]["template"]["spec"]["containers"]
     assert containers, "Knative Service defines no container"
-    return containers[0]
-
-
-def _job_container(doc: dict[str, Any]) -> dict[str, Any]:
-    """The first container of a Cloud Run ``Job`` task template.
-
-    The nesting is Job → ExecutionTemplate (``spec.template``) → TaskTemplate
-    (``.spec.template``) → ``.spec.containers``.
-    """
-    containers = doc["spec"]["template"]["spec"]["template"]["spec"]["containers"]
-    assert containers, "Cloud Run Job defines no container"
     return containers[0]
 
 
@@ -1427,25 +1416,18 @@ def cloud_frontend() -> dict[str, Any]:
     return _load_yaml(_CLOUD_FRONTEND)
 
 
-@pytest.fixture(scope="module")
-def cloud_job() -> dict[str, Any]:
-    return _load_yaml(_CLOUD_JOB)
-
-
 def test_cloud_artifacts_exist() -> None:
     assert _CLOUD_API.is_file(), "deploy/cloud/api-service.yaml is missing"
     assert _CLOUD_FRONTEND.is_file(), "deploy/cloud/frontend-service.yaml is missing"
-    assert _CLOUD_JOB.is_file(), "deploy/cloud/demo-reset-job.yaml is missing"
 
 
 def test_cloud_services_have_expected_kinds(
-    cloud_api: dict[str, Any], cloud_frontend: dict[str, Any], cloud_job: dict[str, Any]
+    cloud_api: dict[str, Any], cloud_frontend: dict[str, Any]
 ) -> None:
     assert cloud_api["kind"] == _KNATIVE_SERVICE_KIND, "api-service.yaml must be a Knative Service"
     assert cloud_frontend["kind"] == _KNATIVE_SERVICE_KIND, (
         "frontend-service.yaml must be a Knative Service"
     )
-    assert cloud_job["kind"] == _CLOUD_RUN_JOB_KIND, "demo-reset-job.yaml must be a Cloud Run Job"
 
 
 # ---------------------------------------------------------------------------
@@ -1497,7 +1479,7 @@ def test_cloud_api_ingress_is_internal(cloud_api: dict[str, Any]) -> None:
 
 
 @pytest.mark.security
-@pytest.mark.parametrize("path", [_CLOUD_API, _CLOUD_FRONTEND, _CLOUD_JOB], ids=lambda p: p.name)
+@pytest.mark.parametrize("path", sorted(_CLOUD_DIR.glob("*.yaml")), ids=lambda p: p.name)
 def test_cloud_manifest_bakes_no_secret(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     lowered = text.lower()
@@ -1758,40 +1740,79 @@ def test_cloud_frontend_is_public_gfe_tls(cloud_frontend: dict[str, Any]) -> Non
 
 
 # ---------------------------------------------------------------------------
-# Demo-reset Cloud Run Job.
+# F27 — the data bucket has exactly one writer; the demo reset runs in-process.
+#
+# Cloud Storage FUSE "does not provide concurrency control for multiple writes
+# (file locking) to the same file" — the last write wins. The old demo-reset
+# Cloud Run Job ran `sec-rag manage clear -y` against the SQLite / ChromaDB
+# files while the API served (and wrote) them. The reset is now
+# POST /api/admin/demo-reset inside the API, gated by a dedicated token.
 # ---------------------------------------------------------------------------
 
 
+def _gcsfuse_buckets(doc: dict[str, Any]) -> list[str]:
+    """Every gcsfuse CSI bucket a Service / Job manifest mounts."""
+    found: list[str] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            csi = node.get("csi")
+            if isinstance(csi, dict) and csi.get("driver") == "gcsfuse.run.googleapis.com":
+                found.append(str((csi.get("volumeAttributes") or {}).get("bucketName")))
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                _walk(value)
+
+    _walk(doc)
+    return found
+
+
 @pytest.mark.security
-def test_cloud_demo_reset_is_a_job(cloud_job: dict[str, Any]) -> None:
-    # A Job runs to completion per trigger — never a long-lived Service that
-    # would hold the destructive `clear` surface open.
-    assert cloud_job["kind"] == _CLOUD_RUN_JOB_KIND, "demo-reset must be a Cloud Run Job"
-    container = _job_container(cloud_job)
-    # It invokes the CLI (which bypasses API_DEMO_MODE) — the only reset path,
-    # since the API blocks `clear` under demo mode.
-    args = container.get("args") or []
-    assert args[:3] == ["sec-rag", "manage", "clear"], (
-        f"demo-reset Job must run `sec-rag manage clear` (the CLI reset path that "
-        f"bypasses demo mode); got args {args}"
+def test_only_the_api_service_mounts_the_data_bucket() -> None:
+    mounts = {
+        path.name: _gcsfuse_buckets(_load_yaml(path)) for path in sorted(_CLOUD_DIR.glob("*.yaml"))
+    }
+    writers = {name for name, buckets in mounts.items() if buckets}
+    assert writers == {"api-service.yaml"}, (
+        "gcsfuse has no file locking — no manifest other than api-service.yaml may "
+        f"mount the data bucket (a second writer corrupts SQLite / ChromaDB): {mounts}"
     )
-    # `args` only, no `command`: the image ENTRYPOINT (the gosu drop) stays in
-    # force, so the reset runs as the unprivileged appuser, not root.
-    assert "command" not in container, (
-        "demo-reset Job must not override `command` — keep the image ENTRYPOINT "
-        "(docker-entrypoint.sh) so the gosu non-root drop still runs"
+    assert not any(_load_yaml(path).get("kind") == "Job" for path in _CLOUD_DIR.glob("*.yaml")), (
+        "a Cloud Run Job is back in deploy/cloud — the demo reset runs in-process (F27)"
     )
 
 
 @pytest.mark.security
-def test_cloud_demo_reset_uses_secret_manager(cloud_job: dict[str, Any]) -> None:
-    env = _env_by_name(_job_container(cloud_job))
-    assert "DB_ENCRYPTION_KEY" in env, (
-        "demo-reset Job needs DB_ENCRYPTION_KEY to open the SQLCipher store"
+def test_cloud_demo_reset_token_is_secret_managed_and_needs_demo_mode(
+    cloud_api: dict[str, Any],
+) -> None:
+    env = _env_by_name(_service_container(cloud_api))
+    assert "API_DEMO_RESET_TOKEN" in env, (
+        "the cloud API must configure API_DEMO_RESET_TOKEN for the scheduled reset"
     )
-    assert _uses_secret_manager(env["DB_ENCRYPTION_KEY"]), (
-        "demo-reset Job DB_ENCRYPTION_KEY must resolve from Secret Manager "
-        "(valueFrom.secretKeyRef), never an inline value"
+    assert _uses_secret_manager(env["API_DEMO_RESET_TOKEN"]), (
+        "API_DEMO_RESET_TOKEN must resolve from Secret Manager (valueFrom.secretKeyRef)"
+    )
+    # Settings refuse the token outside demo mode — a manifest that dropped
+    # demo mode would fail its own boot.
+    assert env.get("API_DEMO_MODE", {}).get("value") == "true", (
+        "API_DEMO_RESET_TOKEN requires API_DEMO_MODE=true on the same service"
+    )
+
+
+@pytest.mark.security
+def test_cloud_reset_token_is_not_an_admin_credential(cloud_api: dict[str, Any]) -> None:
+    env = _env_by_name(_service_container(cloud_api))
+    secret_names = {
+        name: (entry.get("valueFrom") or {}).get("secretKeyRef", {}).get("name")
+        for name, entry in env.items()
+        if _uses_secret_manager(entry)
+    }
+    token_secret = secret_names["API_DEMO_RESET_TOKEN"]
+    assert token_secret not in {secret_names.get("API_KEY"), secret_names.get("API_ADMIN_KEY")}, (
+        "the demo-reset token must be its own secret — least privilege for the scheduler"
     )
 
 
@@ -2040,8 +2061,9 @@ def test_deploy_workflow_pins_image_digests(deploy_workflow: str) -> None:
     assert "gcloud run services replace" in deploy_workflow, (
         "deploy.yml must apply the api/frontend Services via `gcloud run services replace`"
     )
-    assert "gcloud run jobs replace" in deploy_workflow, (
-        "deploy.yml must apply the demo-reset Job via `gcloud run jobs replace`"
+    # F27: the demo reset runs in the API — no Job is deployed any more.
+    assert "gcloud run jobs replace" not in deploy_workflow, (
+        "deploy.yml deploys a Cloud Run Job again — the demo reset runs in-process (F27)"
     )
 
 

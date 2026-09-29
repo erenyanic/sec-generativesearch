@@ -42,6 +42,7 @@ REDACTED_HEADER_NAMES: frozenset[str] = frozenset(
         "set-cookie",
         "x-api-key",
         "x-admin-key",
+        "x-demo-reset-token",
     }
 )
 

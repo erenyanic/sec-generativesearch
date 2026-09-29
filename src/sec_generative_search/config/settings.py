@@ -229,6 +229,11 @@ def resolve_encryption_key_from_values(key: str | None, key_file: str | None) ->
     )
 
 
+# Floor for ``API_DEMO_RESET_TOKEN``: ``secrets.token_urlsafe(24)`` is 32
+# characters (192 bits).
+DEMO_RESET_TOKEN_MIN_LENGTH = 32
+
+
 def resolve_auth_pepper_from_values(
     pepper: str | None,
     pepper_file: str | None,
@@ -912,6 +917,17 @@ class ApiSettings(BaseSettings):
     demo_mode: bool = False
     demo_eviction_buffer: int = 500
 
+    # Bearer token for ``POST /api/admin/demo-reset`` (F27): the scheduled
+    # demo-corpus reset runs INSIDE the API — the single writer of the
+    # SQLite / ChromaDB files — instead of a second process on the shared
+    # volume.  Deliberately not ``API_KEY`` / ``API_ADMIN_KEY``: the caller
+    # (Cloud Scheduler) must hold a secret that can do nothing but this reset.
+    # Mutually exclusive with ``demo_reset_token_file``; only valid with
+    # ``demo_mode`` (refused at load otherwise).  Unset = the route answers
+    # 401 to everyone.
+    demo_reset_token: str | None = None
+    demo_reset_token_file: str | None = None
+
     # Task queue size (maximum concurrent + pending ingest tasks).
     max_task_queue_size: int = 5
 
@@ -920,7 +936,7 @@ class ApiSettings(BaseSettings):
     max_filings_per_request: int = 0
     max_task_duration_minutes: int = 0
 
-    @field_validator("key", "admin_key", "auth_pepper", mode="before")
+    @field_validator("key", "admin_key", "auth_pepper", "demo_reset_token", mode="before")
     @classmethod
     def _empty_str_to_none(cls, v: str | None) -> str | None:
         return v or None
@@ -973,7 +989,42 @@ class ApiSettings(BaseSettings):
         self.auth_pepper = resolve_auth_pepper_from_values(self.auth_pepper, self.auth_pepper_file)
         return self
 
-    model_config = SettingsConfigDict(env_prefix="API_")
+    @model_validator(mode="after")
+    def _resolve_demo_reset_token(self) -> "ApiSettings":
+        """Resolve the demo-reset token and refuse an unsafe configuration.
+
+        Fail-closed at load: a token shorter than
+        :data:`DEMO_RESET_TOKEN_MIN_LENGTH`, or one configured while
+        ``API_DEMO_MODE`` is off (the route wipes the corpus — it exists
+        only for a public demo), refuses the boot.  The message names the
+        variable, never the value.
+        """
+        token = resolve_secret_from_value_or_file(
+            self.demo_reset_token,
+            self.demo_reset_token_file,
+            value_env_name="API_DEMO_RESET_TOKEN",
+            file_env_name="API_DEMO_RESET_TOKEN_FILE",
+        )
+        if token is not None:
+            if len(token) < DEMO_RESET_TOKEN_MIN_LENGTH:
+                raise ValueError(
+                    f"API_DEMO_RESET_TOKEN must be at least {DEMO_RESET_TOKEN_MIN_LENGTH} "
+                    "characters — mint one with "
+                    "`python -c 'import secrets; print(secrets.token_urlsafe(32))'`."
+                )
+            if not self.demo_mode:
+                raise ValueError(
+                    "API_DEMO_RESET_TOKEN is set but API_DEMO_MODE is false — the demo "
+                    "reset route wipes the corpus and exists only for a demo deployment. "
+                    "Unset the token or enable demo mode."
+                )
+        self.demo_reset_token = token
+        return self
+
+    # ``hide_input_in_errors``: a failing validator must not print the model
+    # input — pydantic would render the API / admin keys, the pepper and the
+    # demo-reset token (in full, or their tails) into the boot error log.
+    model_config = SettingsConfigDict(env_prefix="API_", hide_input_in_errors=True)
 
 
 class Settings(BaseSettings):

@@ -79,7 +79,8 @@ import contextlib
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -113,6 +114,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "FilingResult",
+    "IngestActiveError",
+    "IngestPausedError",
     "TaskInfo",
     "TaskManager",
     "TaskProgress",
@@ -393,6 +396,23 @@ class TaskQueueFullError(SECGenerativeSearchError):
         )
 
 
+class IngestActiveError(SECGenerativeSearchError):
+    """An exclusive maintenance operation met a pending / running ingest."""
+
+    def __init__(self, active: int) -> None:
+        super().__init__(
+            "An ingest task is in progress; retry once it has finished.",
+            details={"active": active},
+        )
+
+
+class IngestPausedError(SECGenerativeSearchError):
+    """``create_task`` refused while an exclusive maintenance operation runs."""
+
+    def __init__(self) -> None:
+        super().__init__("Ingest is paused while the corpus is being reset; retry shortly.")
+
+
 class _CancelledError(Exception):
     """Internal sentinel raised from a progress callback to abort the pipeline.
 
@@ -479,6 +499,8 @@ class TaskManager:
         # Set during ``shutdown``; observed by ``create_task`` so a
         # late-arriving request after lifespan teardown is refused.
         self._shutdown_event = threading.Event()
+        # Set while ``exclusive_maintenance`` runs (guarded by ``_lock``).
+        self._maintenance = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -522,13 +544,6 @@ class TaskManager:
         self._evict_stale_locked()
 
         max_active = get_settings().api.max_task_queue_size
-        with self._lock:
-            active_count = sum(
-                1 for t in self._tasks.values() if t.state in (TaskState.PENDING, TaskState.RUNNING)
-            )
-            if active_count >= max_active:
-                raise TaskQueueFullError(active=active_count, maximum=max_active)
-
         task_id = uuid.uuid4().hex
         info = TaskInfo(
             task_id=task_id,
@@ -542,7 +557,15 @@ class TaskManager:
             session_id=session_id,
         )
 
+        # One critical section for the maintenance gate, the capacity check
+        # and the insert: ``exclusive_maintenance`` decides "no active task"
+        # under the same lock, so a task can never slip in between (F27).
         with self._lock:
+            if self._maintenance:
+                raise IngestPausedError
+            active_count = self._active_count_locked()
+            if active_count >= max_active:
+                raise TaskQueueFullError(active=active_count, maximum=max_active)
             self._tasks[task_id] = info
             if edgar_identity_resolver is not None:
                 self._task_resolvers[task_id] = edgar_identity_resolver
@@ -639,9 +662,37 @@ class TaskManager:
     def has_active_task(self) -> bool:
         """``True`` if any task is pending or running."""
         with self._lock:
-            return any(
-                t.state in (TaskState.PENDING, TaskState.RUNNING) for t in self._tasks.values()
-            )
+            return self._active_count_locked() > 0
+
+    def _active_count_locked(self) -> int:
+        """Pending + running tasks.  Caller holds ``self._lock``."""
+        return sum(
+            1 for t in self._tasks.values() if t.state in (TaskState.PENDING, TaskState.RUNNING)
+        )
+
+    @contextmanager
+    def exclusive_maintenance(self) -> Iterator[None]:
+        """Run a whole-corpus operation with no ingest writing beside it.
+
+        Enters only when no task is pending or running (else
+        :class:`IngestActiveError` — the caller reports 409 and retries
+        later) and, until the block exits, makes :meth:`create_task` refuse
+        with :class:`IngestPausedError`.  Both decisions are taken under
+        ``self._lock``, the lock ``create_task`` inserts under, so no task
+        can start between the check and the operation.  Backs the in-API
+        demo reset (F27), which must be the only writer of the store while
+        it clears it.
+        """
+        with self._lock:
+            active = self._active_count_locked()
+            if active or self._maintenance:
+                raise IngestActiveError(active)
+            self._maintenance = True
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._maintenance = False
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Bind the running asyncio loop for cross-thread message pushes."""

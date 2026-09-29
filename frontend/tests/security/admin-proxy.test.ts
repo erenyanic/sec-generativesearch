@@ -122,6 +122,25 @@ describe("path allow-list", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("never reaches the scheduled demo reset (F27)", async () => {
+    // POST /api/admin/demo-reset wipes the corpus and is token-gated for
+    // Cloud Scheduler only. It must stay off the allow-list: an admin
+    // session is not a way to reach it.
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const id = createSession("api-k", "admin-k"); // pragma: allowlist secret
+    const plain = await callHandler("POST", ["admin", "demo-reset"], {
+      cookies: { [ADMIN_SESSION_COOKIE]: id },
+    });
+    expect(plain.status).toBe(403);
+    // Trailing-slash form: refused too (the empty segment is a 400).
+    const trailing = await callHandler("POST", ["admin", "demo-reset", ""], {
+      cookies: { [ADMIN_SESSION_COOKIE]: id },
+    });
+    expect([400, 403]).toContain(trailing.status);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("rejects path-traversal segments", async () => {
     const fetchMock = vi.fn();
     globalThis.fetch = fetchMock as unknown as typeof fetch;
@@ -308,6 +327,17 @@ describe("header injection", () => {
     // The spoofed values must be gone — only the server-side keys remain.
     expect(headers.get("x-api-key")).toBe("server-api");
     expect(headers.get("x-admin-key")).toBe("server-admin");
+  });
+
+  it("strips a client-set X-Demo-Reset-Token", async () => {
+    const fetchMock = mockBackend();
+    const id = createSession("server-api", "server-admin"); // pragma: allowlist secret
+    await callHandler("GET", ["filings"], {
+      cookies: { [ADMIN_SESSION_COOKIE]: id },
+      headers: { "X-Demo-Reset-Token": "spoofed-token" },
+    });
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(new Headers(init.headers as HeadersInit).get("x-demo-reset-token")).toBeNull();
   });
 
   it("strips client-set X-Forwarded-* headers (M2: rate-limit key integrity)", async () => {

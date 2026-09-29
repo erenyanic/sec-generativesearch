@@ -1051,6 +1051,7 @@ _READER_ALLOW_LIST = {
     ("database", "encryption_key_file"): "resolved into encryption_key by a validator",
     ("api", "auth_pepper_file"): "resolved into auth_pepper by a validator",
     ("local_llm", "allow_non_local"): "read by the loopback host-policy validator",
+    ("api", "demo_reset_token_file"): "resolved into demo_reset_token by a validator",
 }
 
 
@@ -1135,3 +1136,53 @@ def test_env_example_advertises_only_real_knobs() -> None:
     advertised = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]+)=", text, re.MULTILINE))
     assert advertised, "no keys parsed from .env.example"
     assert sorted(advertised - real - _EXTERNAL_ENV_KNOBS) == []
+
+
+@pytest.mark.security
+class TestDemoResetToken:
+    """F27: ``API_DEMO_RESET_TOKEN`` gates the in-API demo reset.  Fail-closed
+    at load: never outside demo mode, never short, one source only — and no
+    error message ever carries the value."""
+
+    _TOKEN = "demo-reset-token-0123456789abcdefghij"  # pragma: allowlist secret
+
+    def test_token_with_demo_mode_loads(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("API_DEMO_MODE", "true")
+        clean_env.setenv("API_DEMO_RESET_TOKEN", self._TOKEN)
+        assert ApiSettings().demo_reset_token == self._TOKEN
+
+    def test_unset_and_empty_mean_disabled(self, clean_env: pytest.MonkeyPatch) -> None:
+        assert ApiSettings().demo_reset_token is None
+        clean_env.setenv("API_DEMO_RESET_TOKEN", "")
+        assert ApiSettings().demo_reset_token is None
+
+    def test_token_without_demo_mode_is_refused(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("API_DEMO_RESET_TOKEN", self._TOKEN)
+        with pytest.raises(ValueError, match="API_DEMO_MODE") as excinfo:
+            ApiSettings()
+        assert self._TOKEN not in str(excinfo.value)
+
+    def test_short_token_is_refused(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("API_DEMO_MODE", "true")
+        clean_env.setenv("API_DEMO_RESET_TOKEN", "too-short-token")
+        with pytest.raises(ValueError, match="at least 32") as excinfo:
+            ApiSettings()
+        assert "too-short-token" not in str(excinfo.value)
+
+    def test_value_and_file_are_mutually_exclusive(
+        self, clean_env: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        token_file = tmp_path / "token"
+        token_file.write_text(self._TOKEN)
+        clean_env.setenv("API_DEMO_MODE", "true")
+        clean_env.setenv("API_DEMO_RESET_TOKEN", self._TOKEN)
+        clean_env.setenv("API_DEMO_RESET_TOKEN_FILE", str(token_file))
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            ApiSettings()
+
+    def test_file_form_resolves(self, clean_env: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        token_file = tmp_path / "token"
+        token_file.write_text(self._TOKEN + "\n")
+        clean_env.setenv("API_DEMO_MODE", "true")
+        clean_env.setenv("API_DEMO_RESET_TOKEN_FILE", str(token_file))
+        assert ApiSettings().demo_reset_token == self._TOKEN

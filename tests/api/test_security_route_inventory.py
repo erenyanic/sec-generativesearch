@@ -89,6 +89,18 @@ _EXPECTED_ADMIN_ROUTES: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+# Routes gated by a dedicated shared-secret token instead of the API /
+# admin keys — a deliberate, reviewed exception to rule A. Adding one is a
+# security decision on the same footing as widening the open allow-list.
+#   - POST /api/admin/demo-reset: the scheduled demo reset (F27). Cloud
+#     Scheduler holds ``API_DEMO_RESET_TOKEN``, a secret that can do
+#     nothing else; the API / admin keys must NOT open it.
+_EXPECTED_TOKEN_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("POST", "/api/admin/demo-reset"),
+    }
+)
+
 
 # Generous per-category rate-limit ceilings so the multi-route sweep (≈2
 # requests per route) never trips a limiter and turns into a flaky 429.
@@ -237,6 +249,32 @@ class TestRouteAuthTierInventory:
             f"(want no-header=401, api-key-only=403): {misgated}"
         )
 
+    def test_token_routes_refuse_the_api_and_admin_keys(self, sweep_client) -> None:
+        """A token-gated route is 401 with no header AND with both keys — the
+        admin credentials are not a way in (least privilege both ways)."""
+        for method, path in _EXPECTED_TOKEN_ROUTES:
+            cp = _concrete_path(path)
+            no_header = sweep_client.request(method, cp).status_code
+            both_keys = sweep_client.request(
+                method,
+                cp,
+                headers={"X-API-Key": _SWEEP_API_KEY, "X-Admin-Key": _SWEEP_ADMIN_KEY},
+            ).status_code
+            assert (no_header, both_keys) == (401, 401), (
+                f"{method} {path}: token-gated route must refuse both no-header and "
+                f"admin-key requests with 401, got {(no_header, both_keys)}"
+            )
+
+    def test_every_admin_path_is_classified(self, api_app) -> None:
+        """Every ``/api/admin/*`` route is reviewed as admin-tier or token-gated."""
+        unclassified = {
+            (method, path)
+            for method, path in self._route_keys(api_app)
+            if path.startswith("/api/admin/")
+            and (method, path) not in _EXPECTED_ADMIN_ROUTES | _EXPECTED_TOKEN_ROUTES
+        }
+        assert not unclassified, f"unreviewed /api/admin routes: {sorted(unclassified)}"
+
     def test_every_admin_route_runs_api_key_before_admin_key(self, sweep_client) -> None:
         """The footgun guard, behaviourally.
 
@@ -339,10 +377,16 @@ class TestConfiguredSecretNeverInResponseBody:
     _ADMIN_KEY = "configured-admin-key-SENTINEL-B"  # pragma: allowlist secret
     _WRONG_KEY = "supplied-wrong-key-SENTINEL-C"  # pragma: allowlist secret
     _PROVIDER_KEY = "sk-supplied-provider-SENTINEL-D"  # pragma: allowlist secret
+    _RESET_TOKEN = "configured-demo-reset-token-SENTINEL-E"  # pragma: allowlist secret
 
     @pytest.fixture
     def client(self, api_client_factory):
-        return api_client_factory(API_KEY=self._API_KEY, API_ADMIN_KEY=self._ADMIN_KEY)
+        return api_client_factory(
+            API_KEY=self._API_KEY,
+            API_ADMIN_KEY=self._ADMIN_KEY,
+            API_DEMO_MODE="true",
+            API_DEMO_RESET_TOKEN=self._RESET_TOKEN,
+        )
 
     def test_no_configured_or_supplied_secret_appears_in_any_body(self, client) -> None:
         bodies: list[str] = []
@@ -374,6 +418,25 @@ class TestConfiguredSecretNeverInResponseBody:
             ).text
         )
 
+        # 401: the demo-reset route with a wrong / admin credential.
+        bodies.append(
+            client.post(
+                "/api/admin/demo-reset", headers={"X-Demo-Reset-Token": self._WRONG_KEY}
+            ).text
+        )
+        bodies.append(
+            client.post(
+                "/api/admin/demo-reset",
+                headers={"X-API-Key": self._API_KEY, "X-Admin-Key": self._ADMIN_KEY},
+            ).text
+        )
+
         joined = "\n".join(bodies)
-        for secret in (self._API_KEY, self._ADMIN_KEY, self._WRONG_KEY, self._PROVIDER_KEY):
+        for secret in (
+            self._API_KEY,
+            self._ADMIN_KEY,
+            self._WRONG_KEY,
+            self._PROVIDER_KEY,
+            self._RESET_TOKEN,
+        ):
             assert secret not in joined, f"secret leaked into a response body: {secret!r}"

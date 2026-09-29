@@ -44,6 +44,7 @@ from sec_generative_search.api.middleware import (
 )
 from sec_generative_search.api.routes.auth import router as auth_router
 from sec_generative_search.api.routes.catalogue import router as catalogue_router
+from sec_generative_search.api.routes.demo import router as demo_router
 from sec_generative_search.api.routes.filings import router as filings_router
 from sec_generative_search.api.routes.health import router as health_router
 from sec_generative_search.api.routes.ingest import router as ingest_router
@@ -400,6 +401,7 @@ def create_app() -> FastAPI:
     app.include_router(session_router, prefix="/api", tags=["session"])
     app.include_router(auth_router, prefix="/api", tags=["auth"])
     app.include_router(users_router, prefix="/api/admin", tags=["admin-users"])
+    app.include_router(demo_router, prefix="/api/admin", tags=["admin-demo"])
     app.include_router(providers_router, prefix="/api/providers", tags=["providers"])
     app.include_router(provider_health_router, prefix="/api/providers", tags=["providers"])
     app.include_router(catalogue_router, prefix="/api/providers", tags=["providers"])

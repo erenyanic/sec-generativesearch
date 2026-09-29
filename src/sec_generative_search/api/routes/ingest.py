@@ -69,7 +69,12 @@ from sec_generative_search.api.schemas import (
     TaskProgressSchema,
     TaskStatusResponse,
 )
-from sec_generative_search.api.tasks import TaskInfo, TaskManager, TaskQueueFullError
+from sec_generative_search.api.tasks import (
+    IngestPausedError,
+    TaskInfo,
+    TaskManager,
+    TaskQueueFullError,
+)
 from sec_generative_search.config.settings import get_settings
 from sec_generative_search.core.edgar_identity import EdgarIdentity
 from sec_generative_search.core.logging import audit_log, get_logger
@@ -174,6 +179,16 @@ def _create_task(
             message=str(exc),
             details=details,
             hint="Wait for existing tasks to complete before submitting new ones.",
+        ) from exc
+    except IngestPausedError as exc:
+        # The scheduled demo reset (F27) holds ingest off for the seconds
+        # it takes to clear the corpus.
+        raise http_error(
+            status_code=503,
+            error="ingest_paused",
+            message=exc.message,
+            hint="Retry in a few seconds.",
+            headers={"Retry-After": "5"},
         ) from exc
 
     audit_log(
