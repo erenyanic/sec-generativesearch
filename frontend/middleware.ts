@@ -10,9 +10,11 @@ import {
 // available in both the Edge and Node runtimes; sticking to Edge keeps the
 // security surface minimal.
 export const config = {
-  // Match every request path. Static-asset paths (e.g. /_next/static/...)
-  // still go through the middleware but the headers cost nothing on them.
-  matcher: ["/((?!.*\\.[a-zA-Z0-9]+$|_next/static|_next/image|favicon.ico).*)"],
+  // Match every request path except file-extension paths, /_next/static and
+  // favicon.ico. `/_next/image` is deliberately NOT excluded: the optimizer
+  // is disabled (next.config.ts), so that path renders the HTML not-found
+  // page, which must carry the CSP + header set like any other page.
+  matcher: ["/((?!.*\\.[a-zA-Z0-9]+$|_next/static|favicon.ico).*)"],
 };
 
 const IS_DEVELOPMENT = process.env.NODE_ENV === "development";

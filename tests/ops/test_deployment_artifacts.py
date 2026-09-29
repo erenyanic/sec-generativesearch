@@ -1348,6 +1348,26 @@ def test_nginx_websocket_upgrade_to_api(nginx_conf: str) -> None:
     )
 
 
+@pytest.mark.security
+def test_nginx_refuses_the_next_image_optimizer(nginx_conf: str) -> None:
+    # SECURITY VULNERABILITIES F1: the SPA has no image optimizer
+    # (next.config.ts `images.unoptimized`, Vitest-locked). The edge refuses
+    # /_next/image as well, so the unauthenticated sharp -> libvips / libheif
+    # decode path stays unreachable through nginx even if Next registers it again.
+    live = "\n".join(line for line in nginx_conf.splitlines() if not line.strip().startswith("#"))
+    tls_idx = live.find("listen 443 ssl")
+    match = re.search(r"location\s*=\s*/_next/image\s*\{([^}]*)\}", live)
+    assert match is not None, "nginx has no exact `location = /_next/image` block"
+    assert tls_idx != -1 and match.start() > tls_idx, (
+        "the /_next/image refusal must live in the :443 application server"
+    )
+    body = match.group(1)
+    assert re.search(r"^\s*return\s+404\s*;", body, re.M), (
+        "`location = /_next/image` must `return 404;`"
+    )
+    assert "proxy_pass" not in body, "`location = /_next/image` must not reach any upstream"
+
+
 def test_nginx_terminates_tls(nginx_conf: str) -> None:
     assert "listen 443 ssl" in nginx_conf, "nginx does not terminate TLS on :443"
     assert "ssl_certificate" in nginx_conf, "nginx has no TLS certificate directive"
