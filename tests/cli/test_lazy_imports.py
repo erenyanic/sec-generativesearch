@@ -5,8 +5,7 @@ process, so an in-process check would see whatever earlier tests loaded).
 Before F28, ``sec-rag --help`` took ~3.4 s and ~260 MB: every CLI module was
 imported eagerly and dragged in the three vendor SDKs (``openai``,
 ``anthropic``, ``google.genai`` — ~1.75 s), ``edgar`` (~0.8 s) and
-``chromadb`` (~0.6 s).  The demo-reset Job and every Cloud Run cold start
-paid the same.
+``chromadb`` (~0.6 s).  Every Cloud Run cold start paid the same.
 """
 
 from __future__ import annotations

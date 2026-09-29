@@ -447,10 +447,11 @@ def clear_all(
     1. ``confirm=true`` MUST be present.  Without it the route returns
        400 — preventing a stray ``curl -X DELETE`` from emptying the
        corpus.
-    2. ``API_DEMO_MODE=true`` returns 403 unconditionally — the demo
-       deployment relies on the nightly reset job for wipes and a
-       human-driven clear-all bypassing that schedule has historically
-       caused contention.
+    2. ``API_DEMO_MODE=true`` returns 403 unconditionally — the demo is
+       wiped only by the scheduled, token-gated ``POST
+       /api/admin/demo-reset`` (F27), which holds ingest off while it
+       clears; a human-driven clear-all bypassing that schedule has
+       historically caused contention.
     """
     if get_settings().api.demo_mode:
         raise http_error(

@@ -59,8 +59,9 @@ logger = get_logger(__name__)
 
 
 # Busy-handler budget (ms) for a contended write lock — a second process
-# (``sec-rag manage …`` while the API runs, the demo-reset Job) then makes
-# a write wait instead of failing with ``database is locked``.  Both the
+# (a ``sec-rag`` command while the API runs on a local volume) then makes a
+# write wait instead of failing with ``database is locked``.  Not a licence
+# for a second writer on Cloud Run's gcsfuse volume, which has no locks (F27).  Both the
 # stdlib driver and pysqlcipher3 already default to 5 s via
 # ``connect(timeout=5.0)``; the explicit pragma pins it driver-independently.
 _BUSY_TIMEOUT_MS = 5000

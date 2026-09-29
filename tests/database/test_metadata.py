@@ -722,8 +722,8 @@ class TestConnectionPragmas:
         registry: MetadataRegistry,
         tmp_db_path: str,
     ) -> None:
-        """A second process holding the write lock (CLI, demo-reset Job)
-        makes the registry wait, not fail with ``database is locked``."""
+        """A second process holding the write lock (e.g. the CLI on a local
+        volume) makes the registry wait, not fail with ``database is locked``."""
         other = sqlite3.connect(tmp_db_path, check_same_thread=False, timeout=0)
         other.execute("BEGIN IMMEDIATE")
         release = threading.Thread(target=lambda: (time.sleep(0.3), other.commit()))

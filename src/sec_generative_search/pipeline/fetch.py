@@ -45,8 +45,8 @@ logger = get_logger(__name__)
 
 # edgartools is imported on the first EDGAR-bound call, not with this module
 # (F28): ``import edgar`` costs ~0.8 s (its HTML/XBRL stack), and this module
-# is reached by every ``sec_generative_search.pipeline`` import — the API,
-# ``sec-rag --help``, the demo-reset Job.  The proxies keep the edgartools
+# is reached by every ``sec_generative_search.pipeline`` import — the API and
+# every ``sec-rag`` command, ``--help`` included.  The proxies keep the edgartools
 # names at module level, which is also the seam the tests patch.
 def Company(ticker: str) -> EdgarCompany:  # noqa: N802 — stands in for the edgartools class
     """Construct an ``edgar.Company`` (lazy import)."""
