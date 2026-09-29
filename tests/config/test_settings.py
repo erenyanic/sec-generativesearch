@@ -1186,3 +1186,52 @@ class TestDemoResetToken:
         clean_env.setenv("API_DEMO_MODE", "true")
         clean_env.setenv("API_DEMO_RESET_TOKEN_FILE", str(token_file))
         assert ApiSettings().demo_reset_token == self._TOKEN
+
+
+@pytest.mark.security
+class TestValidationErrorsNeverEchoConfiguredValues:
+    """A settings validation error is a boot failure, printed to the container
+    log.  Pydantic renders the model input in it (``input_value={...}``) —
+    in full for a small input, middle-truncated to its *tail* for a large one
+    — so without ``hide_input_in_errors`` a misconfigured deployment wrote
+    its API / admin keys, pepper or SQLCipher key into the log."""
+
+    # Random-looking so no 5-character window can occur in an English error.
+    _API_KEY = "Zq7rXv9Lm2Wn4Pk8Rt6Yh3Gd5Fs1Jb0Qc"  # pragma: allowlist secret
+    _DB_KEY = "Hx4Tq9Vb2Nm7Kw3Rj8Pf5Ld1Gz6Yc0Sa"  # pragma: allowlist secret
+
+    @staticmethod
+    def _pieces(secret: str, size: int = 5) -> set[str]:
+        return {secret[i : i + size] for i in range(len(secret) - size + 1)}
+
+    def test_every_settings_model_hides_its_input(self) -> None:
+        models = [Settings] + [
+            info.default_factory
+            for info in Settings.model_fields.values()
+            if info.default_factory is not None
+        ]
+        assert len(models) >= 11
+        for model in models:
+            assert model.model_config.get("hide_input_in_errors") is True, model.__name__
+
+    def test_api_error_carries_no_piece_of_a_key(self, clean_env: pytest.MonkeyPatch) -> None:
+        clean_env.setenv("API_KEY", self._API_KEY)
+        clean_env.setenv("API_CORS_ORIGINS", '["*"]')
+        with pytest.raises(ValueError) as excinfo:
+            ApiSettings()
+        rendered = str(excinfo.value)
+        assert "API_CORS_ORIGINS" in rendered  # the useful part survives
+        assert not any(piece in rendered for piece in self._pieces(self._API_KEY))
+
+    def test_database_error_carries_no_piece_of_the_key(
+        self, clean_env: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # A model-level failure (key + key file both set) — the kind whose
+        # error renders the whole input dict, key included.
+        key_file = tmp_path / "db.key"
+        key_file.write_text("unused-file-key-value")
+        clean_env.setenv("DB_ENCRYPTION_KEY", self._DB_KEY)
+        clean_env.setenv("DB_ENCRYPTION_KEY_FILE", str(key_file))
+        with pytest.raises(ValueError, match="mutually exclusive") as excinfo:
+            DatabaseSettings()
+        assert not any(piece in str(excinfo.value) for piece in self._pieces(self._DB_KEY))

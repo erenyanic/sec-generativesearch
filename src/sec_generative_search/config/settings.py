@@ -48,7 +48,7 @@ class EdgarSettings(BaseSettings):
     identity_name: str | None = None
     identity_email: str | None = None
 
-    model_config = SettingsConfigDict(env_prefix="EDGAR_")
+    model_config = SettingsConfigDict(env_prefix="EDGAR_", hide_input_in_errors=True)
 
 
 class EmbeddingSettings(BaseSettings):
@@ -76,7 +76,7 @@ class EmbeddingSettings(BaseSettings):
     # inside the first user request.  Fail-fast on error.  Local-only.
     warm_on_boot: bool = False
 
-    model_config = SettingsConfigDict(env_prefix="EMBEDDING_")
+    model_config = SettingsConfigDict(env_prefix="EMBEDDING_", hide_input_in_errors=True)
 
     @field_validator("provider")
     @classmethod
@@ -163,7 +163,7 @@ class ChunkingSettings(BaseSettings):
     token_limit: int = 1000
     tolerance: int = 150
 
-    model_config = SettingsConfigDict(env_prefix="CHUNKING_")
+    model_config = SettingsConfigDict(env_prefix="CHUNKING_", hide_input_in_errors=True)
 
 
 def resolve_secret_from_value_or_file(
@@ -339,7 +339,7 @@ class DatabaseSettings(BaseSettings):
     # always be encrypted at rest.
     persist_provider_credentials: bool | None = None
 
-    model_config = SettingsConfigDict(env_prefix="DB_")
+    model_config = SettingsConfigDict(env_prefix="DB_", hide_input_in_errors=True)
 
     @field_validator("deployment_profile")
     @classmethod
@@ -509,7 +509,7 @@ class LLMSettings(BaseSettings):
     default_model: str | None = None  # None = use the provider's own default
     max_output_tokens: int = 2048
 
-    model_config = SettingsConfigDict(env_prefix="LLM_")
+    model_config = SettingsConfigDict(env_prefix="LLM_", hide_input_in_errors=True)
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -566,7 +566,7 @@ class LocalLLMSettings(BaseSettings):
     default_model: str = "llama3.2"
     allow_non_local: bool = False
 
-    model_config = SettingsConfigDict(env_prefix="LOCAL_LLM_")
+    model_config = SettingsConfigDict(env_prefix="LOCAL_LLM_", hide_input_in_errors=True)
 
     @model_validator(mode="after")
     def _validate_base_url_host_policy(self) -> "LocalLLMSettings":
@@ -642,7 +642,7 @@ class ProviderSettings(BaseSettings):
     # database paths.
     catalogue_overlay_path: str = "./data/model_catalogue_overlay.json"
 
-    model_config = SettingsConfigDict(env_prefix="PROVIDER_")
+    model_config = SettingsConfigDict(env_prefix="PROVIDER_", hide_input_in_errors=True)
 
     @field_validator("timeout")
     @classmethod
@@ -800,7 +800,7 @@ class RAGSettings(BaseSettings):
     # set this once per deployment.
     output_language: str = "auto"
 
-    model_config = SettingsConfigDict(env_prefix="RAG_")
+    model_config = SettingsConfigDict(env_prefix="RAG_", hide_input_in_errors=True)
 
     @field_validator("history_token_budget")
     @classmethod
@@ -838,7 +838,7 @@ class SearchSettings(BaseSettings):
     # validated now so a deployment can pre-set it.
     rerank_over_fetch_factor: int = 4
 
-    model_config = SettingsConfigDict(env_prefix="SEARCH_")
+    model_config = SettingsConfigDict(env_prefix="SEARCH_", hide_input_in_errors=True)
 
     @field_validator("max_per_section", "max_per_filing")
     @classmethod
@@ -1021,9 +1021,6 @@ class ApiSettings(BaseSettings):
         self.demo_reset_token = token
         return self
 
-    # ``hide_input_in_errors``: a failing validator must not print the model
-    # input — pydantic would render the API / admin keys, the pepper and the
-    # demo-reset token (in full, or their tails) into the boot error log.
     model_config = SettingsConfigDict(env_prefix="API_", hide_input_in_errors=True)
 
 
@@ -1059,6 +1056,11 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",  # Ignore prefixed env vars handled by nested classes
+        # Every settings model hides its input from validation errors: pydantic
+        # would otherwise render the configured values — API / admin keys, the
+        # pepper, the SQLCipher key, the EDGAR identity — in full or as a tail
+        # into the boot error, i.e. into the container log.
+        hide_input_in_errors=True,
     )
 
 
