@@ -20,8 +20,8 @@ Access model — a deliberate, reviewed exception to rule **A**
   (``401``); settings refuse a token outside ``API_DEMO_MODE``.
 - Kept **off** the SPA admin proxy's allow-list — the browser cannot reach
   it even with an admin session.
-- The token is never logged (the access-log layer suppresses the header)
-  and never echoed.
+- The token is never logged in clear (the access-log layer masks the
+  header like ``X-API-Key``) and never echoed.
 """
 
 from __future__ import annotations
