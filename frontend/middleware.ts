@@ -10,11 +10,17 @@ import {
 // available in both the Edge and Node runtimes; sticking to Edge keeps the
 // security surface minimal.
 export const config = {
-  // Match every request path except file-extension paths, /_next/static and
-  // favicon.ico. `/_next/image` is deliberately NOT excluded: the optimizer
-  // is disabled (next.config.ts), so that path renders the HTML not-found
-  // page, which must carry the CSP + header set like any other page.
-  matcher: ["/((?!.*\\.[a-zA-Z0-9]+$|_next/static|favicon.ico).*)"],
+  // Match every request path except the hashed build assets under
+  // `/_next/static/` (trailing slash included). Any path Next does not serve
+  // as a file renders the HTML not-found page, which reflects the path and
+  // query into an inline script — so it must carry the nonce'd CSP + header
+  // set like every other page. Excluding a path by its *shape* (a `.ext`
+  // suffix, `favicon.ico`, `_next/static` without the slash) sent that page
+  // out header-less; nothing is served from `public/`, so no such exclusion
+  // is needed. `/_next/image` is covered too: the optimizer is disabled
+  // (next.config.ts), so it renders the same page. Locked by
+  // tests/security/middleware-matcher.test.ts.
+  matcher: ["/((?!_next/static/).*)"],
 };
 
 const IS_DEVELOPMENT = process.env.NODE_ENV === "development";
