@@ -1,3 +1,21 @@
 allowBuilds:
   sharp: false
   unrs-resolver: false
+
+# pnpm 11 refuses lockfile entries younger than its default 24h
+# minimumReleaseAge. next 16.3.8 is the GHSA-vcvr-r3jv-pc5j security bump,
+# so its release set is exempted by exact version; pnpm rejects a versioned
+# `@next/*` pattern, so every package is listed. Drop these once they age out.
+minimumReleaseAgeExclude:
+  - next@16.3.8
+  - eslint-config-next@16.3.8
+  - '@next/env@16.3.8'
+  - '@next/eslint-plugin-next@16.3.8'
+  - '@next/swc-darwin-arm64@16.3.8'
+  - '@next/swc-darwin-x64@16.3.8'
+  - '@next/swc-linux-arm64-gnu@16.3.8'
+  - '@next/swc-linux-arm64-musl@16.3.8'
+  - '@next/swc-linux-x64-gnu@16.3.8'
+  - '@next/swc-linux-x64-musl@16.3.8'
+  - '@next/swc-win32-arm64-msvc@16.3.8'
+  - '@next/swc-win32-x64-msvc@16.3.8'
