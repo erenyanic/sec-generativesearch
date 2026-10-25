@@ -247,7 +247,7 @@ class GeminiProvider(_GeminiClientMixin, BaseLLMProvider):
     """Chat-completion provider for Google's Gemini models."""
 
     provider_name: ClassVar[str] = "gemini"
-    default_model: ClassVar[str] = "gemini-3-flash-preview"
+    default_model: ClassVar[str] = "gemini-3.8-flash"
 
     def __init__(
         self,
