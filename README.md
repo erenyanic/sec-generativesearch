@@ -226,8 +226,8 @@ Twelve hosted providers, each via its first-party SDK, plus a self-hosted `local
 | Provider   | Default chat model            | Embedding (if used)          |
 | ---------- | ----------------------------- | ---------------------------- |
 | OpenAI     | `gpt-5.4-mini`                | `text-embedding-3-small`     |
-| Anthropic  | `claude-haiku-4-5`            | —                            |
-| Gemini     | `gemini-3-flash-preview`      | `gemini-embedding-2-preview` |
+| Anthropic  | `claude-haiku-5-5`            | —                            |
+| Gemini     | `gemini-3.8-flash`            | `gemini-embedding-2-preview` |
 | Mistral    | `mistral-small-2603`          | `mistral-embed`              |
 | DeepSeek   | `deepseek-v4-flash`           | —                            |
 | Grok       | `grok-4-1-fast-non-reasoning` | —                            |

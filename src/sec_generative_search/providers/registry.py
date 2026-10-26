@@ -218,13 +218,13 @@ class ProviderRegistry:
             "anthropic",
             ProviderSurface.LLM,
             f"{_P}.anthropic:AnthropicProvider",
-            default_model="claude-haiku-4-5",
+            default_model="claude-haiku-5-5",
         ),
         ProviderEntry(
             "gemini",
             ProviderSurface.LLM,
             f"{_P}.gemini:GeminiProvider",
-            default_model="gemini-3-flash-preview",
+            default_model="gemini-3.8-flash",
         ),
         ProviderEntry(
             "deepseek",

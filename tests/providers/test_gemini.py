@@ -189,7 +189,7 @@ class TestProviderMetadata:
         assert GeminiEmbeddingProvider.provider_name == "gemini"
 
     def test_default_models(self) -> None:
-        assert GeminiProvider.default_model == "gemini-3-flash-preview"
+        assert GeminiProvider.default_model == "gemini-3.8-flash"
         assert GeminiEmbeddingProvider.default_model == "gemini-embedding-2"
 
     def test_catalogue_has_tiered_models(self) -> None:

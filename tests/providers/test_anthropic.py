@@ -179,7 +179,7 @@ class TestProviderMetadata:
         assert AnthropicProvider.provider_name == "anthropic"
 
     def test_default_model(self) -> None:
-        assert AnthropicProvider.default_model == "claude-haiku-4-5"
+        assert AnthropicProvider.default_model == "claude-haiku-5-5"
 
     def test_catalogue_has_tiered_models(self) -> None:
         def tier(slug: str) -> PricingTier:
@@ -251,7 +251,7 @@ class TestGenerate:
         provider._fake_client.messages.create.return_value = _make_message()
         provider.generate(GenerationRequest(prompt="hi", model=""))
         kwargs = provider._fake_client.messages.create.call_args.kwargs
-        assert kwargs["model"] == "claude-haiku-4-5"
+        assert kwargs["model"] == "claude-haiku-5-5"
         assert kwargs["stream"] is False
 
     def test_system_prompt_passed_as_field(self, provider: AnthropicProvider) -> None:

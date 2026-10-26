@@ -104,7 +104,7 @@ class AnthropicProvider(BaseLLMProvider):
     """Chat-completion provider for Anthropic's hosted Claude models."""
 
     provider_name: ClassVar[str] = "anthropic"
-    default_model: ClassVar[str] = "claude-haiku-5.5"
+    default_model: ClassVar[str] = "claude-haiku-5-5"
     default_timeout: ClassVar[float] = 60.0
 
     def __init__(
