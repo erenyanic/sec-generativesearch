@@ -34,7 +34,7 @@ class OpenAIProvider(OpenAICompatibleLLMProvider):
     """Chat-completion provider for OpenAI's hosted models."""
 
     provider_name = "openai"
-    default_model = "gpt-5.4-mini"
+    default_model = "gpt-6-luna"
 
 
 class OpenAIEmbeddingProvider(OpenAICompatibleEmbeddingProvider):
