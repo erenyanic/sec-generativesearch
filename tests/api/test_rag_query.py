@@ -304,9 +304,9 @@ class TestRagQueryDelegation:
         assert usage["output_tokens"] == 42
         assert usage["total_tokens"] == 162
         # Estimated cost is the canonical token-weighted estimate for the
-        # resolved model (gpt-5.4-mini: in=0.6, out=2.4 USD/MTok):
-        # 120/1e6*0.6 + 42/1e6*2.4 = 0.0001728.
-        assert body["estimated_cost_usd"] == pytest.approx(0.0001728)
+        # resolved model (gpt-6-luna: in=0.1, out=0.5 USD/MTok):
+        # 120/1e6*0.1 + 42/1e6*0.5 = 0.000033.
+        assert body["estimated_cost_usd"] == pytest.approx(0.000033)
         # Orchestrator received the lifted plan, not the raw payload.
         call = orch.calls[0]
         assert call["plan_raw_query"] == "What are AAPL's iPhone segment risks?"
@@ -488,7 +488,7 @@ class TestRagQueryCostEstimate:
             headers={"X-Provider-Key-openai": "sk-1234"},  # pragma: allowlist secret
         )
         assert response.status_code == 200
-        assert response.json()["estimated_cost_usd"] == pytest.approx(0.0001728)
+        assert response.json()["estimated_cost_usd"] == pytest.approx(0.000033)
 
     def test_arbitrary_slug_provider_cost_is_none(self, rag_query_app_factory) -> None:
         # OpenRouter carries no catalogued cost — the capability the route

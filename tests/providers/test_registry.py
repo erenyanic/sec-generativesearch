@@ -575,10 +575,10 @@ class TestGetCapability:
         assert cap.pricing_tier is PricingTier.FREE
 
     def test_default_model_used_when_none_passed(self) -> None:
-        # ``OpenAIProvider.default_model`` is ``"gpt-5.4-mini"``. The
+        # ``OpenAIProvider.default_model`` is ``"gpt-6-luna"``. The
         # registry must fall through to it.
         cap = ProviderRegistry.get_capability("openai", ProviderSurface.LLM)
-        expected = model_catalogue().get_llm_capability("openai", "gpt-5.4-mini")
+        expected = model_catalogue().get_llm_capability("openai", "gpt-6-luna")
         assert cap == expected
 
     def test_known_embedding_slug_returns_embeddings_capability(self) -> None:

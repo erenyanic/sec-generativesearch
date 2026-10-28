@@ -62,8 +62,8 @@ class TestProviderMetadata:
         OpenAIProvider(_LONG_KEY)
         assert _patch_openai_client["kwargs"]["base_url"] is None
 
-    def test_default_model_is_gpt_5_4_mini(self) -> None:
-        assert OpenAIProvider.default_model == "gpt-5.4-mini"
+    def test_default_model(self) -> None:
+        assert OpenAIProvider.default_model == "gpt-6-luna"
 
     def test_catalogue_includes_required_models(self) -> None:
         for slug in (

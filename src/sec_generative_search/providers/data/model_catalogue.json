@@ -8,6 +8,17 @@
   },
   "providers": {
     "openai": {
+      "gpt-6-luna": {
+        "streaming": true,
+        "tool_use": true,
+        "structured_output": true,
+        "prompt_caching": true,
+        "vision": true,
+        "context_window_tokens": 1050000,
+        "max_output_tokens": 128000,
+        "input_cost_per_mtok": 0.1,
+        "output_cost_per_mtok": 0.5
+      },
       "gpt-5.5-pro": {
         "streaming": true,
         "tool_use": true,

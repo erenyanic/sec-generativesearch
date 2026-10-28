@@ -212,7 +212,7 @@ class ProviderRegistry:
             "openai",
             ProviderSurface.LLM,
             f"{_P}.openai:OpenAIProvider",
-            default_model="gpt-5.4-mini",
+            default_model="gpt-6-luna",
         ),
         ProviderEntry(
             "anthropic",
