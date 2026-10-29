@@ -80,10 +80,10 @@ _LONG_KEY = "sk-test-BEHAVIOUR-ABCDEFGHIJKLMNOPQRSTUVWX"  # pragma: allowlist se
 _LLM_VENDORS: list[tuple[type, str]] = [
     (MistralProvider, "mistral-small-2603"),
     (KimiProvider, "kimi-k2.5"),
-    (DeepSeekProvider, "deepseek-v4-flash"),
+    (DeepSeekProvider, "deepseek-flash"),
     (QwenProvider, "qwen3.6-plus"),
     (ZaiProvider, "glm-5"),
-    (GrokProvider, "grok-4-1-fast-non-reasoning"),
+    (GrokProvider, "grok-4.3"),
     (MiniMaxProvider, "minimax-m2.7"),
     (MimoProvider, "mimo-v2.5"),
 ]

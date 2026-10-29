@@ -230,7 +230,7 @@ class ProviderRegistry:
             "deepseek",
             ProviderSurface.LLM,
             f"{_P}.deepseek:DeepSeekProvider",
-            default_model="deepseek-v4-flash",
+            default_model="deepseek-flash",
         ),
         ProviderEntry(
             "kimi", ProviderSurface.LLM, f"{_P}.kimi:KimiProvider", default_model="kimi-k2.5"
@@ -249,7 +249,7 @@ class ProviderRegistry:
             "grok",
             ProviderSurface.LLM,
             f"{_P}.grok:GrokProvider",
-            default_model="grok-4-1-fast-non-reasoning",
+            default_model="grok-4.3",
         ),
         ProviderEntry(
             "minimax",

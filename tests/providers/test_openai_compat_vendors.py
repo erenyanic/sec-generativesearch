@@ -111,7 +111,7 @@ _LLM_VENDORS: list[tuple[type, str, str, str]] = [
         DeepSeekProvider,
         "deepseek",
         "https://api.deepseek.com",
-        "deepseek-v4-flash",
+        "deepseek-flash",
     ),
     (
         QwenProvider,
@@ -129,7 +129,7 @@ _LLM_VENDORS: list[tuple[type, str, str, str]] = [
         GrokProvider,
         "grok",
         "https://api.x.ai/v1",
-        "grok-4-1-fast-non-reasoning",
+        "grok-4.3",
     ),
     (
         MiniMaxProvider,
