@@ -94,8 +94,8 @@ class TestProviderMetadata:
             return ProviderRegistry.get_capability("openai", ProviderSurface.LLM, slug).pricing_tier
 
         assert tier("gpt-5.4-mini") == PricingTier.STANDARD
-        assert tier("gpt-5.4") == PricingTier.PREMIUM
-        assert tier("gpt-4.1-mini") == PricingTier.LOW
+        assert tier("gpt-5.4") == PricingTier.HIGH
+        assert tier("gpt-4.1-mini") == PricingTier.STANDARD
         assert tier("gpt-5.4-pro") == PricingTier.PREMIUM
         assert tier("gpt-4.1") == PricingTier.HIGH
 

@@ -196,10 +196,10 @@ class TestProviderMetadata:
         def cap(slug: str) -> ProviderCapability:
             return ProviderRegistry.get_capability("gemini", ProviderSurface.LLM, slug)
 
-        assert cap("gemini-3.1-pro-preview").pricing_tier == PricingTier.PREMIUM
+        assert cap("gemini-3.1-pro-preview").pricing_tier == PricingTier.HIGH
         assert cap("gemini-3.1-pro-preview-customtools").tool_use is True
         assert cap("gemini-3-flash-preview").pricing_tier == PricingTier.STANDARD
-        assert cap("gemini-2.5-pro").pricing_tier == PricingTier.PREMIUM
+        assert cap("gemini-2.5-pro").pricing_tier == PricingTier.HIGH
         assert cap("gemini-2.5-flash-lite").pricing_tier == PricingTier.LOW
         assert cap("gemini-2.5-flash").pricing_tier == PricingTier.STANDARD
 

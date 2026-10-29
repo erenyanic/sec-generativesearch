@@ -2,8 +2,8 @@
   "_meta": {
     "schema_version": 1,
     "description": "Vendored baseline LLM model catalogue: the full capability matrix and exact per-MTok costs for every closed-catalogue model. pricing_tier is NEVER stored here -- it is derived from cost at load by ProviderCapability.__post_init__ / derive_pricing_tier. chat=true / embeddings=false are LLM-surface invariants applied by the loader, not stored per row.",
-    "generated_at": "2026-06-25",
-    "source": "Consolidation of the per-adapter MODEL_CATALOGUE dicts into package data. The model set is forward-dated and largely pre-release, so baseline costs are tier-calibrated estimates (blended input/output) chosen to reproduce each model's reviewed pricing tier; they are placeholders pending a future refresh from models.dev / LiteLLM.",
+    "generated_at": "2026-10-29",
+    "source": "Consolidation of the per-adapter MODEL_CATALOGUE dicts into package data. Costs for every model listed on models.dev (https://models.dev/api.json) were refreshed from it on 2026-10-29, matched against the models.dev provider whose endpoint each adapter targets (e.g. zai = api.z.ai, not zhipuai). Models absent from models.dev keep tier-calibrated placeholder costs (blended input/output) chosen to reproduce their reviewed pricing tier, pending a future refresh.",
     "cost_units": "USD per 1,000,000 tokens; null = unknown"
   },
   "providers": {
@@ -27,8 +27,8 @@
         "vision": true,
         "context_window_tokens": 1050000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 15.0,
-        "output_cost_per_mtok": 60.0
+        "input_cost_per_mtok": 30.0,
+        "output_cost_per_mtok": 180.0
       },
       "gpt-5.5": {
         "streaming": true,
@@ -38,8 +38,8 @@
         "vision": true,
         "context_window_tokens": 1050000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 10.0,
-        "output_cost_per_mtok": 40.0
+        "input_cost_per_mtok": 5.0,
+        "output_cost_per_mtok": 30.0
       },
       "gpt-5.4-pro": {
         "streaming": true,
@@ -49,8 +49,8 @@
         "vision": true,
         "context_window_tokens": 1050000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 15.0,
-        "output_cost_per_mtok": 60.0
+        "input_cost_per_mtok": 30.0,
+        "output_cost_per_mtok": 180.0
       },
       "gpt-5.4": {
         "streaming": true,
@@ -60,8 +60,8 @@
         "vision": true,
         "context_window_tokens": 1050000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 10.0,
-        "output_cost_per_mtok": 40.0
+        "input_cost_per_mtok": 2.5,
+        "output_cost_per_mtok": 15.0
       },
       "gpt-5.4-mini": {
         "streaming": true,
@@ -71,8 +71,8 @@
         "vision": true,
         "context_window_tokens": 400000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.6,
-        "output_cost_per_mtok": 2.4
+        "input_cost_per_mtok": 0.75,
+        "output_cost_per_mtok": 4.5
       },
       "gpt-5.4-nano": {
         "streaming": true,
@@ -82,8 +82,8 @@
         "vision": true,
         "context_window_tokens": 400000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.2,
+        "output_cost_per_mtok": 1.25
       },
       "gpt-5.2-pro": {
         "streaming": true,
@@ -93,8 +93,8 @@
         "vision": true,
         "context_window_tokens": 400000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 15.0,
-        "output_cost_per_mtok": 60.0
+        "input_cost_per_mtok": 21.0,
+        "output_cost_per_mtok": 168.0
       },
       "gpt-5.2": {
         "streaming": true,
@@ -104,8 +104,8 @@
         "vision": true,
         "context_window_tokens": 400000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 10.0,
-        "output_cost_per_mtok": 40.0
+        "input_cost_per_mtok": 1.75,
+        "output_cost_per_mtok": 14.0
       },
       "gpt-5.1": {
         "streaming": true,
@@ -115,8 +115,8 @@
         "vision": true,
         "context_window_tokens": 400000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 10.0,
-        "output_cost_per_mtok": 40.0
+        "input_cost_per_mtok": 1.25,
+        "output_cost_per_mtok": 10.0
       },
       "gpt-5-pro": {
         "streaming": true,
@@ -127,7 +127,7 @@
         "context_window_tokens": 400000,
         "max_output_tokens": 272000,
         "input_cost_per_mtok": 15.0,
-        "output_cost_per_mtok": 60.0
+        "output_cost_per_mtok": 120.0
       },
       "gpt-5": {
         "streaming": true,
@@ -137,8 +137,8 @@
         "vision": true,
         "context_window_tokens": 400000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 10.0,
-        "output_cost_per_mtok": 40.0
+        "input_cost_per_mtok": 1.25,
+        "output_cost_per_mtok": 10.0
       },
       "gpt-5-mini": {
         "streaming": true,
@@ -148,8 +148,8 @@
         "vision": true,
         "context_window_tokens": 400000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.6,
-        "output_cost_per_mtok": 2.4
+        "input_cost_per_mtok": 0.25,
+        "output_cost_per_mtok": 2.0
       },
       "gpt-5-nano": {
         "streaming": true,
@@ -159,8 +159,8 @@
         "vision": true,
         "context_window_tokens": 400000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.05,
+        "output_cost_per_mtok": 0.4
       },
       "gpt-4.1": {
         "streaming": true,
@@ -170,8 +170,8 @@
         "vision": true,
         "context_window_tokens": 1047576,
         "max_output_tokens": 32768,
-        "input_cost_per_mtok": 3.2,
-        "output_cost_per_mtok": 12.8
+        "input_cost_per_mtok": 2.0,
+        "output_cost_per_mtok": 8.0
       },
       "gpt-4.1-mini": {
         "streaming": true,
@@ -181,8 +181,8 @@
         "vision": true,
         "context_window_tokens": 1047576,
         "max_output_tokens": 32768,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.4,
+        "output_cost_per_mtok": 1.6
       },
       "gpt-4.1-nano": {
         "streaming": true,
@@ -192,8 +192,8 @@
         "vision": true,
         "context_window_tokens": 1047576,
         "max_output_tokens": 32768,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.1,
+        "output_cost_per_mtok": 0.4
       },
       "gpt-4o": {
         "streaming": true,
@@ -203,8 +203,8 @@
         "vision": true,
         "context_window_tokens": 128000,
         "max_output_tokens": 16384,
-        "input_cost_per_mtok": 10.0,
-        "output_cost_per_mtok": 40.0
+        "input_cost_per_mtok": 2.5,
+        "output_cost_per_mtok": 10.0
       },
       "gpt-4o-mini": {
         "streaming": true,
@@ -214,8 +214,8 @@
         "vision": true,
         "context_window_tokens": 128000,
         "max_output_tokens": 16384,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.15,
+        "output_cost_per_mtok": 0.6
       },
       "o3": {
         "streaming": true,
@@ -225,8 +225,8 @@
         "vision": false,
         "context_window_tokens": 200000,
         "max_output_tokens": 100000,
-        "input_cost_per_mtok": 3.2,
-        "output_cost_per_mtok": 12.8
+        "input_cost_per_mtok": 2.0,
+        "output_cost_per_mtok": 8.0
       },
       "o4-mini": {
         "streaming": true,
@@ -236,8 +236,8 @@
         "vision": false,
         "context_window_tokens": 200000,
         "max_output_tokens": 100000,
-        "input_cost_per_mtok": 0.6,
-        "output_cost_per_mtok": 2.4
+        "input_cost_per_mtok": 1.1,
+        "output_cost_per_mtok": 4.4
       }
     },
     "anthropic": {
@@ -249,8 +249,8 @@
         "vision": true,
         "context_window_tokens": 1000000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 15.0,
-        "output_cost_per_mtok": 60.0
+        "input_cost_per_mtok": 5.0,
+        "output_cost_per_mtok": 25.0
       },
       "claude-opus-4-7": {
         "streaming": true,
@@ -260,8 +260,8 @@
         "vision": true,
         "context_window_tokens": 1000000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 15.0,
-        "output_cost_per_mtok": 60.0
+        "input_cost_per_mtok": 5.0,
+        "output_cost_per_mtok": 25.0
       },
       "claude-sonnet-4-6": {
         "streaming": true,
@@ -271,8 +271,8 @@
         "vision": true,
         "context_window_tokens": 1000000,
         "max_output_tokens": 64000,
-        "input_cost_per_mtok": 10.0,
-        "output_cost_per_mtok": 40.0
+        "input_cost_per_mtok": 3.0,
+        "output_cost_per_mtok": 15.0
       },
       "claude-haiku-5-5": {
         "streaming": true,
@@ -293,8 +293,8 @@
         "vision": true,
         "context_window_tokens": 200000,
         "max_output_tokens": 64000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 1.0,
+        "output_cost_per_mtok": 5.0
       }
     },
     "gemini": {
@@ -306,8 +306,8 @@
         "vision": true,
         "context_window_tokens": 1048576,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 7.2,
-        "output_cost_per_mtok": 28.8
+        "input_cost_per_mtok": 2.0,
+        "output_cost_per_mtok": 12.0
       },
       "gemini-3.1-pro-preview-customtools": {
         "streaming": true,
@@ -317,8 +317,8 @@
         "vision": true,
         "context_window_tokens": 1048576,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 7.2,
-        "output_cost_per_mtok": 28.8
+        "input_cost_per_mtok": 2.0,
+        "output_cost_per_mtok": 12.0
       },
       "gemini-3.8-flash": {
         "streaming": true,
@@ -339,8 +339,8 @@
         "vision": true,
         "context_window_tokens": 1048576,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 2.2,
-        "output_cost_per_mtok": 8.8
+        "input_cost_per_mtok": 1.5,
+        "output_cost_per_mtok": 9.0
       },
       "gemini-3.1-flash-lite": {
         "streaming": true,
@@ -350,8 +350,8 @@
         "vision": true,
         "context_window_tokens": 1048576,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.25,
+        "output_cost_per_mtok": 1.5
       },
       "gemini-3.1-flash-lite-preview": {
         "streaming": true,
@@ -361,8 +361,8 @@
         "vision": true,
         "context_window_tokens": 1048576,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.25,
+        "output_cost_per_mtok": 1.5
       },
       "gemini-3-flash-preview": {
         "streaming": true,
@@ -372,8 +372,8 @@
         "vision": true,
         "context_window_tokens": 1048576,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.6,
-        "output_cost_per_mtok": 2.4
+        "input_cost_per_mtok": 0.5,
+        "output_cost_per_mtok": 3.0
       },
       "gemini-2.5-pro": {
         "streaming": true,
@@ -383,8 +383,8 @@
         "vision": true,
         "context_window_tokens": 1048576,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 7.2,
-        "output_cost_per_mtok": 28.8
+        "input_cost_per_mtok": 1.25,
+        "output_cost_per_mtok": 10.0
       },
       "gemini-2.5-flash-lite": {
         "streaming": true,
@@ -394,8 +394,8 @@
         "vision": true,
         "context_window_tokens": 1048576,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.1,
+        "output_cost_per_mtok": 0.4
       },
       "gemini-2.5-flash": {
         "streaming": true,
@@ -405,8 +405,8 @@
         "vision": true,
         "context_window_tokens": 1048576,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.6,
-        "output_cost_per_mtok": 2.4
+        "input_cost_per_mtok": 0.3,
+        "output_cost_per_mtok": 2.5
       }
     },
     "deepseek": {
@@ -418,8 +418,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 384000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.15,
+        "output_cost_per_mtok": 0.6
       },
       "deepseek-v4-flash": {
         "streaming": true,
@@ -429,8 +429,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 384000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.15,
+        "output_cost_per_mtok": 0.6
       },
       "deepseek-v4-pro": {
         "streaming": true,
@@ -440,8 +440,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 384000,
-        "input_cost_per_mtok": 1.2,
-        "output_cost_per_mtok": 4.8
+        "input_cost_per_mtok": 0.66,
+        "output_cost_per_mtok": 1.98
       }
     },
     "kimi": {
@@ -453,8 +453,8 @@
         "vision": true,
         "context_window_tokens": 262144,
         "max_output_tokens": 262144,
-        "input_cost_per_mtok": 2.2,
-        "output_cost_per_mtok": 8.8
+        "input_cost_per_mtok": 1.9,
+        "output_cost_per_mtok": 8.0
       },
       "kimi-k2.7-code": {
         "streaming": true,
@@ -464,8 +464,8 @@
         "vision": true,
         "context_window_tokens": 262144,
         "max_output_tokens": 262144,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.95,
+        "output_cost_per_mtok": 4.0
       },
       "kimi-k2.6": {
         "streaming": true,
@@ -475,8 +475,8 @@
         "vision": true,
         "context_window_tokens": 262144,
         "max_output_tokens": 262144,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.95,
+        "output_cost_per_mtok": 4.0
       },
       "kimi-k2.5": {
         "streaming": true,
@@ -565,8 +565,8 @@
         "vision": false,
         "context_window_tokens": 256000,
         "max_output_tokens": 256000,
-        "input_cost_per_mtok": 0.18,
-        "output_cost_per_mtok": 0.72
+        "input_cost_per_mtok": 0.5,
+        "output_cost_per_mtok": 1.5
       },
       "mistral-medium-2508": {
         "streaming": true,
@@ -576,8 +576,8 @@
         "vision": false,
         "context_window_tokens": 128000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 1.2,
-        "output_cost_per_mtok": 4.8
+        "input_cost_per_mtok": 0.4,
+        "output_cost_per_mtok": 2.0
       },
       "mistral-small-2603": {
         "streaming": true,
@@ -587,8 +587,8 @@
         "vision": false,
         "context_window_tokens": 256000,
         "max_output_tokens": 256000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.15,
+        "output_cost_per_mtok": 0.6
       },
       "mistral-small-2506": {
         "streaming": true,
@@ -598,8 +598,8 @@
         "vision": false,
         "context_window_tokens": 256000,
         "max_output_tokens": 256000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.1,
+        "output_cost_per_mtok": 0.3
       },
       "ministral-14b-2512": {
         "streaming": true,
@@ -609,8 +609,8 @@
         "vision": false,
         "context_window_tokens": 256000,
         "max_output_tokens": 256000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.2,
+        "output_cost_per_mtok": 0.2
       },
       "ministral-8b-2512": {
         "streaming": true,
@@ -620,8 +620,8 @@
         "vision": false,
         "context_window_tokens": 256000,
         "max_output_tokens": 256000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.15,
+        "output_cost_per_mtok": 0.15
       },
       "ministral-3b-2512": {
         "streaming": true,
@@ -631,8 +631,8 @@
         "vision": false,
         "context_window_tokens": 256000,
         "max_output_tokens": 256000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.1,
+        "output_cost_per_mtok": 0.1
       },
       "codestral-2508": {
         "streaming": true,
@@ -642,8 +642,8 @@
         "vision": false,
         "context_window_tokens": 128000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.18,
-        "output_cost_per_mtok": 0.72
+        "input_cost_per_mtok": 0.3,
+        "output_cost_per_mtok": 0.9
       },
       "devstral-2512": {
         "streaming": true,
@@ -653,8 +653,8 @@
         "vision": false,
         "context_window_tokens": 256000,
         "max_output_tokens": 256000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.4,
+        "output_cost_per_mtok": 2.0
       }
     },
     "qwen": {
@@ -666,8 +666,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 4.4,
-        "output_cost_per_mtok": 17.6
+        "input_cost_per_mtok": 2.5,
+        "output_cost_per_mtok": 7.5
       },
       "qwen3.7-plus": {
         "streaming": true,
@@ -677,8 +677,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.4,
+        "output_cost_per_mtok": 1.6
       },
       "qwen3-max": {
         "streaming": true,
@@ -688,8 +688,8 @@
         "vision": false,
         "context_window_tokens": 262144,
         "max_output_tokens": 32768,
-        "input_cost_per_mtok": 15.0,
-        "output_cost_per_mtok": 60.0
+        "input_cost_per_mtok": 1.2,
+        "output_cost_per_mtok": 6.0
       },
       "qwen3-max-thinking": {
         "streaming": true,
@@ -710,8 +710,8 @@
         "vision": false,
         "context_window_tokens": 262144,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 15.0,
-        "output_cost_per_mtok": 60.0
+        "input_cost_per_mtok": 1.3,
+        "output_cost_per_mtok": 7.8
       },
       "qwen3.6-plus": {
         "streaming": true,
@@ -721,8 +721,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 3.2,
-        "output_cost_per_mtok": 12.8
+        "input_cost_per_mtok": 0.5,
+        "output_cost_per_mtok": 3.0
       },
       "qwen3.6-flash": {
         "streaming": true,
@@ -732,8 +732,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.6,
-        "output_cost_per_mtok": 2.4
+        "input_cost_per_mtok": 0.25,
+        "output_cost_per_mtok": 1.5
       },
       "qwen3.6-35b-a3b": {
         "streaming": true,
@@ -743,8 +743,8 @@
         "vision": false,
         "context_window_tokens": 262144,
         "max_output_tokens": 262144,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.375,
+        "output_cost_per_mtok": 2.25
       },
       "qwen3.6-27b": {
         "streaming": true,
@@ -754,7 +754,7 @@
         "vision": false,
         "context_window_tokens": 262144,
         "max_output_tokens": 262144,
-        "input_cost_per_mtok": 0.9,
+        "input_cost_per_mtok": 0.6,
         "output_cost_per_mtok": 3.6
       },
       "qwen3.5-plus": {
@@ -765,8 +765,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.4,
+        "output_cost_per_mtok": 2.4
       },
       "qwen3.5-flash": {
         "streaming": true,
@@ -776,8 +776,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.1,
+        "output_cost_per_mtok": 0.4
       },
       "qwen3.5-35b-a3b": {
         "streaming": true,
@@ -787,8 +787,8 @@
         "vision": false,
         "context_window_tokens": 262144,
         "max_output_tokens": 262144,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.25,
+        "output_cost_per_mtok": 2.0
       },
       "qwen3.5-27b": {
         "streaming": true,
@@ -798,8 +798,8 @@
         "vision": false,
         "context_window_tokens": 262144,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.3,
+        "output_cost_per_mtok": 2.4
       },
       "qwen3.5-9b": {
         "streaming": true,
@@ -820,7 +820,7 @@
         "vision": false,
         "context_window_tokens": 262144,
         "max_output_tokens": 65536,
-        "input_cost_per_mtok": 0.9,
+        "input_cost_per_mtok": 0.6,
         "output_cost_per_mtok": 3.6
       },
       "qwen3.5-omni-plus": {
@@ -853,8 +853,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 32768,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.4,
+        "output_cost_per_mtok": 1.2
       },
       "qwen-plus-2025-07-28": {
         "streaming": true,
@@ -877,8 +877,8 @@
         "vision": false,
         "context_window_tokens": 1000000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 1.4,
+        "output_cost_per_mtok": 4.4
       },
       "glm-5.1": {
         "streaming": true,
@@ -888,8 +888,8 @@
         "vision": false,
         "context_window_tokens": 200000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 1.4,
+        "output_cost_per_mtok": 4.4
       },
       "glm-5": {
         "streaming": true,
@@ -899,8 +899,8 @@
         "vision": false,
         "context_window_tokens": 200000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 1.0,
+        "output_cost_per_mtok": 3.2
       },
       "glm-5-turbo": {
         "streaming": true,
@@ -910,8 +910,8 @@
         "vision": false,
         "context_window_tokens": 200000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.6,
-        "output_cost_per_mtok": 2.4
+        "input_cost_per_mtok": 1.2,
+        "output_cost_per_mtok": 4.0
       },
       "glm-4.7": {
         "streaming": true,
@@ -921,8 +921,8 @@
         "vision": false,
         "context_window_tokens": 200000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.6,
+        "output_cost_per_mtok": 2.2
       },
       "glm-4.7-flashx": {
         "streaming": true,
@@ -932,8 +932,8 @@
         "vision": false,
         "context_window_tokens": 200000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.07,
+        "output_cost_per_mtok": 0.4
       },
       "glm-4.6": {
         "streaming": true,
@@ -943,8 +943,8 @@
         "vision": false,
         "context_window_tokens": 200000,
         "max_output_tokens": 128000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.6,
+        "output_cost_per_mtok": 2.2
       },
       "glm-4.5": {
         "streaming": true,
@@ -954,8 +954,8 @@
         "vision": false,
         "context_window_tokens": 128000,
         "max_output_tokens": 96000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.6,
+        "output_cost_per_mtok": 2.2
       },
       "glm-4.5-x": {
         "streaming": true,
@@ -976,8 +976,8 @@
         "vision": false,
         "context_window_tokens": 128000,
         "max_output_tokens": 96000,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.2,
+        "output_cost_per_mtok": 1.1
       },
       "glm-4.5-airx": {
         "streaming": true,
@@ -1022,8 +1022,8 @@
         "vision": true,
         "context_window_tokens": 1000000,
         "max_output_tokens": 1000000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 1.25,
+        "output_cost_per_mtok": 2.5
       },
       "grok-4.20-0309-reasoning": {
         "streaming": true,
@@ -1033,8 +1033,8 @@
         "vision": true,
         "context_window_tokens": 2000000,
         "max_output_tokens": 2000000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 1.25,
+        "output_cost_per_mtok": 2.5
       },
       "grok-4.20-0309-non-reasoning": {
         "streaming": true,
@@ -1044,8 +1044,8 @@
         "vision": true,
         "context_window_tokens": 2000000,
         "max_output_tokens": 2000000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 1.25,
+        "output_cost_per_mtok": 2.5
       },
       "grok-4.20-multi-agent-0309": {
         "streaming": true,
@@ -1055,8 +1055,8 @@
         "vision": true,
         "context_window_tokens": 2000000,
         "max_output_tokens": 2000000,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 1.25,
+        "output_cost_per_mtok": 2.5
       },
       "grok-4-1-fast-reasoning": {
         "streaming": true,
@@ -1090,8 +1090,8 @@
         "vision": true,
         "context_window_tokens": 1048576,
         "max_output_tokens": 512000,
-        "input_cost_per_mtok": 0.6,
-        "output_cost_per_mtok": 2.4
+        "input_cost_per_mtok": 0.3,
+        "output_cost_per_mtok": 1.2
       },
       "minimax-m2.7": {
         "streaming": true,
@@ -1101,8 +1101,8 @@
         "vision": false,
         "context_window_tokens": 204800,
         "max_output_tokens": 204800,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.3,
+        "output_cost_per_mtok": 1.2
       },
       "minimax-m2.7-highspeed": {
         "streaming": true,
@@ -1123,8 +1123,8 @@
         "vision": false,
         "context_window_tokens": 204800,
         "max_output_tokens": 204800,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.3,
+        "output_cost_per_mtok": 1.2
       },
       "minimax-m2.5-highspeed": {
         "streaming": true,
@@ -1145,8 +1145,8 @@
         "vision": false,
         "context_window_tokens": 204800,
         "max_output_tokens": 204800,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.3,
+        "output_cost_per_mtok": 1.2
       },
       "minimax-m2.1-highspeed": {
         "streaming": true,
@@ -1167,8 +1167,8 @@
         "vision": false,
         "context_window_tokens": 204800,
         "max_output_tokens": 204800,
-        "input_cost_per_mtok": 0.08,
-        "output_cost_per_mtok": 0.32
+        "input_cost_per_mtok": 0.3,
+        "output_cost_per_mtok": 1.2
       }
     },
     "mimo": {
@@ -1180,8 +1180,8 @@
         "vision": false,
         "context_window_tokens": 1048576,
         "max_output_tokens": 131072,
-        "input_cost_per_mtok": 4.4,
-        "output_cost_per_mtok": 17.6
+        "input_cost_per_mtok": 0.435,
+        "output_cost_per_mtok": 0.87
       },
       "mimo-v2-pro": {
         "streaming": true,
@@ -1202,8 +1202,8 @@
         "vision": false,
         "context_window_tokens": 1048576,
         "max_output_tokens": 131072,
-        "input_cost_per_mtok": 0.9,
-        "output_cost_per_mtok": 3.6
+        "input_cost_per_mtok": 0.14,
+        "output_cost_per_mtok": 0.28
       },
       "mimo-v2-omni": {
         "streaming": true,

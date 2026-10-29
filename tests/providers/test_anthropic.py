@@ -188,7 +188,7 @@ class TestProviderMetadata:
             ).pricing_tier
 
         assert tier("claude-opus-4-7") == PricingTier.PREMIUM
-        assert tier("claude-sonnet-4-6") == PricingTier.PREMIUM
+        assert tier("claude-sonnet-4-6") == PricingTier.HIGH
         assert tier("claude-haiku-4-5") == PricingTier.STANDARD
 
     def test_sdk_retries_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:

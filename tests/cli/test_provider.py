@@ -790,7 +790,7 @@ class TestEnvVarTableConsistency:
 class TestPricingLabel:
     def test_known_model_returns_tier(self) -> None:
         """A catalogued LLM model returns its cost-derived tier value."""
-        assert provider_module._pricing_label("openai", ProviderSurface.LLM, "gpt-4o") == "premium"
+        assert provider_module._pricing_label("openai", ProviderSurface.LLM, "gpt-4o") == "high"
 
     def test_unknown_slug_returns_unknown(self) -> None:
         """OpenRouter's arbitrary-slug surface has no catalogued tier."""
