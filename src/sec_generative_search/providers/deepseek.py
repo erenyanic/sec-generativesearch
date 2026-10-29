@@ -20,4 +20,4 @@ class DeepSeekProvider(OpenAICompatibleLLMProvider):
 
     provider_name = "deepseek"
     default_base_url = "https://api.deepseek.com"
-    default_model = "deepseek-v4-flash"
+    default_model = "deepseek-flash"
