@@ -229,8 +229,8 @@ Twelve hosted providers, each via its first-party SDK, plus a self-hosted `local
 | Anthropic  | `claude-haiku-5-5`            | —                            |
 | Gemini     | `gemini-3.8-flash`            | `gemini-embedding-2-preview` |
 | Mistral    | `mistral-small-2603`          | `mistral-embed`              |
-| DeepSeek   | `deepseek-v4-flash`           | —                            |
-| Grok       | `grok-4-1-fast-non-reasoning` | —                            |
+| DeepSeek   | `deepseek-flash`              | —                            |
+| Grok       | `grok-4.3`                    | —                            |
 | Qwen       | `qwen3.6-plus`                | `text-embedding-v4`          |
 | Kimi       | `kimi-k2.5`                   | —                            |
 | MiniMax    | `minimax-m2.7`                | —                            |

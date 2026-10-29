@@ -410,6 +410,17 @@
       }
     },
     "deepseek": {
+      "deepseek-flash": {
+        "streaming": true,
+        "tool_use": true,
+        "structured_output": true,
+        "prompt_caching": true,
+        "vision": false,
+        "context_window_tokens": 1000000,
+        "max_output_tokens": 384000,
+        "input_cost_per_mtok": 0.08,
+        "output_cost_per_mtok": 0.32
+      },
       "deepseek-v4-flash": {
         "streaming": true,
         "tool_use": true,
