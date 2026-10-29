@@ -84,7 +84,7 @@ function upstreamOrderHasError(entries: string[]): boolean {
 // or above the last); `tests/core/test_types.py` fails the build when the
 // two drift, and `tests/security/model-picker.test.tsx` pins the rendered
 // numbers.
-export const PRICING_TIER_BLENDED_BOUNDS_USD = [1, 4, 15] as const;
+export const PRICING_TIER_BLENDED_BOUNDS_USD = [2, 5, 10] as const;
 
 const [LOW_BELOW, STANDARD_BELOW, HIGH_BELOW] = PRICING_TIER_BLENDED_BOUNDS_USD;
 const BLENDED = "per 1M tokens, blended (mean of input and output price)";

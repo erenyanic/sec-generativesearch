@@ -95,7 +95,7 @@ class TestProviderMetadata:
 
         assert tier("gpt-5.4-mini") == PricingTier.STANDARD
         assert tier("gpt-5.4") == PricingTier.HIGH
-        assert tier("gpt-4.1-mini") == PricingTier.STANDARD
+        assert tier("gpt-4.1-mini") == PricingTier.LOW
         assert tier("gpt-5.4-pro") == PricingTier.PREMIUM
         assert tier("gpt-4.1") == PricingTier.HIGH
 

@@ -346,15 +346,16 @@ describe("ModelPicker — pricing-tier help (14.6.bis)", () => {
 
   it("explains the tiers with the backend's blended bounds (F37)", async () => {
     // The old legend said "Under $2 / $5 / $10 per 1M output tokens" while
-    // `derive_pricing_tier` buckets the blended mean at 1 / 4 / 15 USD.
+    // `derive_pricing_tier` bucketed the blended mean (then at 1 / 4 / 15
+    // USD). The bounds are now 2 / 5 / 10 USD, still on the blended mean.
     renderPicker();
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: /pricing tiers/i }));
     const text = screen.getByRole("note").textContent ?? "";
-    expect(text).toContain("Under $1 per 1M tokens, blended");
-    expect(text).toContain("$1 to under $4 per 1M tokens, blended");
-    expect(text).toContain("$4 to under $15 per 1M tokens, blended");
-    expect(text).toContain("$15 or more per 1M tokens, blended");
+    expect(text).toContain("Under $2 per 1M tokens, blended");
+    expect(text).toContain("$2 to under $5 per 1M tokens, blended");
+    expect(text).toContain("$5 to under $10 per 1M tokens, blended");
+    expect(text).toContain("$10 or more per 1M tokens, blended");
     expect(text).not.toMatch(/output tokens/i);
   });
 });

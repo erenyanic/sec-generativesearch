@@ -3,7 +3,7 @@
     "schema_version": 1,
     "description": "Vendored baseline LLM model catalogue: the full capability matrix and exact per-MTok costs for every closed-catalogue model. pricing_tier is NEVER stored here -- it is derived from cost at load by ProviderCapability.__post_init__ / derive_pricing_tier. chat=true / embeddings=false are LLM-surface invariants applied by the loader, not stored per row.",
     "generated_at": "2026-10-29",
-    "source": "Consolidation of the per-adapter MODEL_CATALOGUE dicts into package data. Costs for every model listed on models.dev (https://models.dev/api.json) were refreshed from it on 2026-10-29, matched against the models.dev provider whose endpoint each adapter targets (e.g. zai = api.z.ai, not zhipuai). Models absent from models.dev keep tier-calibrated placeholder costs (blended input/output) chosen to reproduce their reviewed pricing tier, pending a future refresh.",
+    "source": "Consolidation of the per-adapter MODEL_CATALOGUE dicts into package data. Costs for every model listed on models.dev (https://models.dev/api.json) were refreshed from it on 2026-10-29, matched against the models.dev provider whose endpoint each adapter targets (e.g. zai = api.z.ai, not zhipuai). Models absent from models.dev keep placeholder costs, originally chosen to reproduce their reviewed pricing tier under the earlier 1/4/15 USD blended bounds (the bounds are now 2/5/10), pending a future refresh.",
     "cost_units": "USD per 1,000,000 tokens; null = unknown"
   },
   "providers": {

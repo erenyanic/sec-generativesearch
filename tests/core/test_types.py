@@ -646,10 +646,11 @@ class TestNoCredentialFieldsOnDomainTypes:
 
 class TestPricingTierHelpTextMatchesTheTierFunction:
     """F37: the web model-picker explains the tiers to users.  It said "Under
-    $2 / $5 / $10 per 1M output tokens" while ``derive_pricing_tier`` buckets
-    the *blended* mean at 1 / 4 / 15 USD — and nothing failed when the two
-    disagreed.  The legend now derives from one named constant that must
-    equal ``_PRICING_TIER_BLENDED_BOUNDS``; this lock reads it from the TSX."""
+    $2 / $5 / $10 per 1M output tokens" while ``derive_pricing_tier`` bucketed
+    the *blended* mean (then at 1 / 4 / 15 USD) — and nothing failed when the
+    two disagreed.  The legend now derives from one named constant that must
+    equal ``_PRICING_TIER_BLENDED_BOUNDS`` (now 2 / 5 / 10 USD, still on the
+    blended mean); this lock reads it from the TSX."""
 
     _PICKER = (
         Path(__file__).resolve().parents[2] / "frontend" / "src" / "components" / "model-picker.tsx"

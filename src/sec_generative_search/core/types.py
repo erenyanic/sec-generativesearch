@@ -601,9 +601,9 @@ class PricingTier(Enum):
 # :func:`derive_pricing_tier` is the single source of truth, so the per-model
 # catalogue stores exact cost and never a hand-assigned tier.
 _PRICING_TIER_BLENDED_BOUNDS: tuple[tuple[float, "PricingTier"], ...] = (
-    (1.0, PricingTier.LOW),
-    (4.0, PricingTier.STANDARD),
-    (15.0, PricingTier.HIGH),
+    (2.0, PricingTier.LOW),
+    (5.0, PricingTier.STANDARD),
+    (10.0, PricingTier.HIGH),
 )
 
 
