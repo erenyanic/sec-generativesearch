@@ -415,6 +415,24 @@ class TestLoadMerged:
         assert merged.has_provider("newvendor")
         assert merged.has_provider("openai")  # baseline providers survive
 
+    def test_overlay_slug_matched_case_insensitively(self, tmp_path: Path) -> None:
+        # models.dev spells MiniMax slugs with capitals; the refresh must update
+        # the curated lower-case row rather than add a duplicate beside it.
+        path = _write_overlay(
+            tmp_path / "o.json",
+            {
+                "minimax": {
+                    "MiniMax-M2.7": _overlay_row(input_cost_per_mtok=0.5, output_cost_per_mtok=0.5)
+                }
+            },
+        )
+        merged = ModelCatalogue.load_merged(path)
+        models = merged.list_llm_models("minimax")
+        assert "minimax-m2.7" in models
+        assert "MiniMax-M2.7" not in models
+        cap = merged.get_llm_capability("minimax", "minimax-m2.7")
+        assert cap is not None and cap.input_cost_per_mtok == 0.5
+
     def test_baseline_only_model_survives(self, tmp_path: Path) -> None:
         # An overlay touching only one provider leaves every other untouched.
         path = _write_overlay(tmp_path / "o.json", {"openai": {"gpt-x": _overlay_row()}})
@@ -423,7 +441,7 @@ class TestLoadMerged:
         assert merged.list_llm_models("anthropic")
 
     def test_cost_refresh_wins_and_retiers(self, tmp_path: Path) -> None:
-        # gpt-4o is PREMIUM in the baseline (10 / 40); a cheaper overlay price
+        # gpt-4o is HIGH in the baseline (2.5 / 10); a cheaper overlay price
         # must win and re-bucket the tier from the *merged* cost.
         path = _write_overlay(
             tmp_path / "o.json",

@@ -271,8 +271,12 @@ class ModelCatalogue:
         The bundled baseline is always the floor.  When a valid overlay is
         present it is merged on top: a model only in the overlay is *added*; a
         model only in the baseline *survives*; a model in both is merged per
-        field by :meth:`_merge_row`.  The pricing tier is re-derived from the
-        merged cost at :func:`capability_from_row`, never read from disk.
+        field by :meth:`_merge_row`.  Slugs are matched case-insensitively
+        (models.dev spells ``MiniMax-M2.7`` where the baseline curates
+        ``minimax-m2.7``) and the baseline spelling stays canonical, so a
+        refresh updates the curated row instead of adding a duplicate.  The
+        pricing tier is re-derived from the merged cost at
+        :func:`capability_from_row`, never read from disk.
 
         **Fail-closed**: a missing / unreadable / invalid overlay — or no path
         at all — yields the baseline alone.  Because the overlay can only
@@ -294,16 +298,21 @@ class ModelCatalogue:
         for provider in (*baseline_rows, *overlay_only_providers):
             b_models = baseline_rows.get(provider, {})
             o_models = overlay_rows.get(provider, {})
+            o_by_lower = {slug.lower(): o_row for slug, o_row in o_models.items()}
             models: dict[str, ProviderCapability] = {}
             # Baseline slugs first (preserving declaration order), each merged
-            # with its overlay counterpart when present.
+            # with its overlay counterpart when present — an exact-case match
+            # first, else a case-insensitive one.
             for slug, b_row in b_models.items():
                 o_row = o_models.get(slug)
+                if o_row is None:
+                    o_row = o_by_lower.get(slug.lower())
                 row = cls._merge_row(b_row, o_row) if o_row is not None else b_row
                 models[slug] = capability_from_row(row)
             # Then overlay-only slugs, added verbatim (already validated).
+            b_lower = {slug.lower() for slug in b_models}
             for slug, o_row in o_models.items():
-                if slug in b_models:
+                if slug.lower() in b_lower:
                     continue
                 models[slug] = capability_from_row(o_row)
             built[provider] = models

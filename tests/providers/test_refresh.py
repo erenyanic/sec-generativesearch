@@ -324,6 +324,36 @@ class TestNormaliseModelsDev:
         assert "unknownvendor" not in out  # not served -> dropped
         assert "google" not in out
 
+    def test_region_mirror_never_prices_served_endpoint(self) -> None:
+        # zhipuai is Z.ai's China endpoint (open.bigmodel.cn); ZaiProvider
+        # targets api.z.ai, so the mirror must not price the zai key — even
+        # when it comes last in the payload.
+        payload = {
+            "zai": {"models": {"glm-5": {"cost": {"input": 1.0, "output": 3.2}}}},
+            "zhipuai": {"models": {"glm-5": {"cost": {"input": 0.6, "output": 2.7}}}},
+        }
+        out = normalise_models_dev(payload, _KNOWN | {"zai"})
+        assert out["zai"]["glm-5"]["input_cost_per_mtok"] == 1.0
+        assert out["zai"]["glm-5"]["output_cost_per_mtok"] == 3.2
+
+    @pytest.mark.parametrize("canonical_first", [True, False])
+    def test_alias_never_overrides_canonical_id(self, canonical_first: bool) -> None:
+        canonical = ("gemini", {"models": {"g-1": {"cost": {"input": 1.0, "output": 2.0}}}})
+        alias = (
+            "google",
+            {
+                "models": {
+                    "g-1": {"cost": {"input": 9.0, "output": 9.0}},
+                    "g-2": {"cost": {"input": 0.5, "output": 0.5}},
+                }
+            },
+        )
+        payload = dict([canonical, alias] if canonical_first else [alias, canonical])
+        out = normalise_models_dev(payload, _KNOWN)
+        # The id that is the served key wins the clash; the alias only fills gaps.
+        assert out["gemini"]["g-1"]["input_cost_per_mtok"] == 1.0
+        assert out["gemini"]["g-2"]["input_cost_per_mtok"] == 0.5
+
     def test_non_object_payload_raises(self) -> None:
         with pytest.raises(CatalogueRefreshError, match="not a JSON object"):
             normalise_models_dev([1, 2], _KNOWN)

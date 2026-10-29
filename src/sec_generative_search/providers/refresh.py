@@ -179,6 +179,11 @@ def resolve_known_llm_providers() -> set[str]:
 # internal provider keys this build serves.  Anything that does not map to a
 # served provider is dropped (not an error) — the overlay stays focused on the
 # curated catalogue.  Identity entries for our own keys are added below.
+#
+# Region mirrors of a served vendor (models.dev ``zhipuai`` = open.bigmodel.cn,
+# ``alibaba-cn``, ``moonshotai-cn``, ``minimax-cn``) are deliberately *not*
+# aliased: they price a different endpoint than the one each adapter targets,
+# so folding them in would overwrite the served endpoint's prices.
 _PROVIDER_ALIASES: Final[dict[str, str]] = {
     "google": "gemini",
     "google-ai-studio": "gemini",
@@ -189,8 +194,6 @@ _PROVIDER_ALIASES: Final[dict[str, str]] = {
     "x-ai": "grok",
     "xai": "grok",
     "z-ai": "zai",
-    "zhipu": "zai",
-    "zhipuai": "zai",
     "alibaba": "qwen",
     "dashscope": "qwen",
     "mistralai": "mistral",
@@ -280,8 +283,17 @@ def normalise_models_dev(payload: Any, known: set[str]) -> dict[str, dict[str, d
                 "input_cost_per_mtok": _coerce_cost(cost.get("input"), scale=1.0),
                 "output_cost_per_mtok": _coerce_cost(cost.get("output"), scale=1.0),
             }
-        if rows:
-            out[provider] = rows
+        if not rows:
+            continue
+        # Several upstream ids can alias one served key, so merge rather than
+        # replace: the id that *is* the served key wins a slug clash and an
+        # alias only fills slugs it lacks, independent of upstream key order.
+        target = out.setdefault(provider, {})
+        if raw_provider == provider:
+            target.update(rows)
+        else:
+            for slug, row in rows.items():
+                target.setdefault(slug, row)
     return out
 
 
