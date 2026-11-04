@@ -1656,7 +1656,7 @@ class TestChatSecurity:
 
 
 class TestProviderModelOverride:
-    """``--provider`` / ``--model`` must override LLM_PROVIDER /
+    """``--provider`` / ``--model`` must override LLM_DEFAULT_PROVIDER /
     LLM_DEFAULT_MODEL exactly the way the API body does on
     ``POST /api/rag/query``.
 

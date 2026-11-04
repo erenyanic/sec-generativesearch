@@ -46,7 +46,7 @@ Trust model and load-bearing rules:
      orchestrator embeds the raw query.  Useful when the operator
      knows the question is plain English and does not want to spend
      the structured-output round-trip.
-   - ``--provider`` / ``--model`` override ``LLM_PROVIDER`` /
+   - ``--provider`` / ``--model`` override ``LLM_DEFAULT_PROVIDER`` /
      ``LLM_DEFAULT_MODEL`` for a single invocation (``query``) or for
      the lifetime of the REPL (``chat``).
    - ``--openrouter-provider`` (repeatable) and
@@ -608,7 +608,7 @@ def _resolve_provider_and_model(
     Mirrors :func:`api.routes.rag._resolve_provider_and_model_query`'s
     precedence (request body wins, settings is the fallback) so the CLI
     and API surfaces describe the same operator mental model: an
-    explicit override always beats ``LLM_PROVIDER`` / ``LLM_DEFAULT_MODEL``
+    explicit override always beats ``LLM_DEFAULT_PROVIDER`` / ``LLM_DEFAULT_MODEL``
     from the environment.  Empty strings on either flag fall back to the
     settings value — Typer renders ``--model ""`` for empty input, and
     silently treating that as "use the default" matches the API
@@ -782,7 +782,7 @@ def query(
             "-P",
             help=(
                 "Override the LLM provider (e.g. openai / anthropic / openrouter). "
-                "Defaults to LLM_PROVIDER."
+                "Defaults to LLM_DEFAULT_PROVIDER."
             ),
         ),
     ] = None,
@@ -892,7 +892,9 @@ def query(
             "Unknown LLM provider",
             f"{provider_name!r} is not a registered LLM provider.",
             details=str(exc),
-            hint="Set LLM_PROVIDER to a registered slug (openai / anthropic / gemini / ...).",
+            hint=(
+                "Set LLM_DEFAULT_PROVIDER to a registered slug (openai / anthropic / gemini / ...)."
+            ),
             output=output_format,
             error_code="unknown_provider",
         )
@@ -1345,7 +1347,7 @@ def chat(
             "-P",
             help=(
                 "Override the LLM provider for every turn in this session. "
-                "Defaults to LLM_PROVIDER."
+                "Defaults to LLM_DEFAULT_PROVIDER."
             ),
         ),
     ] = None,
@@ -1425,7 +1427,9 @@ def chat(
             "Unknown LLM provider",
             f"{provider_name!r} is not a registered LLM provider.",
             details=str(exc),
-            hint="Set LLM_PROVIDER to a registered slug (openai / anthropic / gemini / ...).",
+            hint=(
+                "Set LLM_DEFAULT_PROVIDER to a registered slug (openai / anthropic / gemini / ...)."
+            ),
         )
         raise typer.Exit(code=1) from None
     except ValueError as exc:

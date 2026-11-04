@@ -132,7 +132,7 @@ spec:
             # allows ~310 s.
             - name: EMBEDDING_WARM_ON_BOOT
               value: "true"
-            - name: LLM_PROVIDER
+            - name: LLM_DEFAULT_PROVIDER
               value: anthropic
             - name: LOG_FORMAT
               value: json

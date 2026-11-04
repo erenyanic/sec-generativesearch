@@ -102,12 +102,12 @@ The SEC requires an identifying name and email in the User-Agent of every EDGAR 
 
 **Minimum for local CLI use:**
 
-| Variable               | Description                                             |
-| ---------------------- | ------------------------------------------------------- |
-| `EDGAR_IDENTITY_NAME`  | Your name (sent to SEC EDGAR)                           |
-| `EDGAR_IDENTITY_EMAIL` | Your email (sent to SEC EDGAR)                          |
-| `LLM_PROVIDER`         | The provider used to generate answers, e.g. `anthropic` |
-| `<PROVIDER>_API_KEY`   | The matching key, e.g. `ANTHROPIC_API_KEY`              |
+| Variable                 | Description                                             |
+| ------------------------ | ------------------------------------------------------- |
+| `EDGAR_IDENTITY_NAME`    | Your name (sent to SEC EDGAR)                           |
+| `EDGAR_IDENTITY_EMAIL`   | Your email (sent to SEC EDGAR)                          |
+| `LLM_DEFAULT_PROVIDER`   | The provider used to generate answers, e.g. `anthropic` |
+| `<PROVIDER>_API_KEY`     | The matching key, e.g. `ANTHROPIC_API_KEY`              |
 
 **Commonly adjusted optional variables:**
 
@@ -126,7 +126,7 @@ A `.env` for local use is as short as:
 ```env
 EDGAR_IDENTITY_NAME=Your Name
 EDGAR_IDENTITY_EMAIL=your@email.com
-LLM_PROVIDER=anthropic
+LLM_DEFAULT_PROVIDER=anthropic
 ANTHROPIC_API_KEY=sk-ant-...
 DB_DEPLOYMENT_PROFILE=local
 ```
