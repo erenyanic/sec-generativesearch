@@ -41,9 +41,10 @@
 | **gemini** | `gemini-embedding-2` | 3072 *(MRL)* | 8192 | ~0.20 | Provider default (GA). |
 | **gemini** | `gemini-embedding-2-preview` | 3072 *(MRL)* | 8192 | ~0.20 | Superseded preview; kept so a collection already stamped against it still opens. |
 | **gemini** | `gemini-embedding-001` | 3072 *(MRL)* | 2048 | 0.15 | GA. |
-| **mistral** | `mistral-embed` | 1024 | 8192 | 0.10 | Provider default. |
-| **mistral** | `codestral-embed` | 1536 *(MRL)* | 8192 | 0.15 | Code-tuned; supports larger dims via MRL. |
-| **qwen** (DashScope) | `text-embedding-v4` | 1024 *(MRL)* | ~8192 | — | Provider default. **Not in models.dev / LiteLLM — price from the Alibaba Cloud DashScope console; confirm v4's default dimension.** |
+| **mistral** | `mistral-embed` | 1024 | 8192 | 0.10 | Previous provider default; still selectable. |
+| **mistral** | `codestral-embed` | 1536 *(MRL)* | 8192 | 0.15 | Provider default. Code-tuned; supports larger dims via MRL. |
+| **qwen** (DashScope) | `qwen3.7-text-embedding` | 1024 | — | — | Provider default. **Not in models.dev / LiteLLM — price and max input from the Alibaba Cloud DashScope console; the 1024 dimension is not yet verified against the live API.** |
+| **qwen** (DashScope) | `text-embedding-v4` | 1024 *(MRL)* | ~8192 | — | Previous provider default; still selectable. See note above; confirm v4's default dimension. |
 | **qwen** (DashScope) | `text-embedding-v3` | 1024 *(MRL)* | ~8192 | — | See note above. |
 
 ## Local / on-device (`local` provider — `sentence-transformers`)
