@@ -535,6 +535,17 @@
       }
     },
     "mistral": {
+      "mistral-large-4": {
+        "streaming": true,
+        "tool_use": true,
+        "structured_output": true,
+        "prompt_caching": true,
+        "vision": true,
+        "context_window_tokens": 1048576,
+        "max_output_tokens": 262144,
+        "input_cost_per_mtok": 0.7,
+        "output_cost_per_mtok": 2.1
+      },
       "mistral-medium-3.5": {
         "streaming": true,
         "tool_use": true,

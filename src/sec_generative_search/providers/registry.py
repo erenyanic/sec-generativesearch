@@ -239,7 +239,7 @@ class ProviderRegistry:
             "mistral",
             ProviderSurface.LLM,
             f"{_P}.mistral:MistralProvider",
-            default_model="mistral-small-2603",
+            default_model="mistral-large-4",
         ),
         ProviderEntry(
             "qwen", ProviderSurface.LLM, f"{_P}.qwen:QwenProvider", default_model="qwen3.8-flash"

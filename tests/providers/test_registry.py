@@ -969,7 +969,7 @@ class TestValidateKeyClosesClient:
 # ---------------------------------------------------------------------------
 
 
-class TestLazyAdapteLazyrClasses:
+class TestLazyAdapterClasses:
     """The curated entries name their adapters by reference and record the
     default model, so listings, settings validation and the LLM capability
     probe never import a vendor SDK.  The recorded values must not drift

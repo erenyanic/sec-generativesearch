@@ -228,7 +228,7 @@ Twelve hosted providers, each via its first-party SDK, plus a self-hosted `local
 | OpenAI     | `gpt-6-luna`                  | `text-embedding-3-small`     |
 | Anthropic  | `claude-haiku-5-5`            | —                            |
 | Gemini     | `gemini-3.8-flash`            | `gemini-embedding-2`         |
-| Mistral    | `mistral-small-2603`          | `codestral-embed`            |
+| Mistral    | `mistral-large-4`             | `codestral-embed`            |
 | DeepSeek   | `deepseek-flash`              | —                            |
 | Grok       | `grok-4.7`                    | —                            |
 | Qwen       | `qwen3.8-flash`               | `qwen3.7-text-embedding`     |
