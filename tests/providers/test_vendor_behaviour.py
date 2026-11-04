@@ -78,7 +78,7 @@ _LONG_KEY = "sk-test-BEHAVIOUR-ABCDEFGHIJKLMNOPQRSTUVWX"  # pragma: allowlist se
 # silent default-model change trips a review here as well as in the
 # declaration suite.
 _LLM_VENDORS: list[tuple[type, str]] = [
-    (MistralProvider, "mistral-small-2603"),
+    (MistralProvider, "mistral-large-4"),
     (KimiProvider, "kimi-k3.1-pro"),
     (DeepSeekProvider, "deepseek-flash"),
     (QwenProvider, "qwen3.8-flash"),

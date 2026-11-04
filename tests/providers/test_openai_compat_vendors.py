@@ -99,7 +99,7 @@ _LLM_VENDORS: list[tuple[type, str, str, str]] = [
         MistralProvider,
         "mistral",
         "https://api.mistral.ai/v1",
-        "mistral-small-2603",
+        "mistral-large-4",
     ),
     (
         KimiProvider,
