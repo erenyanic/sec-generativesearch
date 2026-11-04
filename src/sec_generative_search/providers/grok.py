@@ -29,4 +29,4 @@ class GrokProvider(OpenAICompatibleLLMProvider):
 
     provider_name = "grok"
     default_base_url = "https://api.x.ai/v1"
-    default_model = "grok-4.3"
+    default_model = "grok-4.7"

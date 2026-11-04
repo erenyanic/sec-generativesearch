@@ -39,7 +39,7 @@ class MistralEmbeddingProvider(OpenAICompatibleEmbeddingProvider):
 
     provider_name = "mistral"
     default_base_url = "https://api.mistral.ai/v1"
-    default_model = "mistral-embed"
+    default_model = "codestral-embed"
 
     MODEL_DIMENSIONS: ClassVar[dict[str, int]] = {
         "mistral-embed": 1024,

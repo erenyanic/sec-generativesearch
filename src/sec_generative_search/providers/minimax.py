@@ -32,4 +32,4 @@ class MiniMaxProvider(OpenAICompatibleLLMProvider):
 
     provider_name = "minimax"
     default_base_url = "https://api.minimax.io/v1"
-    default_model = "minimax-m2.7"
+    default_model = "MiniMax-M3.1-Flash"

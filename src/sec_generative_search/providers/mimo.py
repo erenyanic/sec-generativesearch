@@ -28,4 +28,4 @@ class MimoProvider(OpenAICompatibleLLMProvider):
 
     provider_name = "mimo"
     default_base_url = "https://api.xiaomimimo.com/v1"
-    default_model = "mimo-v2.5"
+    default_model = "mimo-v2.6-pro"

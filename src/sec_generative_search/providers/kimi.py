@@ -23,4 +23,4 @@ class KimiProvider(OpenAICompatibleLLMProvider):
 
     provider_name = "kimi"
     default_base_url = "https://api.moonshot.ai/v1"
-    default_model = "kimi-k2.5"
+    default_model = "kimi-k3.1-pro"

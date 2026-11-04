@@ -29,7 +29,7 @@ class QwenProvider(OpenAICompatibleLLMProvider):
 
     provider_name = "qwen"
     default_base_url = _QWEN_BASE_URL
-    default_model = "qwen3.6-plus"
+    default_model = "qwen3.8-flash"
 
 
 class QwenEmbeddingProvider(OpenAICompatibleEmbeddingProvider):
@@ -37,9 +37,11 @@ class QwenEmbeddingProvider(OpenAICompatibleEmbeddingProvider):
 
     provider_name = "qwen"
     default_base_url = _QWEN_BASE_URL
-    default_model = "text-embedding-v4"
+    default_model = "qwen3-rerank"
 
     MODEL_DIMENSIONS: ClassVar[dict[str, int]] = {
+        "qwen3.7-text-embedding": 1024,
+        "qwen3-rerank": 1024,
         "text-embedding-v4": 1024,
         "text-embedding-v3": 1024,
     }

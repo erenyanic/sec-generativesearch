@@ -31,4 +31,4 @@ class ZaiProvider(OpenAICompatibleLLMProvider):
 
     provider_name = "zai"
     default_base_url = "https://api.z.ai/api/paas/v4"
-    default_model = "glm-5"
+    default_model = "glm-5.3-flash"
