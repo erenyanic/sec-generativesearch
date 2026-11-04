@@ -228,14 +228,14 @@ Twelve hosted providers, each via its first-party SDK, plus a self-hosted `local
 | OpenAI     | `gpt-6-luna`                  | `text-embedding-3-small`     |
 | Anthropic  | `claude-haiku-5-5`            | —                            |
 | Gemini     | `gemini-3.8-flash`            | `gemini-embedding-2-preview` |
-| Mistral    | `mistral-small-2603`          | `mistral-embed`              |
+| Mistral    | `mistral-small-2603`          | `codestral-embed`            |
 | DeepSeek   | `deepseek-flash`              | —                            |
-| Grok       | `grok-4.3`                    | —                            |
-| Qwen       | `qwen3.6-plus`                | `text-embedding-v4`          |
-| Kimi       | `kimi-k2.5`                   | —                            |
-| MiniMax    | `minimax-m2.7`                | —                            |
-| MiMo       | `mimo-v2.5`                   | —                            |
-| Z.ai       | `glm-5`                       | —                            |
+| Grok       | `grok-4.7`                    | —                            |
+| Qwen       | `qwen3.8-flash`               | `qwen3.7-text-embedding`     |
+| Kimi       | `kimi-k3.1-pro`               | —                            |
+| MiniMax    | `MiniMax-M3.1-Flash`          | —                            |
+| MiMo       | `mimo-v2.6-pro`               | —                            |
+| Z.ai       | `glm-5.3-flash`               | —                            |
 | OpenRouter | `qwen/qwen3.6-plus`           | — (accepts any model slug)   |
 | Local LLM  | `llama3.2` (any slug)         | — (self-hosted)              |
 | Local      | — (no LLM; embedding only)    | `google/embeddinggemma-300m` |

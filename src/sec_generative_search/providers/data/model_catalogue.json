@@ -445,6 +445,17 @@
       }
     },
     "kimi": {
+      "kimi-k3.1-pro": {
+        "streaming": true,
+        "tool_use": true,
+        "structured_output": true,
+        "prompt_caching": true,
+        "vision": true,
+        "context_window_tokens": 1048576,
+        "max_output_tokens": 1048576,
+        "input_cost_per_mtok": 2.0,
+        "output_cost_per_mtok": 10.0
+      },
       "kimi-k2.7-code-highspeed": {
         "streaming": true,
         "tool_use": true,
@@ -658,6 +669,17 @@
       }
     },
     "qwen": {
+      "qwen3.8-flash": {
+        "streaming": true,
+        "tool_use": true,
+        "structured_output": true,
+        "prompt_caching": true,
+        "vision": true,
+        "context_window_tokens": 1000000,
+        "max_output_tokens": 131072,
+        "input_cost_per_mtok": 0.15,
+        "output_cost_per_mtok": 0.47
+      },
       "qwen3.7-max": {
         "streaming": true,
         "tool_use": true,
@@ -869,6 +891,17 @@
       }
     },
     "zai": {
+      "glm-5.3-flash": {
+        "streaming": true,
+        "tool_use": true,
+        "structured_output": true,
+        "prompt_caching": true,
+        "vision": true,
+        "context_window_tokens": 1000000,
+        "max_output_tokens": 131072,
+        "input_cost_per_mtok": 0.15,
+        "output_cost_per_mtok": 0.5
+      },
       "glm-5.2": {
         "streaming": true,
         "tool_use": true,
@@ -1014,6 +1047,17 @@
       }
     },
     "grok": {
+      "grok-4.7": {
+        "streaming": true,
+        "tool_use": true,
+        "structured_output": true,
+        "prompt_caching": true,
+        "vision": true,
+        "context_window_tokens": 500000,
+        "max_output_tokens": 500000,
+        "input_cost_per_mtok": 2.0,
+        "output_cost_per_mtok": 6.0
+      },
       "grok-4.3": {
         "streaming": true,
         "tool_use": true,
@@ -1082,6 +1126,17 @@
       }
     },
     "minimax": {
+      "MiniMax-M3.1-Flash": {
+        "streaming": true,
+        "tool_use": true,
+        "structured_output": false,
+        "prompt_caching": true,
+        "vision": true,
+        "context_window_tokens": 1000000,
+        "max_output_tokens": 524288,
+        "input_cost_per_mtok": 0.15,
+        "output_cost_per_mtok": 0.6
+      },
       "minimax-m3": {
         "streaming": true,
         "tool_use": true,
@@ -1172,6 +1227,17 @@
       }
     },
     "mimo": {
+      "mimo-v2.6-pro": {
+        "streaming": true,
+        "tool_use": true,
+        "structured_output": true,
+        "prompt_caching": true,
+        "vision": true,
+        "context_window_tokens": 1048576,
+        "max_output_tokens": 131072,
+        "input_cost_per_mtok": 0.435,
+        "output_cost_per_mtok": 0.87
+      },
       "mimo-v2.5-pro": {
         "streaming": true,
         "tool_use": true,

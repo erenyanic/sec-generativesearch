@@ -79,13 +79,13 @@ _LONG_KEY = "sk-test-BEHAVIOUR-ABCDEFGHIJKLMNOPQRSTUVWX"  # pragma: allowlist se
 # declaration suite.
 _LLM_VENDORS: list[tuple[type, str]] = [
     (MistralProvider, "mistral-small-2603"),
-    (KimiProvider, "kimi-k2.5"),
+    (KimiProvider, "kimi-k3.1-pro"),
     (DeepSeekProvider, "deepseek-flash"),
-    (QwenProvider, "qwen3.6-plus"),
-    (ZaiProvider, "glm-5"),
-    (GrokProvider, "grok-4.3"),
-    (MiniMaxProvider, "minimax-m2.7"),
-    (MimoProvider, "mimo-v2.5"),
+    (QwenProvider, "qwen3.8-flash"),
+    (ZaiProvider, "glm-5.3-flash"),
+    (GrokProvider, "grok-4.7"),
+    (MiniMaxProvider, "MiniMax-M3.1-Flash"),
+    (MimoProvider, "mimo-v2.6-pro"),
 ]
 
 _LLM_PARAMS = [pytest.param(cls, model, id=cls.provider_name) for cls, model in _LLM_VENDORS]
@@ -93,8 +93,8 @@ _LLM_PARAMS = [pytest.param(cls, model, id=cls.provider_name) for cls, model in 
 
 # Embedding vendors paired with default model + native dimension.
 _EMBED_VENDORS: list[tuple[type, str, int]] = [
-    (MistralEmbeddingProvider, "mistral-embed", 1024),
-    (QwenEmbeddingProvider, "text-embedding-v4", 1024),
+    (MistralEmbeddingProvider, "codestral-embed", 1536),
+    (QwenEmbeddingProvider, "qwen3.7-text-embedding", 1024),
 ]
 
 _EMBED_PARAMS = [

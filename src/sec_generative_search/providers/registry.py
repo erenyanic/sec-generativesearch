@@ -233,7 +233,7 @@ class ProviderRegistry:
             default_model="deepseek-flash",
         ),
         ProviderEntry(
-            "kimi", ProviderSurface.LLM, f"{_P}.kimi:KimiProvider", default_model="kimi-k2.5"
+            "kimi", ProviderSurface.LLM, f"{_P}.kimi:KimiProvider", default_model="kimi-k3.1-pro"
         ),
         ProviderEntry(
             "mistral",
@@ -242,23 +242,25 @@ class ProviderRegistry:
             default_model="mistral-small-2603",
         ),
         ProviderEntry(
-            "qwen", ProviderSurface.LLM, f"{_P}.qwen:QwenProvider", default_model="qwen3.6-plus"
+            "qwen", ProviderSurface.LLM, f"{_P}.qwen:QwenProvider", default_model="qwen3.8-flash"
         ),
-        ProviderEntry("zai", ProviderSurface.LLM, f"{_P}.zai:ZaiProvider", default_model="glm-5"),
+        ProviderEntry(
+            "zai", ProviderSurface.LLM, f"{_P}.zai:ZaiProvider", default_model="glm-5.3-flash"
+        ),
         ProviderEntry(
             "grok",
             ProviderSurface.LLM,
             f"{_P}.grok:GrokProvider",
-            default_model="grok-4.3",
+            default_model="grok-4.7",
         ),
         ProviderEntry(
             "minimax",
             ProviderSurface.LLM,
             f"{_P}.minimax:MiniMaxProvider",
-            default_model="minimax-m2.7",
+            default_model="MiniMax-M3.1-Flash",
         ),
         ProviderEntry(
-            "mimo", ProviderSurface.LLM, f"{_P}.mimo:MimoProvider", default_model="mimo-v2.5"
+            "mimo", ProviderSurface.LLM, f"{_P}.mimo:MimoProvider", default_model="mimo-v2.6-pro"
         ),
         ProviderEntry(
             "openrouter",
@@ -302,13 +304,13 @@ class ProviderRegistry:
             "mistral",
             ProviderSurface.EMBEDDING,
             f"{_P}.mistral:MistralEmbeddingProvider",
-            default_model="mistral-embed",
+            default_model="codestral-embed",
         ),
         ProviderEntry(
             "qwen",
             ProviderSurface.EMBEDDING,
             f"{_P}.qwen:QwenEmbeddingProvider",
-            default_model="text-embedding-v4",
+            default_model="qwen3.7-text-embedding",
         ),
         ProviderEntry(
             "local",

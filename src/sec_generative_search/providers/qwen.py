@@ -33,15 +33,14 @@ class QwenProvider(OpenAICompatibleLLMProvider):
 
 
 class QwenEmbeddingProvider(OpenAICompatibleEmbeddingProvider):
-    """Embedding provider for DashScope's ``text-embedding-v*`` models."""
+    """Embedding provider for DashScope's hosted text-embedding models."""
 
     provider_name = "qwen"
     default_base_url = _QWEN_BASE_URL
-    default_model = "qwen3-rerank"
+    default_model = "qwen3.7-text-embedding"
 
     MODEL_DIMENSIONS: ClassVar[dict[str, int]] = {
         "qwen3.7-text-embedding": 1024,
-        "qwen3-rerank": 1024,
         "text-embedding-v4": 1024,
         "text-embedding-v3": 1024,
     }
